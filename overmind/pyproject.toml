@@ -12,10 +12,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
-# Default is the CLI (`overmind init`, sync, …) plus litellm. OpenTelemetry
-# lives on the `tracing` extra so an app that already pinned OTel does not clash.
+# Default is the CLI (`overmind init`, sync, …). OpenTelemetry lives on the
+# `tracing` extra so an app that already pinned OTel does not clash.
 dependencies = [
-    "litellm>=1.90.2",
     "rich>=14.0.0",
     "typer>=0.25.0",
     "tomli-w>=1.0.0",
@@ -29,7 +28,7 @@ name = "overmind"
 readme = "README.md"
 requires-python = ">=3.10,<4" # todo; remove the upper bound
 urls = { Homepage = "https://github.com/overmind-core/overmind", Repository = "https://github.com/overmind-core/overmind" }
-version = "0.1.78"
+version = "0.1.79"
 
     [project.scripts]
     overmind = "overmind.__main__:app"
