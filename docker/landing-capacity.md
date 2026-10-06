@@ -15,16 +15,18 @@ aws ecs describe-services --cluster overmind-prod-cluster --services celery-batc
   --query 'services[0]' --output json > batch-service.json
 python scripts/plan_landing_capacity.py \
   --task-definition batch-task-definition.json --service batch-service.json \
-  --cluster overmind-prod-cluster --image "$REVIEWED_IMAGE_URI" \
+  --api-family api --cluster overmind-prod-cluster --image "$REVIEWED_IMAGE_URI" \
   --min-capacity 1 --max-capacity 4 --alarm-topic-arn "$EXISTING_ALARM_TOPIC_ARN" \
   --output landing-capacity-plan
 ```
+
+For staging, use its own batch snapshots and the observed API task-definition family (`overmind-staging-api`); the landing family retains the batch family prefix (`overmind-staging-celery-landing-worker`). Service and container names remain `celery-landing-worker` in each cluster. The `--api-family` value must come from that environment's current API task definition.
 
 The generator only writes local files. Review the image, task-role references, secret references, EFS mounts, network, min/max capacity, alarm destination and IAM additions. The initial plan preserves the existing 4-vCPU/8-GiB batch resource envelope and creates additional capacity. Its 1–4 task bounds are cost limits, not a promise to absorb unlimited arrivals. Adjust after measuring real import memory and execution time.
 
 The inspected production deployment inline policy does not grant `ecs:RunTask`, `ecs:ListTasks` or `ecs:DescribeTasks`. Check whether attached policies already grant them before applying an additional policy. The generated `deploy-role-policy.json` grants only API migration tasks in the selected cluster and task inspection; it does not expand `iam:PassRole`. Apply this reviewed additional policy to the environment's deployment role before using the new workflow. Its existing PassRole permission already covers the batch role reused by the landing task.
 
-The control worker needs the separate generated `metrics-role-policy.json`: namespace-constrained `cloudwatch:PutMetricData` plus read-only `ecs:DescribeServices` for landing and bulk workers. Apply it to the actual control task role, not the GitHub deployment role. The generated rollout script resolves that role from ECS. IAM, service provisioning and autoscaling are infrastructure mutations and are not performed by generating the plan. Use an approved deployment identity; the investigation's read-only profile cannot apply it.
+The control worker needs the separate generated `metrics-role-policy.json`: namespace-constrained `cloudwatch:PutMetricData` plus read-only `ecs:DescribeServices` for landing and bulk workers. Apply it to the actual control task role, not the GitHub deployment role. The monitor explicitly uses refreshing ECS task-role credentials; checkpoint archive keys injected into the same container cannot override that identity. The generated rollout script resolves that role from ECS. IAM, service provisioning and autoscaling are infrastructure mutations and are not performed by generating the plan. Use an approved deployment identity; the investigation's read-only profile cannot apply it.
 
 After review, the generated rollout script migrates the schema, creates the dedicated service, verifies its registered landing-only consumer, and installs bounded scaling and alarms. For subsequent releases the workflow orders:
 
