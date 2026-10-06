@@ -77,7 +77,7 @@ def run(
     from celery.exceptions import SoftTimeLimitExceeded
 
     from overbae.models import Dataset, User
-    from overbae.services.datasets import dispatch, lifecycle
+    from overbae.services.datasets import dispatch, heartbeat, lifecycle
     from overbae.services.datasets.notebook import run as run_svc
 
     dataset = Dataset.objects.filter(pk=dataset_id).first()
@@ -87,6 +87,7 @@ def run(
         return {"status": dataset.state}
     if not lifecycle.claim_workshop(dataset_id, self.request.id, state=Dataset.State.RUNNING):
         return {"status": "superseded"}
+    beat = heartbeat.start(lambda: lifecycle.beat_workshop(dataset_id, self.request.id))
     user = User.objects.filter(pk=user_id).first() if user_id else None
     try:
         run_svc.execute(
@@ -120,6 +121,8 @@ def run(
         )
         _emit(dataset_id, {"type": "run_failed", "error": str(exc)[:4000]})
         return {"status": "failed", "error": str(exc)}
+    finally:
+        beat.set()
     return {"status": dataset.state}
 
 
@@ -133,11 +136,12 @@ def run(
 )
 def diagnose(self, *, dataset_id: str, user_id: str | None = None) -> dict[str, Any]:
     from overbae.models import User
-    from overbae.services.datasets import imports
+    from overbae.services.datasets import heartbeat, imports, lifecycle
     from overbae.services.datasets.notebook import agent
 
     if not imports.claim_diagnosis(dataset_id, self.request.id):
         return {"status": "superseded"}
+    beat = heartbeat.start(lambda: lifecycle.beat_workshop(dataset_id, self.request.id))
     user = User.objects.filter(pk=user_id).first() if user_id else None
     try:
         for _event in agent.diagnose(dataset_id, user=user, turn_key=self.request.id or ""):
@@ -147,6 +151,8 @@ def diagnose(self, *, dataset_id: str, user_id: str | None = None) -> dict[str, 
         _emit(dataset_id, {"type": "chat_failed", "error": str(exc)[:400]})
         agent.settle(dataset_id, turn_key=self.request.id or "")
         return {"status": "failed"}
+    finally:
+        beat.set()
     return {"status": "ok"}
 
 
@@ -162,11 +168,12 @@ def turn(
     self, *, dataset_id: str, message: str, user_id: str | None = None, display: str | None = None
 ) -> dict[str, Any]:
     from overbae.models import Dataset, User
-    from overbae.services.datasets import lifecycle
+    from overbae.services.datasets import heartbeat, lifecycle
     from overbae.services.datasets.notebook import agent
 
     if not lifecycle.claim_workshop(dataset_id, self.request.id, state=Dataset.State.DIAGNOSING):
         return {"status": "superseded"}
+    beat = heartbeat.start(lambda: lifecycle.beat_workshop(dataset_id, self.request.id))
     user = User.objects.filter(pk=user_id).first() if user_id else None
     try:
         for _event in agent.follow_up(
@@ -178,6 +185,8 @@ def turn(
         _emit(dataset_id, {"type": "chat_failed", "error": str(exc)[:400]})
         agent.settle(dataset_id, turn_key=self.request.id or "")
         return {"status": "failed"}
+    finally:
+        beat.set()
     return {"status": "ok"}
 
 
@@ -186,8 +195,10 @@ def reap_stuck_runs() -> dict[str, Any]:
     """Queue waiting and execution have separate, immutable clocks."""
     from datetime import timedelta
 
+    from django.db.models import Q
+
     from overbae.models import Cell, Dataset, DatasetImport
-    from overbae.services.datasets import imports
+    from overbae.services.datasets import heartbeat, imports
     from overbae.services.datasets.lifecycle import WORKSHOP_QUEUE_SECONDS
 
     imports.reconcile()
@@ -206,7 +217,11 @@ def reap_stuck_runs() -> dict[str, Any]:
             )
         else:
             stuck = stuck.filter(
-                workshop_started_at__lt=now - timedelta(seconds=limit + REAP_GRACE)
+                Q(workshop_started_at__lt=now - timedelta(seconds=limit + REAP_GRACE))
+                | Q(
+                    workshop_started_at__isnull=False,
+                    updated_at__lt=now - timedelta(seconds=heartbeat.STALE_SECONDS),
+                )
             )
         with transaction.atomic():
             found = list(stuck.select_for_update(skip_locked=True).values_list("id", flat=True))

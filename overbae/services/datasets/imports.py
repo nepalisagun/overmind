@@ -13,11 +13,12 @@ from datetime import timedelta
 from celery import current_app
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import DateTimeField, ExpressionWrapper, F, Q, Value
+from django.db.models.functions import Least
 from django.utils import timezone
 
 from overbae.models import Dataset, DatasetImport, User
-from overbae.services.datasets import files, llm_calls, paths
+from overbae.services.datasets import files, heartbeat, llm_calls, paths
 from overbae.services.datasets import land as landing
 from overbae.services.datasets.lifecycle import DatasetError, claim_workshop, queue_workshop
 from overbae.services.datasets.notebook import events
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 LANDING_RECEIPT_VERSION = 1
 EXECUTION_SECONDS = 60 * 60
 LEASE_GRACE_SECONDS = 5 * 60
+LEASE_SECONDS = 5 * 60
 MAX_ATTEMPTS = 3
 MAX_PUBLICATIONS = 8
 RECONCILE_BATCH = 40
@@ -70,6 +72,12 @@ def _source_inputs(inputs):
         if not filename or not path.is_file():
             raise DatasetError(
                 "The source upload is missing. Upload it again.", code="source_missing"
+            )
+        if not inputs["source"].get("pasted") and files.inspection(upload_id) is None:
+            raise DatasetError(
+                f"Inspect upload {upload_id} with POST /api/uploads/{upload_id}/inspect/ "
+                "before creating a dataset from it.",
+                code="upload_not_inspected",
             )
         stat = path.stat()
         manifest.append(
@@ -252,7 +260,7 @@ def claim(run_id):
     run.state = DatasetImport.State.RUNNING
     run.owner = uuid.uuid4()
     run.started_at = now
-    run.lease_until = now + timedelta(seconds=EXECUTION_SECONDS + LEASE_GRACE_SECONDS)
+    run.lease_until = now + timedelta(seconds=LEASE_SECONDS)
     run.attempts += 1
     run.failure_code = run.error = ""
     run.save(
@@ -271,6 +279,18 @@ def claim(run_id):
         state=Dataset.State.LANDING, error="", updated_at=now
     )
     return ImportClaim(run.pk, run.owner)
+
+
+def renew(claimed):
+    """Progress never extends the absolute execution limit."""
+    limit = ExpressionWrapper(
+        F("started_at") + timedelta(seconds=EXECUTION_SECONDS + LEASE_GRACE_SECONDS),
+        output_field=DateTimeField(),
+    )
+    lease = Value(timezone.now() + timedelta(seconds=LEASE_SECONDS), DateTimeField())
+    DatasetImport.objects.filter(
+        pk=claimed.run_id, owner=claimed.owner, state=DatasetImport.State.RUNNING
+    ).update(lease_until=Least(lease, limit))
 
 
 @contextmanager
@@ -311,6 +331,11 @@ def resume(run_id):
             "The import attempt limit was reached. Its source is retained.",
             code="attempts_exhausted",
         )
+    return _requeue(run)
+
+
+def _requeue(run):
+    """The caller holds the receipt's row lock."""
     targets = list(
         Dataset.objects.select_for_update().filter(pk__in=_target_ids(run)).order_by("id")
     )
@@ -539,11 +564,17 @@ def reconcile():
                 and run.lease_until
                 and run.lease_until < now
             ):
-                _block(
-                    run,
-                    "worker_timeout",
-                    "The import worker stopped before publication. Its source is retained.",
-                )
+                if run.attempts >= MAX_ATTEMPTS:
+                    _block(
+                        run,
+                        "worker_timeout",
+                        "The import worker stopped before publication. Its source is retained.",
+                    )
+                else:
+                    try:
+                        _requeue(run)
+                    except DatasetError as exc:
+                        _block(run, exc.code, exc.detail)
             elif run.state == DatasetImport.State.QUEUED and run.queued_at < now - timedelta(
                 seconds=queue_seconds
             ):
@@ -674,6 +705,7 @@ def execute(task_id, inputs):
         run.refresh_from_db()
         return {"status": run.state}
     stage = paths.dataset_dir(dataset.pk) / "imports" / str(run.pk) / str(claimed.owner)
+    beat = heartbeat.start(lambda: renew(claimed))
     try:
         run.refresh_from_db()
         validate_sources(run)
@@ -754,4 +786,5 @@ def execute(task_id, inputs):
         fail(claimed, str(exc), code=getattr(exc, "code", "import_failed"))
         return {"status": "failed", "error": str(exc)}
     finally:
+        beat.set()
         shutil.rmtree(stage, ignore_errors=True)

@@ -418,7 +418,7 @@ QUEUE_METRICS_CLUSTER = os.environ.get("QUEUE_METRICS_CLUSTER", "")
 # Admission is a provider-spend/concurrency budget, independent of sample count.
 EVAL_MAX_IN_FLIGHT = int(os.environ.get("EVAL_MAX_IN_FLIGHT", "12"))
 EVAL_MAX_IN_FLIGHT_PER_RUN = int(os.environ.get("EVAL_MAX_IN_FLIGHT_PER_RUN", "2"))
-DATASET_IMPORT_MAX_QUEUE_SECONDS = int(os.environ.get("DATASET_IMPORT_MAX_QUEUE_SECONDS", "900"))
+DATASET_IMPORT_MAX_QUEUE_SECONDS = int(os.environ.get("DATASET_IMPORT_MAX_QUEUE_SECONDS", "3600"))
 
 CELERY_TASK_ROUTES = {
     "overbae.tasks.training_preparation.inspect_preparation": {"queue": "io"},
@@ -426,6 +426,8 @@ CELERY_TASK_ROUTES = {
     "overbae.tasks.datasets.turn": {"queue": "interactive"},
     "overbae.tasks.datasets.diagnose": {"queue": "interactive"},
     "overbae.tasks.eval.prepare_sample": {"queue": "batch"},
+    # Model warm-up can block for minutes; control stays free for reconcilers and metrics.
+    "overbae.tasks.eval.run_eval_run": {"queue": "io"},
     "overbae.tasks.datasets.land": {"queue": "landing"},
     "overbae.tasks.connector_sync.sync_connector_chunk": {"queue": "batch"},
     "overbae.tasks.eval.execute_evaluator": {"queue": "io"},
@@ -475,7 +477,8 @@ CELERY_BEAT_SCHEDULE = {
     # Reaps notebook runs orphaned by a killed worker.
     "reap-stuck-dataset-runs": {
         "task": "overbae.tasks.datasets.reap_stuck_runs",
-        "schedule": 600.0,
+        "schedule": 60.0,
+        "options": {"expires": 55.0},
     },
     "cleanup-dataset-uploads": {
         "task": "overbae.tasks.cleanup_tmp.cleanup_uploads",

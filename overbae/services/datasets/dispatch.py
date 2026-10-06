@@ -10,13 +10,14 @@ from django.db.models import Q
 from django.utils import timezone
 
 from overbae.models import Cell, Dataset, DatasetImport
-from overbae.services.datasets import imports
+from overbae.services.datasets import files, imports, selection
 from overbae.services.datasets.land import SPLIT_POSITIONS
 from overbae.services.datasets.lifecycle import (
     DatasetError,
     accept_proposal,
     enter_busy,
     queue_workshop,
+    refuse_deleted_capability,
     remove_cell,
 )
 
@@ -39,6 +40,7 @@ def _check_source(source: dict) -> None:
 
 
 def _new(project, user, name: str, source: dict, intent: str | None, capability) -> Dataset:
+    refuse_deleted_capability(capability)
     dataset = Dataset.objects.create(
         project=project,
         capability=capability,
@@ -121,8 +123,16 @@ def create_split(
             raise DatasetError("Two LLM calls are needed to split.", code="split")
     elif position not in SPLIT_POSITIONS:
         raise DatasetError(f"position must be one of {', '.join(SPLIT_POSITIONS)}.", code="split")
-    known = source.get("rows") or (source.get("traces") or {}).get("trace_ids")
-    if known is not None and len(known) < 2:
+    if source.get("rows") is not None:
+        known = len(source["rows"])
+    elif source.get("traces") is not None:
+        known = selection.TraceSource.parse(source["traces"]).count(project.id)
+    elif source.get("llm_calls") is None:
+        inspected = [files.inspection(i) for i in source.get("uploads") or [source["upload_id"]]]
+        known = None if None in inspected else sum(record["rows"] for record in inspected)
+    else:
+        known = None
+    if known is not None and known < 2:
         raise DatasetError("Two rows are needed to split.", code="split")
     name = (name or "").strip()
     with transaction.atomic():

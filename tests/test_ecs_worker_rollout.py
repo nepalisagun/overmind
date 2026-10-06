@@ -102,17 +102,21 @@ def test_bootstrap_isolated_worker_preserves_storage_and_secrets(definition, ser
     assert definition == original
 
 
-def test_every_release_overrides_stale_worker_command(definition):
-    definition["family"] = "celery-landing-worker"
-    definition["containerDefinitions"][0]["name"] = "celery-landing-worker"
+@pytest.mark.parametrize("queue", ["landing", "interactive"])
+def test_every_release_overrides_stale_worker_command(definition, queue):
+    service = f"celery-{queue}-worker"
+    definition["family"] = service
+    definition["containerDefinitions"][0]["name"] = service
     rendered = render_task_definition(
-        definition, service="celery-landing-worker", image="repo:new", cluster="test-cluster"
+        definition, service=service, image="repo:new", cluster="test-cluster"
     )
     container = rendered["containerDefinitions"][0]
     assert container["image"] == "repo:new"
-    assert container["command"][-2:] == ["-Q", "landing"]
+    assert container["command"][-2:] == ["-Q", queue]
+    assert f"--hostname={queue}@%h" in container["command"]
     assert container["entryPoint"] == ["/usr/local/bin/worker-entrypoint.sh"]
-    assert "overbae.worker_health" in " ".join(container["healthCheck"]["command"])
+    assert container["healthCheck"]["command"][-2:] == ["overbae.worker_health", queue]
+    assert container["stopTimeout"] == 120
     assert rendered["containerDefinitions"][1]["image"] == "otel:stable"
 
 
@@ -172,7 +176,7 @@ def test_capacity_plan_has_hard_bounds_and_actionable_missing_metrics_alarm(defi
         a.get("MetricName") == "MetricHeartbeat" and a["TreatMissingData"] == "breaching"
         for a in alarms
     )
-    assert any(a.get("MetricName") == "BlockedImports" for a in alarms)
+    assert any(a.get("MetricName") == "NewlyBlockedImports" for a in alarms)
     metric_permission = plan["metrics-role-policy.json"]["Statement"][0]
     assert metric_permission["Action"] == ["cloudwatch:PutMetricData"]
     assert (

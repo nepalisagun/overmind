@@ -10,11 +10,12 @@ from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
 
-from overbae.models import Cell, Dataset
+from overbae.models import Capability, Cell, Dataset
 from overbae.services.datasets import measure, paths, store
 from overbae.services.datasets.context import context_fingerprint
 
 WORKSHOP_QUEUE_SECONDS = 60 * 60
+_BUSY = (Dataset.State.LANDING, Dataset.State.RUNNING, Dataset.State.DIAGNOSING)
 
 
 class DatasetError(ValueError):
@@ -47,15 +48,22 @@ def queue_workshop(dataset_id: Any, task_id: str) -> None:
 def claim_workshop(dataset_id: Any, task_id: str, *, state: str) -> bool:
     if not task_id:
         return False
+    now = timezone.now()
     return bool(
         Dataset.objects.filter(
             pk=dataset_id,
             state=state,
             workshop_task_id=task_id,
             workshop_started_at__isnull=True,
-            workshop_queued_at__gte=timezone.now() - timedelta(seconds=WORKSHOP_QUEUE_SECONDS),
-        ).update(workshop_started_at=timezone.now())
+            workshop_queued_at__gte=now - timedelta(seconds=WORKSHOP_QUEUE_SECONDS),
+        ).update(workshop_started_at=now, updated_at=now)
     )
+
+
+def beat_workshop(dataset_id: Any, task_id: str) -> None:
+    Dataset.objects.filter(
+        pk=dataset_id, workshop_task_id=task_id, workshop_started_at__isnull=False
+    ).update(updated_at=timezone.now())
 
 
 def _refuse_while_busy(dataset: Dataset) -> None:
@@ -241,7 +249,13 @@ def set_active(dataset: Dataset, cell: Cell | None) -> Dataset:
     return dataset
 
 
-def set_intent(dataset: Dataset, intent: str) -> Dataset:
+def _refuse_user_edit_while_busy(dataset: Dataset, agent: bool) -> None:
+    if not agent and dataset.state in _BUSY:
+        raise DatasetError("The dataset is busy. Wait for it to finish.", code=dataset.state)
+
+
+def set_intent(dataset: Dataset, intent: str, *, agent: bool = False) -> Dataset:
+    _refuse_user_edit_while_busy(dataset, agent)
     if intent not in (Dataset.Intent.TRAIN, Dataset.Intent.EVAL):
         raise DatasetError("The intent is train or eval.", code="intent")
     if dataset.frozen_before >= 0:
@@ -256,11 +270,18 @@ def set_intent(dataset: Dataset, intent: str) -> Dataset:
     return dataset
 
 
-def set_capability(dataset: Dataset, capability: Any) -> Dataset:
+def refuse_deleted_capability(capability: Any) -> None:
+    if capability is not None and capability.status == Capability.Status.DELETED:
+        raise DatasetError("That capability was deleted.", code="capability")
+
+
+def set_capability(dataset: Dataset, capability: Any, *, agent: bool = False) -> Dataset:
+    _refuse_user_edit_while_busy(dataset, agent)
     if dataset.frozen_before >= 0:
         raise DatasetError("A version was used; the capability is fixed.", code="frozen")
     if capability is not None and capability.project_id != dataset.project_id:
         raise DatasetError("That capability belongs to another project.", code="capability")
+    refuse_deleted_capability(capability)
     if getattr(capability, "id", None) != dataset.capability_id:
         _touch(dataset, capability=capability)
         measure.capability_only(dataset)
@@ -323,8 +344,8 @@ def usage(cell: Cell) -> dict[str, list[dict[str, Any]]]:
 
 
 def delete_blocked_reason(dataset: Dataset) -> str:
-    if dataset.state == Dataset.State.RUNNING:
-        return "The notebook is running. Wait for it to finish."
+    if dataset.state in _BUSY:
+        return "The dataset is busy. Wait for it to finish."
     used = [c for c in dataset.cells.all() if c.used_at is not None or any(usage(c).values())]
     if used:
         versions = dataset.versions()
