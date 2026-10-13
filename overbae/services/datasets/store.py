@@ -7,7 +7,9 @@ import hashlib
 import json
 import math
 import tempfile
+import threading
 from collections.abc import Iterable, Iterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from overbae.services.datasets.tables import (
+from sandbox.tables import (
     ARROW_TYPES,
     ManifestBuilder,
     TableWriter,
@@ -27,9 +29,9 @@ from overbae.services.datasets.tables import (
     read_manifest,
     union_kind,
 )
-from overbae.services.datasets.tables import SOURCE_ROW as SOURCE_ROW
-from overbae.services.datasets.tables import json_dumps as json_dumps
-from overbae.services.datasets.tables import write_frame as write_frame
+from sandbox.tables import SOURCE_ROW as SOURCE_ROW
+from sandbox.tables import json_dumps as json_dumps
+from sandbox.tables import write_frame as write_frame
 
 # DuckDB defaults to 80% of the machine for each connection.
 DUCKDB_MEMORY = "512MB"
@@ -105,11 +107,6 @@ def value(raw: Any, kind: str) -> Any:
         return json.loads(raw)
     except (TypeError, ValueError):
         return raw
-
-
-def raw_rows(path: Path, columns: list[str] | None = None) -> Iterator[dict[str, Any]]:
-    for batch in batches(path, columns):
-        yield from batch.to_pylist()
 
 
 def records(path: Path, columns: list[str] | None = None) -> Iterator[dict[str, Any]]:
@@ -440,15 +437,28 @@ def connect_sandboxed(**tables: Path) -> duckdb.DuckDBPyConnection:
     return con
 
 
-def query(sql: str, *, limit: int | None = 200, **tables: Path) -> dict[str, Any]:
+class QueryTimeoutError(StoreError):
+    pass
+
+
+def query(
+    sql: str, *, limit: int | None = 200, timeout: float | None = None, **tables: Path
+) -> dict[str, Any]:
     """Read-only SQL over registered tables. Returns decoded rows and columns."""
     con = connect_sandboxed(**tables)
     sql = sql.strip().rstrip(";").strip()
+    timer = threading.Timer(timeout, con.interrupt) if timeout else None
     try:
+        if timer is not None:
+            timer.start()
         cur = con.execute(f"SELECT * FROM ({sql}) LIMIT {int(limit)}" if limit else sql)
         cols = [d[0] for d in cur.description]
         rows = _records(cur)
+    except duckdb.InterruptException as exc:
+        raise QueryTimeoutError(f"The query ran longer than {timeout:g}s and was stopped.") from exc
     finally:
+        if timer is not None:
+            timer.cancel()
         con.close()
     return {"rows": [_json_safe(r) for r in rows], "columns": cols}
 
@@ -462,5 +472,8 @@ def _json_safe(row: dict[str, Any]) -> dict[str, Any]:
             v = v.decode("utf-8", "replace")
         elif isinstance(v, float) and math.isnan(v):
             v = None
+        elif isinstance(v, Decimal):
+            # SUM over integers is a HUGEINT/DECIMAL; JSON would carry it as a string.
+            v = int(v) if v == v.to_integral_value() else float(v)
         out[k] = v
     return out

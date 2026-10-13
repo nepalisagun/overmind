@@ -2,15 +2,15 @@
 
 An **evaluator** is a rubric (code check or LLM judge). An **eval set** is a
 named grouping of evaluators, optionally mapped to a capability. An **eval run** scores a chosen
-dataset cell with the **eval** contracts using those evaluators.
+dataset version with the **eval** contracts using those evaluators.
 
-The dataset's intent **must** be eval and the chosen cell must fit. Call
+The dataset's intent **must** be eval and the chosen version must fit. Call
 `list_datasets`, pass its dataset UUID to `inspect_dataset`, and use
-`query_dataset` to verify the chosen cell. Eval runs and optimizer experiments
+`query_dataset` to verify the chosen version. Eval runs and optimizer experiments
 refuse `train` and `pending` datasets — see
 [SKILL.md](../SKILL.md#dataset-contracts--read-first-they-gate-every-workflow)
 and [datasets.md](datasets.md) to land one. The run uses the version it
-read, which freezes it.
+read and marks it **Used**.
 
 Use `prepare-evaluation` for readiness and `evaluate-change` for a run versus
 a baseline. Evaluation datasets must have `intent="eval"`.
@@ -24,7 +24,7 @@ does not activate the set or launch an evaluation. Inspect the returned
 `overmind://eval-sets/{eval_set}` resource for names, kinds, roles, and capability
 mapping. Only capability-mapped sets can be activated for live trace scoring.
 
-1. Call `check_evaluation_readiness` with the dataset UUID, chosen cell UUID,
+1. Call `check_evaluation_readiness` with the dataset UUID, the chosen `version`,
    optional eval set, proposed `variants`, and `mode="existing"` or `mode="generate"`.
 1. Read `ready`, evaluator applicability, variable binding status, eval-set
    state, credit availability, and advisory `context_checks` for candidate models
@@ -54,7 +54,7 @@ returned by readiness and keep sensitive values out of rubric/config JSON.
 
 Configurable rubric judges default to generative. Jev is an explicit opt-in after
 validating quality on representative labelled examples; confidence alone is not
-a quality gate. Fixed grounding, classification and workshop decision services
+a quality gate. Fixed grounding and classification services
 use Jev with generative fallback. Authoring and holistic reasoning remain
 generative. `upsert_evaluator` accepts `config.decision` with `backend` (`jev` or
 `generative`), `model` (`typesafe/jev-1.13`), `min_confidence` (default `0.9`) and
@@ -82,7 +82,7 @@ Dataset sampling draws across the complete pinned version, balancing available
 task labels, and repeats the same selection for the same version and budget.
 
 Call `run_evaluation` only after readiness is green. Supply a run name, eval
-dataset UUID, chosen cell UUID, optional eval set/evaluator ids, variants, and
+dataset UUID, the chosen `version`, optional eval set/evaluator ids, variants, and
 bounded `max_items` or sampling as appropriate. It returns a run id, variants, and an
 `overmind://eval-runs/{eval_run}` resource.
 

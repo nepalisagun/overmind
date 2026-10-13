@@ -17,9 +17,15 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HEALTH_CHECKED_QUEUES = {
-    "celery-landing-worker": "landing",
-    "celery-interactive-worker": "interactive",
+HEALTH_CHECKS = {
+    "celery-landing-worker": ["CMD", "python", "-m", "overbae.worker_health", "landing"],
+    "celery-interactive-worker": ["CMD", "python", "-m", "overbae.worker_health", "interactive"],
+    "sandbox": [
+        "CMD",
+        "python",
+        "-c",
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)",
+    ],
 }
 READ_ONLY_FIELDS = (
     "taskDefinitionArn",
@@ -31,6 +37,18 @@ READ_ONLY_FIELDS = (
     "registeredBy",
     "deregisteredAt",
 )
+
+
+SANDBOX_DROPPED = [
+    "AUDIT_WRITE",
+    "FSETID",
+    "MKNOD",
+    "NET_BIND_SERVICE",
+    "NET_RAW",
+    "SETFCAP",
+    "SETPCAP",
+    "SYS_CHROOT",
+]
 
 
 def _environment(container, **values):
@@ -54,17 +72,18 @@ def render_task_definition(document, *, service, image, cluster):
         app["entryPoint"] = ["/usr/local/bin/worker-entrypoint.sh"]
     elif service != "api":
         raise ValueError(f"No reviewed command for service {service!r}")
+    if service == "sandbox":
+        # init reaps the children a killed run leaves; SYS_PTRACE lets the root server
+        # read a run's open files. Runs drop every capability with their uid. Fargate
+        # adds only SYS_PTRACE, so the defaults the server never uses are dropped instead.
+        linux = app.setdefault("linuxParameters", {})
+        linux["initProcessEnabled"] = True
+        linux["capabilities"] = {"add": ["SYS_PTRACE"], "drop": SANDBOX_DROPPED}
     if service == "celery-control-worker":
         _environment(app, QUEUE_METRICS_ENABLED="1", QUEUE_METRICS_CLUSTER=cluster)
-    if service in HEALTH_CHECKED_QUEUES:
+    if service in HEALTH_CHECKS:
         app["healthCheck"] = {
-            "command": [
-                "CMD",
-                "python",
-                "-m",
-                "overbae.worker_health",
-                HEALTH_CHECKED_QUEUES[service],
-            ],
+            "command": HEALTH_CHECKS[service],
             "interval": 30,
             "timeout": 15,
             "retries": 3,
@@ -240,7 +259,7 @@ def deploy(cluster, service_name, image, timeout=4200):
             service,
             tasks,
             task_definition=arn,
-            require_health=service_name in HEALTH_CHECKED_QUEUES,
+            require_health=service_name in HEALTH_CHECKS,
         ):
             print(f"Ready: {service_name} {arn}")
             return

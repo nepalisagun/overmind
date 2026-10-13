@@ -95,7 +95,7 @@ def _next_actions(*dataset_ids: str) -> list[dict[str, Any]]:
         action
         for dataset_id in dataset_ids
         for action in (
-            {"tool": "get_job", "arguments": {"kind": "dataset_run", "id": dataset_id}},
+            {"tool": "get_job", "arguments": {"kind": "dataset_import", "id": dataset_id}},
             {"tool": "inspect_dataset", "arguments": {"dataset": dataset_id}},
         )
     ]
@@ -123,7 +123,7 @@ def _normalize_split(split: int | None, position: str) -> tuple[int | None, str]
 
 
 CHUNK_ATTEMPTS = 4
-_BUSY_STATES = ("landing", "diagnosing", "running")
+_BUSY_STATES = ("landing",)
 
 
 def wait_until_ready(
@@ -135,8 +135,8 @@ def wait_until_ready(
     poll: float = 3,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Poll until the landing and the first scan end. An ``error`` state raises
-    with the dataset's own message."""
+    """Poll until the source has landed. An ``error`` state raises with the
+    dataset's own message."""
     client = session or requests.Session()
     client.headers.update({"X-Api-Key": api_key})
     deadline = time.monotonic() + timeout
@@ -170,10 +170,16 @@ def upload_file(
     capability: str | None = None,
     split: int | None = None,
     split_position: str = "tail",
+    json_rows_field: str | None = None,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
     """Stream one local file through /api/uploads/ then land it as a dataset, or
-    with ``split`` as a train dataset and an eval dataset holding that percent."""
+    with ``split`` as a train dataset and an eval dataset holding that percent.
+    Tables, documents (PDF, DOCX, Markdown, text) and images are accepted; the
+    server sets the size limit for each type."""
+    json_rows_field = (json_rows_field or "").strip() or None
+    if json_rows_field and not path.name.lower().removesuffix(".gz").endswith(".json"):
+        raise DatasetUploadError("--json-rows-field applies to .json files only.")
     intent = _normalize_intent(intent)
     split, split_position = _normalize_split(split, split_position)
     if split is not None and intent:
@@ -246,7 +252,9 @@ def upload_file(
 
         try:
             inspect_response = client.post(
-                f"{base_url}{UPLOAD_PATH}{upload_id}/inspect/", json={"size": total}, timeout=DEFAULT_TIMEOUT
+                f"{base_url}{UPLOAD_PATH}{upload_id}/inspect/",
+                json={"size": total, **({"json_rows_field": json_rows_field} if json_rows_field else {})},
+                timeout=DEFAULT_TIMEOUT,
             )
         except requests.RequestException as exc:
             raise DatasetUploadError(f"inspect upload failed: {exc}") from exc
@@ -254,9 +262,11 @@ def upload_file(
 
         body: dict[str, Any] = {
             "project": project_id,
-            "name": path.name,
+            "name": Path(path.name.removesuffix(".gz").removesuffix(".GZ")).stem or path.name,
             "source": {"upload_id": upload_id, "filename": path.name},
         }
+        if json_rows_field:
+            body["source"]["json_rows_field"] = json_rows_field
         if intent:
             body["intent"] = intent
         if capability:
@@ -341,7 +351,7 @@ def export_dataset(
     api_url: str,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Stream the active version, or a given cell, to a new local file."""
+    """Stream the active version, or a given version, to a new local file."""
     dataset_id = dataset_id.strip()
     file_format = file_format.strip()
     cell = cell.strip() if cell else None
@@ -376,9 +386,10 @@ def export_dataset(
             raise DatasetExportError(f"dataset export failed: {_redact_secret(str(exc), api_key)}") from exc
 
         _raise_export_for_status(response, api_key)
-        export_headers = dict(getattr(response, "headers", {}) or {})
+        # Header names arrive in wire case; a plain dict would lose requests' case folding.
+        export_headers = {k.lower(): v for k, v in (getattr(response, "headers", {}) or {}).items()}
         if destination is None:
-            filename = _content_disposition_filename(getattr(response, "headers", {}).get("Content-Disposition", ""))
+            filename = _content_disposition_filename(export_headers.get("content-disposition", ""))
             destination = Path(_safe_export_filename(filename, dataset_id, file_format))
         if destination.exists():
             raise DatasetExportError(f"Output path already exists: {destination}")
@@ -416,7 +427,7 @@ def export_dataset(
         "bytes_written": bytes_written,
     }
     for key, header in EXPORT_HEADERS:
-        value = export_headers.get(header)
+        value = export_headers.get(header.lower())
         if value:
             result[key] = str(value)
     return result
@@ -461,13 +472,18 @@ def upload(
         str,
         typer.Option("--split-position", help="Where the eval rows come from: head, tail or random"),
     ] = "tail",
+    json_rows_field: Annotated[
+        str | None,
+        typer.Option("--json-rows-field", metavar="FIELD", help="Top-level JSON array field to import."),
+    ] = None,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Wait for the landing and the first scan; exit 1 if either fails"),
+        typer.Option("--wait", help="Wait until the source has landed."),
     ] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Print machine-readable output")] = False,
 ) -> None:
-    """Upload FILE and land it as a dataset, or with --split as a train and an eval dataset."""
+    """Upload FILE (a table, document or image) and land it as a dataset, or with
+    --split as a train and an eval dataset."""
     try:
         config = load(path) if path.exists() else Config()
         key = resolve_api_key(api_key, config)
@@ -486,6 +502,7 @@ def upload(
             capability=capability,
             split=split,
             split_position=split_position,
+            json_rows_field=json_rows_field,
         )
         if wait:
             for id_key, state_key in (("id", "state"), ("eval_id", "eval_state")):
@@ -503,7 +520,7 @@ def upload(
     if "eval_id" in result:
         console.print(f"Eval dataset {result['eval_id']} is {result['eval_state']}.")
     if not wait:
-        console.print("Next: get_job(kind=dataset_run, id=<dataset id>), then inspect_dataset.")
+        console.print("Next: get_job(kind=dataset_import, id=<dataset id>), then inspect_dataset.")
 
 
 @dataset_app.command("export")
@@ -514,7 +531,7 @@ def export(
         typer.Option("--format", help="Export format: jsonl or csv"),
     ] = "jsonl",
     cell: Annotated[
-        str | None, typer.Option("--cell", help="A cell id or a version such as 1.2; default is the active version")
+        str | None, typer.Option("--cell", help="A version such as v3, or its id; default is the active version")
     ] = None,
     output: Annotated[Path | None, typer.Option("--output", help="Local output path")] = None,
     api_key: Annotated[

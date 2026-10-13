@@ -341,7 +341,8 @@ SPECTACULAR_SETTINGS = {
         "DecisionPolicyBackendEnum": [("jev", "jev"), ("generative", "generative")],
         "BackendEnum": [("together", "together"), ("baseten", "baseten"), ("modal", "modal")],
         "IntentEnum": "overbae.models.datasets.Dataset.Intent",
-        "CellStateEnum": "overbae.models.datasets.Cell.State",
+        "ExecutionModeEnum": "overbae.models.datasets.Execution.Mode",
+        "ExecutionStateEnum": "overbae.models.datasets.Execution.State",
         # Lane provenance shares the field name with finetuning evidence; pinned so
         # neither enum is hash-renamed in the generated client.
         "ProvenanceEnum": [("measured", "measured"), ("lab_claimed", "lab_claimed")],
@@ -422,14 +423,13 @@ QUEUE_METRICS_CLUSTER = os.environ.get("QUEUE_METRICS_CLUSTER", "")
 EVAL_MAX_IN_FLIGHT = int(os.environ.get("EVAL_MAX_IN_FLIGHT", "12"))
 EVAL_MAX_IN_FLIGHT_PER_RUN = int(os.environ.get("EVAL_MAX_IN_FLIGHT_PER_RUN", "2"))
 DATASET_IMPORT_MAX_QUEUE_SECONDS = int(os.environ.get("DATASET_IMPORT_MAX_QUEUE_SECONDS", "3600"))
-# Memory the workshop's cells share on one host; 0 is 60% of the host's memory.
-WORKSHOP_SANDBOX_MEMORY_BYTES = int(os.environ.get("WORKSHOP_SANDBOX_MEMORY_BYTES", "0"))
+SANDBOX_URL = os.environ.get("SANDBOX_URL", "").rstrip("/")
+SANDBOX_TOKEN = os.environ.get("SANDBOX_TOKEN", "")
+WORKSHOP_PROJECT_CONCURRENCY = int(os.environ.get("WORKSHOP_PROJECT_CONCURRENCY", "4"))
 
 CELERY_TASK_ROUTES = {
     "overbae.tasks.training_preparation.inspect_preparation": {"queue": "io"},
-    "overbae.tasks.datasets.run": {"queue": "interactive"},
-    "overbae.tasks.datasets.turn": {"queue": "interactive"},
-    "overbae.tasks.datasets.diagnose": {"queue": "interactive"},
+    "overbae.tasks.datasets.execute": {"queue": "interactive"},
     "overbae.tasks.eval.prepare_sample": {"queue": "batch"},
     # Model warm-up and judge authoring block for minutes; control stays free for
     # reconcilers and metrics.
@@ -481,11 +481,11 @@ CELERY_BEAT_SCHEDULE = {
         "task": "overbae.tasks.eval_watchdog.reap_stalled_eval_runs",
         "schedule": 600.0,
     },
-    # Reaps notebook runs orphaned by a killed worker.
-    "reap-stuck-dataset-runs": {
-        "task": "overbae.tasks.datasets.reap_stuck_runs",
-        "schedule": 60.0,
-        "options": {"expires": 55.0},
+    # Fails script runs a dead worker left behind and deletes runs after 30 days.
+    "sweep-workshop-executions": {
+        "task": "overbae.tasks.datasets.sweep_executions",
+        "schedule": 300.0,
+        "options": {"expires": 290.0},
     },
     "cleanup-dataset-uploads": {
         "task": "overbae.tasks.cleanup_tmp.cleanup_uploads",
@@ -530,10 +530,7 @@ CELERY_BEAT_SCHEDULE = {
 }
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-CURSOR_API_KEY = os.environ.get("CURSOR_API_KEY", "")
 
 # Feedback-channel incoming webhook; blank disables the notification.
 SLACK_FEEDBACK_WEBHOOK_URL = os.environ.get("SLACK_FEEDBACK_WEBHOOK_URL", "")
@@ -675,7 +672,9 @@ INFERENCE_API_URL: str = os.environ.get("INFERENCE_API_URL", "")
 INFERENCE_API_KEY: str = os.environ.get("INFERENCE_API_KEY", "")
 
 _REQUIRED_KEYS = {
-    "OPENROUTER_API_KEY": "judges, evals, trace scoring and the Data Workshop",
+    "OPENROUTER_API_KEY": "judges, evals and trace scoring",
+    "SANDBOX_URL": "the Data Workshop script sandbox",
+    "SANDBOX_TOKEN": "the Data Workshop script sandbox",
     "MODAL_TOKEN_ID": "Modal training and serving workers",
     "MODAL_TOKEN_SECRET": "Modal training and serving workers",
     "INFERENCE_API_URL": "the Modal serving endpoint",

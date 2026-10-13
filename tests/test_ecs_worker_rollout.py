@@ -91,6 +91,24 @@ def test_every_release_overrides_stale_worker_command(definition, queue):
     assert rendered["containerDefinitions"][1]["image"] == "otel:stable"
 
 
+def test_the_sandbox_release_runs_the_server_and_checks_its_health(definition):
+    definition["family"] = "sandbox"
+    definition["containerDefinitions"][0]["name"] = "sandbox"
+    rendered = render_task_definition(
+        definition, service="sandbox", image="repo:new", cluster="test-cluster"
+    )
+    container = rendered["containerDefinitions"][0]
+    assert container["command"] == ["python", "-m", "sandbox"]
+    assert container["entryPoint"] == ["/usr/local/bin/worker-entrypoint.sh"]
+    assert "127.0.0.1:8080/health" in container["healthCheck"]["command"][-1]
+    assert container["linuxParameters"]["initProcessEnabled"] is True
+    capabilities = container["linuxParameters"]["capabilities"]
+    assert capabilities["add"] == ["SYS_PTRACE"]
+    assert "NET_RAW" in capabilities["drop"]
+    needed = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID", "SYS_PTRACE"}
+    assert not needed & set(capabilities["drop"])
+
+
 def test_migration_cannot_start_http_server(definition, service):
     definition["containerDefinitions"][0]["name"] = "api"
     request = migration_request(

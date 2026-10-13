@@ -4,7 +4,6 @@ import { useNavigate } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 
 import { IntentBadge, SOURCE_KIND_LABEL, StateBadge } from "@/components/datasets/badges";
-import { type DatasetSource, NewDatasetButton } from "@/components/datasets/new-dataset-button";
 import { EntityRef } from "@/components/entity-ref";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -72,8 +71,7 @@ export function DatasetsToolbar({
   capabilityFilter = "all",
   setCapabilityFilter,
   capabilityNameById = {},
-  onCreate,
-}: DatasetsFilterProps & { onCreate: (source: DatasetSource) => void }) {
+}: DatasetsFilterProps) {
   const capabilityIds = useMemo(() => {
     const ids = new Set<string>(Object.keys(capabilityNameById));
     for (const ds of datasets) ids.add(ds.capability || NO_CAPABILITY);
@@ -92,13 +90,13 @@ export function DatasetsToolbar({
         <>
           <Select onValueChange={setIntentFilter} value={intentFilter}>
             <SelectTrigger aria-label="Filter by intent" className="w-[140px]" size="default">
-              <SelectValue placeholder="All intents" />
+              <SelectValue placeholder="All purposes" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All intents</SelectItem>
-              <SelectItem value="train">Train</SelectItem>
-              <SelectItem value="eval">Eval</SelectItem>
-              <SelectItem value="pending">Pending</SelectItem>
+              <SelectItem value="all">All purposes</SelectItem>
+              <SelectItem value="train">Training</SelectItem>
+              <SelectItem value="eval">Evaluation</SelectItem>
+              <SelectItem value="pending">Not set</SelectItem>
             </SelectContent>
           </Select>
           {setCapabilityFilter && (
@@ -124,7 +122,6 @@ export function DatasetsToolbar({
         setIntentFilter("all");
         setCapabilityFilter?.("all");
       }}
-      primary={<NewDatasetButton onSelect={onCreate} />}
       search={
         <SearchInput
           className="min-w-[200px] flex-1"
@@ -150,7 +147,7 @@ const sortValue = (ds: Dataset, key: SortKey): string | number => {
     case "rows":
       return ds.rows ?? 0;
     case "version":
-      return ds.activeVersion ?? "";
+      return Number(ds.activeVersion?.slice(1) || -1);
     case "capability":
       return (ds.capabilityName ?? "").toLowerCase();
     case "updated":
@@ -187,13 +184,16 @@ function getColumns(opts: {
       accessorFn: (row) => row.intent ?? "",
       cell: ({ row }) => (
         <span className="flex items-center gap-1.5">
-          <IntentBadge intent={row.original.intent} />
-          <StateBadge dataset={row.original} />
+          {row.original.state === "error" ? (
+            <StateBadge dataset={row.original} />
+          ) : (
+            <IntentBadge intent={row.original.intent} />
+          )}
         </span>
       ),
-      header: "Intent",
+      header: "Purpose",
       id: "intent",
-      meta: { label: "Intent", noTruncate: true, orderingField: "intent" },
+      meta: { label: "Purpose", noTruncate: true, orderingField: "intent" },
       minSize: 110,
       size: 150,
     },
@@ -214,7 +214,11 @@ function getColumns(opts: {
       accessorFn: (row) => row.rows ?? 0,
       cell: ({ row }) => (
         <span className="tabular-nums text-sm text-foreground">
-          {formatNumber(row.original.rows ?? 0)}
+          {row.original.state === "error" ? (
+            <span className="text-muted-foreground">—</span>
+          ) : (
+            formatNumber(row.original.rows ?? 0)
+          )}
         </span>
       ),
       header: "Rows",
@@ -285,7 +289,7 @@ function getColumns(opts: {
             <span onClick={(e) => e.stopPropagation()}>
               <ConfirmDialog
                 confirmLabel="Delete"
-                description={`${datasetDisplayName(ds)} and every version of it will be removed. Runs that used a version keep this dataset in place.`}
+                description={`${datasetDisplayName(ds)} and all its versions will be deleted. A dataset that a training job, evaluation or optimiser run used cannot be deleted.`}
                 destructive
                 isPending={opts.deletePendingId === ds.id}
                 onConfirm={() => opts.onDelete(ds)}

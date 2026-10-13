@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
 import { diffText } from "@/components/datasets/notebook/diff";
 import { Badge } from "@/components/ui/badge";
@@ -38,6 +38,19 @@ const FILTER_OPS: Array<{ value: RowFilter["op"]; label: string; needsValue: boo
 ];
 
 type Row = Record<string, unknown> & { _index: number };
+
+interface Evidence {
+  filename?: string;
+  page?: number | null;
+}
+
+function evidenceOf(row: Row): string[] {
+  const provenance = row._overmind_provenance as { evidence?: Evidence[] } | null | undefined;
+  return (provenance?.evidence ?? []).map((piece) =>
+    // `element` is the extractor's internal reference (`#/texts/1`), not something to read.
+    [piece.filename, piece.page != null ? `page ${piece.page}` : ""].filter(Boolean).join(" · ")
+  );
+}
 
 function fullText(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -81,6 +94,71 @@ function ChangedValue({
           </span>
         )
       )}
+    </span>
+  );
+}
+
+interface Turn {
+  role?: unknown;
+  content?: unknown;
+  tool_calls?: Array<{ function?: { name?: unknown; arguments?: unknown } }>;
+}
+
+/** A messages value: a list of chat turns, possibly stored as a JSON string. */
+function turnsOf(value: unknown): Turn[] | null {
+  let parsed = value;
+  if (typeof value === "string" && value.trimStart().startsWith("[")) {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  return Array.isArray(parsed) &&
+    parsed.length > 0 &&
+    parsed.every((turn) => !!turn && typeof turn === "object" && "role" in turn)
+    ? (parsed as Turn[])
+    : null;
+}
+
+function contentText(content: unknown): string {
+  if (content === null || content === undefined) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content))
+    return content
+      .map((part) =>
+        part && typeof part === "object" && "text" in part ? String(part.text) : cellText(part)
+      )
+      .join(" ");
+  return cellText(content);
+}
+
+function turnText(turn: Turn | undefined): string {
+  if (!turn) return "";
+  const calls = (turn.tool_calls ?? [])
+    .map(
+      (call) => `→ ${String(call.function?.name ?? "tool")}(${cellText(call.function?.arguments)})`
+    )
+    .join("\n");
+  return [contentText(turn.content), calls].filter(Boolean).join("\n");
+}
+
+const summaryOf = (turns: Turn[]) =>
+  turns.map((turn) => `${String(turn.role)}: ${turnText(turn)}`).join("  ");
+
+function Conversation({ turns, before }: { turns: Turn[]; before: Turn[] | null }) {
+  return (
+    <span className="grid min-w-80 grid-cols-[4.5rem_1fr] gap-x-2 gap-y-1.5">
+      {turns.map((turn, index) => (
+        <Fragment key={`${index}-${String(turn.role)}`}>
+          <span className="pixel-label pt-px text-muted-foreground">{String(turn.role)}</span>
+          {before ? (
+            <ChangedValue after={turnText(turn)} before={turnText(before[index])} wrap />
+          ) : (
+            <span className="whitespace-pre-wrap break-words">{turnText(turn)}</span>
+          )}
+        </Fragment>
+      ))}
     </span>
   );
 }
@@ -306,21 +384,12 @@ export interface RowsGridProps {
   /** Mark rows added and values changed against the cell before. */
   diff?: boolean;
   pageSize?: number;
-  className?: string;
-  enabled?: boolean;
 }
 
 /** Paged grid over one cell's frame, with server-side sort, search, filters,
  *  and git-style marks: new rows tinted, changed values tinted with the old
  *  value on hover. */
-export function RowsGrid({
-  datasetId,
-  cellId,
-  diff = false,
-  pageSize = 10,
-  className,
-  enabled = true,
-}: RowsGridProps) {
+export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: RowsGridProps) {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(pageSize);
   const [sort, setSort] = useState<{ field: string; dir: "asc" | "desc" } | null>(null);
@@ -334,21 +403,16 @@ export function RowsGrid({
     setPage(1);
   }, [debouncedSearch, filters, sort]);
 
-  const rowsQuery = useRowsQuery(
-    datasetId,
-    cellId,
-    {
-      diff,
-      dir: sort?.dir,
-      filters,
-      limit,
-      offset: (page - 1) * limit,
-      search: debouncedSearch,
-      sort: sort?.field,
-    },
-    enabled
-  );
-  const columnsQuery = useColumnsQuery(datasetId, cellId, enabled);
+  const rowsQuery = useRowsQuery(datasetId, cellId, {
+    diff,
+    dir: sort?.dir,
+    filters,
+    limit,
+    offset: (page - 1) * limit,
+    search: debouncedSearch,
+    sort: sort?.field,
+  });
+  const columnsQuery = useColumnsQuery(datasetId, cellId);
   const statsByName = useMemo(() => {
     const map = new Map<string, ColumnStat>();
     for (const c of columnsQuery.data ?? []) map.set(c.name, c);
@@ -380,11 +444,10 @@ export function RowsGrid({
     []
   );
 
-  if (!enabled) return null;
   const narrowing = !!debouncedSearch || filters.length > 0;
 
   return (
-    <div className={cn("flex min-h-0 flex-col", className)}>
+    <div className="flex min-h-0 flex-col">
       <div className="flex flex-wrap items-center gap-1.5 px-2.5 py-1">
         <SearchInput
           className="w-44"
@@ -441,14 +504,14 @@ export function RowsGrid({
           </Badge>
         )}
         <span className="flex-1" />
-        {data && narrowing && (
+        {data && narrowing && data.total > 0 && (
           <span className="text-xs tabular-nums text-muted-foreground">
-            {data.total.toLocaleString()} match
+            {data.total.toLocaleString()} {data.total === 1 ? "row matches" : "rows match"}
           </span>
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto border-t border-border/70">
+      <div className="nowheel min-h-0 flex-1 overflow-auto overscroll-contain border-t border-border/70">
         {rowsQuery.isPending ? (
           <div className="flex flex-col gap-1.5 p-2">
             <Skeleton className="h-5 w-full" />
@@ -511,49 +574,90 @@ export function RowsGrid({
                     ? undefined
                     : marks[String(sourceRow)];
                 const open = openRow === rowIndex;
+                const evidence = open ? evidenceOf(row) : [];
                 return (
-                  <tr
-                    aria-expanded={open}
-                    className={cn(
-                      "cursor-pointer hover:bg-accent/40",
-                      mark?.added && "bg-success/10",
-                      open && "bg-accent/40"
-                    )}
-                    key={row._index}
-                    onClick={() => setOpenRow(open ? null : rowIndex)}
-                  >
-                    <td className="border-r border-b border-border/60 px-2 py-1 font-mono tabular-nums text-muted-foreground">
-                      {row._index}
-                    </td>
-                    {columns.map((c) => {
-                      const value = row[c.name];
-                      const text = open ? fullText(value) : cellText(value);
-                      const before = mark?.before && c.name in mark.before ? mark.before : null;
-                      return (
-                        <td
-                          className={cn(
-                            "max-w-[26rem] border-r border-b border-border/60 px-2 py-1 align-top last:border-r-0",
-                            // Open: the same cells, wrapped to their full text.
-                            open ? "whitespace-pre-wrap break-words" : "truncate",
-                            c.type === "number" || c.type === "integer"
-                              ? "text-right tabular-nums"
-                              : "",
-                            text === "" && !before && "italic text-muted-foreground"
-                          )}
-                          key={c.name}
-                          title={!open && text.length > 80 ? text.slice(0, 400) : undefined}
+                  <Fragment key={row._index}>
+                    <tr
+                      className={cn(
+                        "cursor-pointer hover:bg-accent/40",
+                        mark?.added && "bg-success/10",
+                        open && "bg-accent/40"
+                      )}
+                      onClick={() => setOpenRow(open ? null : rowIndex)}
+                    >
+                      <td className="border-r border-b border-border/60 px-2 py-1 font-mono tabular-nums text-muted-foreground">
+                        <button
+                          aria-expanded={open}
+                          aria-label={`${open ? "Collapse" : "Inspect"} row ${row._index}`}
+                          className="rounded-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setOpenRow(open ? null : rowIndex);
+                          }}
+                          type="button"
                         >
-                          {before ? (
-                            <ChangedValue after={value} before={before[c.name]} wrap={open} />
-                          ) : text === "" ? (
-                            "null"
-                          ) : (
-                            text
-                          )}
+                          {row._index}
+                        </button>
+                      </td>
+                      {columns.map((c) => {
+                        const value = row[c.name];
+                        const turns = turnsOf(value);
+                        const text = turns
+                          ? summaryOf(turns)
+                          : open
+                            ? fullText(value)
+                            : cellText(value);
+                        const before = mark?.before && c.name in mark.before ? mark.before : null;
+                        const priorTurns = before ? turnsOf(before[c.name]) : null;
+                        return (
+                          <td
+                            className={cn(
+                              "max-w-[26rem] border-r border-b border-border/60 px-2 py-1 align-top last:border-r-0",
+                              open ? "whitespace-pre-wrap break-words" : "truncate",
+                              c.type === "number" || c.type === "integer"
+                                ? "text-right tabular-nums"
+                                : "",
+                              text === "" && !before && "italic text-muted-foreground"
+                            )}
+                            key={c.name}
+                            title={!open && text.length > 80 ? text.slice(0, 400) : undefined}
+                          >
+                            {turns && open ? (
+                              <Conversation
+                                before={before ? (priorTurns ?? []) : null}
+                                turns={turns}
+                              />
+                            ) : turns && before ? (
+                              <ChangedValue
+                                after={text}
+                                before={
+                                  priorTurns ? summaryOf(priorTurns) : cellText(before[c.name])
+                                }
+                              />
+                            ) : before ? (
+                              <ChangedValue after={value} before={before[c.name]} wrap={open} />
+                            ) : text === "" ? (
+                              "null"
+                            ) : (
+                              text
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                    {evidence.length > 0 && (
+                      <tr className="bg-accent/20">
+                        <td className="border-r border-b border-border/60" />
+                        <td
+                          className="border-b border-border/60 px-2 py-1 text-muted-foreground"
+                          colSpan={columns.length}
+                        >
+                          <span className="pixel-label mr-2">From</span>
+                          {evidence.join(" · ")}
                         </td>
-                      );
-                    })}
-                  </tr>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>

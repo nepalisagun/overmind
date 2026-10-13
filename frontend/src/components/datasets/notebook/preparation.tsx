@@ -1,159 +1,79 @@
+import { Link } from "@tanstack/react-router";
+
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
-import { cn } from "@/lib/utils";
-import type { Cell } from "@/openapi";
+import { Icon } from "@/components/ui/icons";
 
-interface Review {
-  rows_before: number;
-  rows_after: number;
-  rows_removed?: number;
-  generated_rows?: number;
-  coverage_before?: Record<string, Record<string, number>>;
-  coverage_after?: Record<string, Record<string, number>>;
-  removed_examples?: unknown[];
-  generated_examples?: unknown[];
-  output_examples?: unknown[];
-  input_examples?: unknown[];
+interface SplitSpec {
+  split?: { role?: "train" | "eval"; sibling?: string };
+  contamination_report?: {
+    train_rows: number;
+    eval_rows: number;
+    duplicates_removed: number;
+    content_overlap: number;
+    group_overlap: number;
+    group_by: string[];
+    stratify_by: string | null;
+  };
 }
 
-export function ProposalImpact({ cell }: { cell: Cell }) {
-  const review = cell.review as Review | null;
-  if (!review || typeof review.rows_before !== "number") return null;
-  const examples =
-    review.generated_examples ??
-    (review.rows_removed ? review.removed_examples : review.output_examples);
-  return (
-    <div className="flex flex-col gap-2 text-xs">
-      <p className="tabular-nums">
-        {review.rows_before.toLocaleString()} → {review.rows_after.toLocaleString()} rows
-        {review.generated_rows
-          ? ` · ${review.generated_rows} generated`
-          : review.rows_removed
-            ? ` · ${review.rows_removed} excluded`
-            : ""}
-      </p>
-      {Object.entries(review.coverage_before ?? {}).map(([column, before]) => {
-        const after = review.coverage_after?.[column] ?? {};
-        return (
-          <details key={column}>
-            <summary className="cursor-pointer text-muted-foreground">{column} coverage</summary>
-            <table className="mt-1 w-full text-left tabular-nums">
-              <thead>
-                <tr>
-                  <th>Value</th>
-                  <th>Before</th>
-                  <th>After</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...new Set([...Object.keys(before), ...Object.keys(after)])].map((value) => (
-                  <tr key={value}>
-                    <td className="break-all">{value}</td>
-                    <td>{before[value] ?? 0}</td>
-                    <td>{after[value] ?? 0}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </details>
-        );
-      })}
-      {!!examples?.length && (
-        <details>
-          <summary className="cursor-pointer text-muted-foreground">
-            {review.generated_rows ? "Generated" : review.rows_removed ? "Excluded" : "Output"}{" "}
-            examples
-          </summary>
-          <pre className="mt-1 max-h-52 overflow-auto whitespace-pre-wrap break-all rounded-sm border border-border bg-background p-2">
-            {JSON.stringify(examples, null, 2)}
-          </pre>
-        </details>
-      )}
-      {!!review.input_examples?.length && !review.generated_rows && (
-        <details>
-          <summary className="cursor-pointer text-muted-foreground">Input examples</summary>
-          <pre className="mt-1 max-h-52 overflow-auto whitespace-pre-wrap break-all rounded-sm border border-border bg-background p-2">
-            {JSON.stringify(review.input_examples, null, 2)}
-          </pre>
-        </details>
-      )}
-    </div>
-  );
-}
+const rows = (n: number) => `${n.toLocaleString()} ${n === 1 ? "row" : "rows"}`;
 
-export function QualityChip({ cell }: { cell: Cell }) {
-  const reviewed = cell.readiness?.qualityReviewed;
-  const passed = cell.readiness?.qualityPassed;
-  const report = cell.qualityReport as {
-    checks?: { name: string; result: string; evidence: string }[];
-  } | null;
-  return (
-    <HoverCard>
-      <HoverCardTrigger asChild>
-        <button
-          className={cn(
-            "inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-sm border px-1.5 text-xs",
-            passed
-              ? "border-border text-muted-foreground"
-              : "border-warning/40 bg-warning/10 text-warning"
-          )}
-          type="button"
-        >
-          {passed ? "Quality passed" : "Review recommended"}
-        </button>
-      </HoverCardTrigger>
-      <HoverCardContent className="max-h-80 w-80 overflow-auto text-xs">
-        {cell.readiness?.qualityReason && <p className="mb-2">{cell.readiness.qualityReason}</p>}
-        {reviewed ? (
-          <ul className="flex flex-col gap-2">
-            {report?.checks?.map((check, index) => (
-              <li key={`${check.name}-${index}`}>
-                <p>
-                  {check.name} · {check.result}
-                </p>
-                <p className="text-muted-foreground">{check.evidence}</p>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p>No current quality review for this version and capability.</p>
-        )}
-        <p className="mt-2 text-muted-foreground">Model and context checks run before training.</p>
-      </HoverCardContent>
-    </HoverCard>
-  );
-}
+export const isSplit = (spec: unknown) => !!(spec as SplitSpec | null)?.contamination_report;
 
-export function ContaminationReport({ spec }: { spec: unknown }) {
-  const report = (
-    spec as {
-      contamination_report?: {
-        train_rows: number;
-        eval_rows: number;
-        duplicates_removed: number;
-        content_overlap: number;
-        group_overlap: number;
-        group_by: string[];
-        stratify_by: string | null;
-      };
-    } | null
-  )?.contamination_report;
+export function SplitSummary({ spec, projectId }: { spec: unknown; projectId: string }) {
+  const { split, contamination_report: report } = (spec ?? {}) as SplitSpec;
   if (!report) return null;
+  const sibling = split?.sibling;
+  const otherLabel = split?.role === "eval" ? "Training set" : "Evaluation set";
+  const overlap = report.content_overlap + report.group_overlap;
   return (
-    <details className="mb-2 mr-2 rounded-md border border-border p-2.5 text-xs">
-      <summary className="cursor-pointer">
-        Data split · {report.train_rows} train · {report.eval_rows} eval
-      </summary>
-      <div className="mt-2 flex flex-col gap-1 text-muted-foreground">
-        <p>
-          {report.duplicates_removed} duplicates removed · {report.content_overlap} matching inputs
-          across splits · {report.group_overlap} shared groups
-        </p>
-        <p>
-          Groups: {report.group_by.join(", ") || "matching content"} · Stratification:{" "}
-          {report.stratify_by ?? "none"}
-        </p>
-        <p>Source snapshot only. Near-duplicate similarity not checked.</p>
-      </div>
-    </details>
+    <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+      <Icon.gitBranch className="size-3.5 shrink-0" />
+      <span className="hidden truncate sm:inline">
+        Split · {report.train_rows.toLocaleString()} training, {report.eval_rows.toLocaleString()}{" "}
+        evaluation rows
+      </span>
+      <HoverCard openDelay={150}>
+        <HoverCardTrigger asChild>
+          <button
+            aria-label="Split details"
+            className="inline-flex shrink-0 items-center rounded-xs p-0.5 hover:bg-wash-raised hover:text-foreground"
+            type="button"
+          >
+            <Icon.info className="size-3.5" />
+          </button>
+        </HoverCardTrigger>
+        <HoverCardContent align="start" className="w-80 p-3 text-xs">
+          <ul className="flex flex-col gap-1.5 text-muted-foreground">
+            <li>
+              {report.duplicates_removed
+                ? `${rows(report.duplicates_removed)} removed as duplicates.`
+                : "No duplicates found."}
+            </li>
+            <li>
+              {overlap
+                ? `${rows(overlap)} share an input or group with the other set.`
+                : "No input or group appears in both sets."}
+            </li>
+            {report.group_by.length > 0 && (
+              <li>Rows with the same {report.group_by.join(", ")} stay in one set.</li>
+            )}
+            {report.stratify_by && <li>Both sets keep the mix of {report.stratify_by}.</li>}
+            <li>Near-duplicates are not checked.</li>
+          </ul>
+        </HoverCardContent>
+      </HoverCard>
+      {sibling && (
+        <Link
+          className="inline-flex shrink-0 items-center gap-1 text-foreground hover:underline"
+          params={{ datasetId: sibling }}
+          search={{ projectId }}
+          to="/datasets/$datasetId"
+        >
+          {otherLabel}
+          <Icon.forward className="size-3" />
+        </Link>
+      )}
+    </span>
   );
 }

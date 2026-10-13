@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable
 from contextlib import suppress
 
-from overbae.services.datasets.examples import input_objects
+from sandbox.examples import input_objects
 
 _IDENTITY = {"source_row", "trace_id", "source_trace_id", "conversation_id", "_overmind_provenance"}
 _OUTPUT = {"output", "expected_output", "answer", "response", "completion", "label", "score"}
@@ -162,7 +162,8 @@ def split_positions(
     ordered = list(components.values())
     if len(ordered) < 2:
         raise ValueError(
-            "All rows belong to one content/group cluster; an independent holdout cannot be created."
+            "All rows are one group (the same content, conversation, trace, document, "
+            "group column or synthetic seed). A split needs two."
         )
     if position == "tail":
         ordered.reverse()
