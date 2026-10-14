@@ -11,6 +11,7 @@ from asgiref.sync import sync_to_async
 from mcp import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from overbae.services.mcp import request_keys
 from overbae.services.mcp.annotations import annotations_for
 from overbae.services.mcp.context import MCPContext, project_context
 from overbae.services.mcp.errors import MCPError, error_result, internal_error
@@ -23,7 +24,7 @@ CostClass = Literal["free", "compute", "llm", "gpu"]
 AsyncMode = Literal["sync", "job", "task"]
 _TOOL_NAME = r"^[a-z][a-z0-9_]{0,63}$"
 _FORBIDDEN_NAME_PARTS = ("delete", "remove", "cancel", "retry", "undeploy")
-_ALLOWED_LIFECYCLE_TOOLS = frozenset({"retry_deployment"})
+_ALLOWED_LIFECYCLE_TOOLS = frozenset({"retry_deployment", "cancel_dataset_job"})
 _SCHEMA_NOISE_KEYS = frozenset({"default", "discriminator", "title"})
 _KNOWN_SCOPES = frozenset(
     {
@@ -203,22 +204,49 @@ class ToolCatalog:
                 )
             )
 
+        key = getattr(payload, "request_key", None)
+        keyed = (
+            (
+                context.project,
+                name,
+                key,
+                payload.model_dump(mode="json", by_alias=True, exclude={"request_key"}),
+            )
+            if key
+            else None
+        )
+        try:
+            replay = await sync_to_async(request_keys.claim)(*keyed) if keyed else None
+        except MCPError as error:
+            return error_result(error)
+        if replay is not None:
+            return self._result(entry, context, replay)
         try:
             result = entry.handler(payload, context)
             if inspect.isawaitable(result):
                 result = await result
             output = entry.definition.output_model.model_validate(result)
-        except MCPError as error:
-            return error_result(error)
-        except ValidationError:
-            return error_result(MCPError("invalid_output", "The tool returned an invalid result."))
-        except Exception:
+        except Exception as error:
+            if keyed:
+                await sync_to_async(request_keys.release)(*keyed[:3])
+            if isinstance(error, MCPError):
+                return error_result(error)
+            if isinstance(error, ValidationError):
+                return error_result(
+                    MCPError("invalid_output", "The tool returned an invalid result.")
+                )
             logger.exception(
                 "MCP tool %s failed for project %s", name, getattr(context.project, "id", None)
             )
             return error_result(internal_error())
 
         structured = output.model_dump(mode="json", by_alias=True)
+        if keyed:
+            await sync_to_async(request_keys.record)(*keyed[:3], structured)
+        return self._result(entry, context, structured)
+
+    @staticmethod
+    def _result(entry: CatalogEntry, context: MCPContext, structured: dict) -> types.CallToolResult:
         if entry.definition.project_scoped and context.token.scope.get("scope") == "account":
             structured = project_references(structured, context.project.pk)
         return tool_result(structured)

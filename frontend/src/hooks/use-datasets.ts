@@ -65,6 +65,7 @@ export type DatasetEvent =
   | { type: "land_started" | "land_done" }
   | { type: "land_progress"; stage?: string; traces?: number }
   | { type: "land_failed"; error?: string }
+  | { type: "land_cancelled" }
   | {
       type: "execution_queued" | "execution_started" | "execution_finished";
       execution_id: string;
@@ -131,6 +132,10 @@ export const activeCellOf = (dataset: Dataset | null | undefined): Cell | null =
 
 export const isBusy = (ds: Dataset | null | undefined): boolean => ds?.state === "landing";
 
+/** The import failed or was stopped, so the dataset has no source. */
+export const importEnded = (ds: Pick<Dataset, "state">): boolean =>
+  ds.state === "error" || ds.state === "stopped";
+
 /** The used-version block consumers carry (`cell_info`). */
 export interface UsedVersionInfo {
   id: string;
@@ -164,6 +169,7 @@ const datasetKeys = {
     ["datasets", "list", projectId, "inventory"] as const,
   list: (projectId: string | undefined, filters: DatasetListFilters) =>
     ["datasets", "list", projectId, filters] as const,
+  preparePrompt: (id: string, cell: string) => ["datasets", id, "prepare-prompt", cell] as const,
   rows: (id: string, cell: string | undefined, params: RowsParams) =>
     ["datasets", id, "rows", cell, params] as const,
 };
@@ -396,6 +402,53 @@ export function useResumeImportMutation(id: string) {
   });
 }
 
+export function useCancelImportMutation(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiClient.datasets.datasetsCancelImportCreate({ id }),
+    onError: (e) => notify.error(e, "Couldn't cancel the import"),
+    onSuccess: () => invalidateDataset(qc, id),
+  });
+}
+
+export function useCancelExecutionMutation(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (executionId: string) =>
+      apiClient.datasets.datasetsExecutionsCancelCreate({ executionId, id }),
+    onError: (e) => notify.error(e, "Couldn't cancel the run"),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: datasetKeys.executions(id) });
+      invalidateDataset(qc, id);
+    },
+  });
+}
+
+/** The prepare-dataset MCP prompt filled with this project, dataset and version. */
+export function usePreparePromptQuery(id: string, cell: string, enabled: boolean) {
+  return useQuery({
+    enabled,
+    queryFn: async () =>
+      (await apiClient.datasets.datasetsPreparePromptRetrieve({ cell, id })).prompt,
+    queryKey: datasetKeys.preparePrompt(id, cell),
+  });
+}
+
+export async function downloadAttachment(id: string, cell: string, filename: string) {
+  saveBlob(await apiClient.datasets.datasetsAttachmentRetrieve({ cell, id }), filename);
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export async function downloadExport(
   id: string,
   cell: string | undefined,
@@ -409,13 +462,7 @@ export async function downloadExport(
     const detail = (await res.json().catch(() => null))?.detail;
     throw new Error(typeof detail === "string" ? detail : `Export failed (HTTP ${res.status}).`);
   }
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${filename}.${fmt}`;
-  a.click();
-  URL.revokeObjectURL(url);
+  saveBlob(await res.blob(), `${filename}.${fmt}`);
 }
 
 /** Fetch-based SSE (EventSource cannot send an Authorization header). Replays the

@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import json
 import uuid
 from unittest.mock import Mock
@@ -13,8 +14,8 @@ from overbae.models import Dataset, Project, ProjectMembership, User
 from overbae.services.datasets import files, paths
 
 
-def _upload(name, content):
-    upload_id, _ = files.begin_upload(name)
+def _upload(name, content, project=None):
+    upload_id, _ = files.begin_upload(name, project=project)
     files.append_chunk(upload_id, 0, content)
     return upload_id
 
@@ -44,7 +45,12 @@ def client_project(db):
 def test_inspection_counts_the_same_rows_that_land(name, content, rows):
     upload_id = _upload(name, content)
     inspection = files.inspect_upload(upload_id, size=len(content))
-    assert inspection == {"filename": name, "bytes": len(content), "rows": rows}
+    assert inspection == {
+        "filename": name,
+        "bytes": len(content),
+        "rows": rows,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
     assert len(list(files.FileRows(files.upload_data_path(upload_id), filename=name))) == rows
 
 
@@ -110,7 +116,12 @@ def test_inspection_endpoint_counts_rows_and_reports_validation_errors(client_pr
     url = f"/api/uploads/{upload_id}/inspect/"
     result = client.post(url, {"size": len(content)}, format="json")
     assert result.status_code == 200, result.data
-    assert result.data == {"filename": "data.csv", "bytes": len(content), "rows": 2}
+    assert result.data == {
+        "filename": "data.csv",
+        "bytes": len(content),
+        "rows": 2,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
     assert client.post(url, {"size": -1}, format="json").status_code == 400
     assert client.post(url, {"size": 999}, format="json").status_code == 400
     assert client.post("/api/uploads/not-a-uuid/inspect/", {"size": 0}).status_code == 404
@@ -143,7 +154,7 @@ def test_multiple_files_land_in_order_and_split_across_the_combined_rows(client_
     second = json.dumps(
         [{"input": f"q{i}", "expected_output": f"a{i}"} for i in range(7, 15)]
     ).encode()
-    ids = [_upload("first.csv", first), _upload("second.json", second)]
+    ids = [_upload("first.csv", first, project.id), _upload("second.json", second, project.id)]
     assert sum(files.inspect_upload(i, size=files.upload_received(i))["rows"] for i in ids) == 15
     body = {"project": str(project.id), "name": "Combined", "source": {"uploads": ids}}
     if split:
@@ -173,7 +184,7 @@ def test_multiple_files_land_in_order_and_split_across_the_combined_rows(client_
 @pytest.mark.parametrize("split", [False, True])
 def test_an_upload_lands_only_as_the_file_it_was_inspected_as(client_project, split):
     client, project = client_project
-    upload_id = _upload("data.jsonl", b'{"input":"one"}\n{"input":"two"}\n')
+    upload_id = _upload("data.jsonl", b'{"input":"one"}\n{"input":"two"}\n', project.id)
     body = {"project": str(project.id), "name": "Strict", "source": {"uploads": [upload_id]}}
     if split:
         body.update(eval_percent=50, position="tail")
@@ -189,8 +200,8 @@ def test_an_upload_lands_only_as_the_file_it_was_inspected_as(client_project, sp
 
 def test_invalid_multi_file_sources_are_rejected_before_creation(client_project):
     client, project = client_project
-    upload_id = _upload("data.csv", b"input\none\n")
-    empty_id, _ = files.begin_upload("empty.csv")
+    upload_id = _upload("data.csv", b"input\none\n", project.id)
+    empty_id, _ = files.begin_upload("empty.csv", project=project.id)
     for source in (
         {"uploads": []},
         {"uploads": [upload_id, upload_id]},

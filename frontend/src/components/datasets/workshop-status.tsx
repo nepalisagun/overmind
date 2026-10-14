@@ -10,13 +10,15 @@ import { domainStatus, TONE_BADGE_VARIANT } from "@/lib/colors";
 import { cn } from "@/lib/utils";
 import type { Dataset, Execution } from "@/openapi";
 
-type WorkshopState = "working" | "complete" | "error" | "idle";
+type WorkshopState = "working" | "complete" | "error" | "stopped" | "idle";
 
-export const workshopStateOf = (dataset: Pick<Dataset, "state" | "running" | "activeVersion">) =>
+export const workshopStateOf = (
+  dataset: Pick<Dataset, "state" | "running" | "activeVersion">
+): WorkshopState =>
   dataset.state === "landing" || (dataset.running ?? 0) > 0
     ? "working"
-    : dataset.state === "error"
-      ? "error"
+    : dataset.state === "error" || dataset.state === "stopped"
+      ? dataset.state
       : dataset.activeVersion
         ? "complete"
         : "idle";
@@ -25,6 +27,7 @@ const STATE_LABEL: Record<WorkshopState, string> = {
   complete: "Ready",
   error: "Failed",
   idle: "Idle",
+  stopped: "Import stopped",
   working: "Working",
 };
 
@@ -51,6 +54,8 @@ export function WorkshopStatusIcon({
       <Icon.loader className="workshop-working text-info" />
     ) : state === "error" ? (
       <Icon.warning className="text-destructive" />
+    ) : state === "stopped" ? (
+      <Icon.stop className="text-muted-foreground" />
     ) : state === "complete" ? (
       <Icon.success className={cn("text-success", finished && "workshop-finished")} />
     ) : (
@@ -75,18 +80,45 @@ const MODE_LABEL: Record<Execution["mode"], string> = {
 };
 
 const STATE_TEXT: Record<Exclude<Execution["state"], "ok">, string> = {
+  cancelled: "Stopped",
   failed: "Failed",
   queued: "Waiting",
   running: "Running",
 };
 
+const elapsed = (seconds: number, live: boolean) =>
+  seconds < 60
+    ? live
+      ? `${Math.floor(seconds)}s`
+      : `${seconds.toFixed(1)}s`
+    : `${Math.floor(seconds / 60)}m ${String(Math.floor(seconds % 60)).padStart(2, "0")}s`;
+
+function useNow(ticking: boolean) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [ticking]);
+  return now;
+}
+
 function RunLine({
   run,
   onShowVersion,
+  onCancel,
 }: {
   run: Execution;
   onShowVersion: (label: string) => void;
+  onCancel?: () => void;
 }) {
+  const live = run.state === "queued" || run.state === "running";
+  const now = useNow(run.state === "running");
+  const end = run.finishedAt?.getTime() ?? (run.state === "running" ? now : null);
+  const seconds =
+    run.runSeconds ??
+    (run.startedAt && end != null ? Math.max(0, (end - run.startedAt.getTime()) / 1000) : null);
   // A traceback ends with the exception; its first line only names the frame.
   const failure =
     run.state === "failed"
@@ -109,21 +141,30 @@ function RunLine({
           {run.title || run.scriptHead}
         </span>
         {run.state !== "ok" && (
-          <Badge size="chip" variant={TONE_BADGE_VARIANT[domainStatus(run.state)]}>
+          <Badge
+            size="chip"
+            variant={
+              run.state === "cancelled" ? "neutral" : TONE_BADGE_VARIANT[domainStatus(run.state)]
+            }
+          >
             {STATE_TEXT[run.state as keyof typeof STATE_TEXT]}
           </Badge>
         )}
-      </div>
-      <div className="flex items-center gap-2 pl-18 text-xs text-muted-foreground">
-        <span className="tabular-nums">
-          {run.runSeconds != null ? `${run.runSeconds.toFixed(1)}s` : "—"}
-        </span>
-        <span>{formatSmart(run.queuedAt)}</span>
-        {run.parent && <span className="font-mono">from {run.parent}</span>}
+        {live && onCancel && (
+          <Button
+            aria-label={`Stop ${run.title || run.scriptHead}`}
+            onClick={onCancel}
+            size="xs"
+            variant="secondary"
+          >
+            <Icon.stop />
+            Stop
+          </Button>
+        )}
         {run.cell && (
           <Button
             aria-label={`Show ${run.cell}`}
-            className="ml-auto"
+            className="font-mono"
             onClick={() => onShowVersion(run.cell!)}
             size="xs"
             variant="secondary"
@@ -131,6 +172,12 @@ function RunLine({
             {run.cell}
           </Button>
         )}
+      </div>
+      <div className="flex items-center gap-2 pl-18 text-xs text-muted-foreground">
+        <span className="tabular-nums">{seconds != null ? elapsed(seconds, live) : "—"}</span>
+        <span>{formatSmart(run.queuedAt)}</span>
+        {run.parent && <span className="font-mono">from {run.parent}</span>}
+        {run.attachment && <span className="truncate">with {run.attachment}</span>}
       </div>
       {failure && <p className="truncate pl-18 text-xs text-destructive">{failure}</p>}
     </li>
@@ -140,9 +187,11 @@ function RunLine({
 export function WorkshopStatus({
   dataset,
   onShowVersion,
+  onCancelRun,
 }: {
   dataset: Dataset;
   onShowVersion: (label: string) => void;
+  onCancelRun?: (executionId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const runs = useDatasetExecutionsQuery(dataset.id, open);
@@ -172,6 +221,7 @@ export function WorkshopStatus({
             {runs.data.map((run) => (
               <RunLine
                 key={run.id}
+                onCancel={onCancelRun ? () => onCancelRun(run.id) : undefined}
                 onShowVersion={(label) => {
                   setOpen(false);
                   onShowVersion(label);

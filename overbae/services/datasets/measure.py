@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+from django.core.cache import cache
+from django.db import transaction
 from django.utils import timezone
 
 from overbae.models import Cell, Dataset
-from overbae.services.datasets import alignment, contract, paths, store
+from overbae.services.datasets import alignment, contract, events, paths, store
+
+ANALYTICS_BATCH = 20
+ANALYTICS_LOCK_SECONDS = 600
 
 
 def describe_frame(dataset, path, *, report=None):
     frame = store.Frame(path)
     report = report or contract.measure(frame)
-    null_rates = {c["name"]: c["null_rate"] for c in store.column_stats(path)}
+    column_stats = store.column_stats(path)
+    null_rates = {c["name"]: c["null_rate"] for c in column_stats}
     capability_report = (
         alignment.capability_contract(dataset.capability, frame, dataset.intent)
         if dataset.capability_id is not None
@@ -28,8 +34,53 @@ def describe_frame(dataset, path, *, report=None):
         },
         "capability_report": capability_report,
         "stats": contract.stats(frame),
+        "analytics": contract.analytics(frame, column_stats),
         "updated_at": timezone.now(),
     }
+
+
+def request_analytics(dataset: Dataset, cells: list[Cell]) -> None:
+    """Versions measured before analytics existed are measured in the background."""
+    if all(cell.analytics for cell in cells):
+        return
+    # The task imports this service, so task imports stay at dispatch boundaries.
+    from overbae.tasks.datasets import measure_analytics
+
+    key = f"dataset-analytics:{dataset.pk}"
+
+    def dispatch():
+        if not cache.add(key, 1, timeout=ANALYTICS_LOCK_SECONDS):
+            return
+        try:
+            measure_analytics.delay(dataset_id=str(dataset.pk))
+        except Exception:
+            cache.delete(key)
+            raise
+
+    transaction.on_commit(dispatch)
+
+
+def backfill_analytics(dataset_id) -> int:
+    cells = list(
+        Cell.objects.filter(dataset_id=dataset_id, analytics={}).order_by("position")[
+            :ANALYTICS_BATCH
+        ]
+    )
+    for cell in cells:
+        path = paths.cell_path(dataset_id, cell.id)
+        result = (
+            contract.analytics(store.Frame(path), store.column_stats(path))
+            if path.exists()
+            else {"labels": [], "inputs": {}}
+        )
+        Cell.objects.filter(pk=cell.pk, analytics={}).update(analytics=result)
+    cache.delete(f"dataset-analytics:{dataset_id}")
+    if cells:
+        events.publish(
+            dataset_id,
+            {"dataset_id": str(dataset_id), "type": "dataset_updated", "changed": {}},
+        )
+    return len(cells)
 
 
 def capability_only(dataset: Dataset) -> None:

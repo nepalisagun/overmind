@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import io
 import json
 import logging
@@ -277,10 +278,16 @@ def inspect_upload(
         raise FileError("The file is empty." if is_document(filename) else "The file has no rows.")
     path = upload_data_path(upload_id)
     bare = filename.lower().removesuffix(".gz")
+    digest = _sha256(path)
     if is_document(filename):
-        record = {"bytes": size, "mtime_ns": stored_stat(path).st_mtime_ns, "rows": None}
+        record = {
+            "bytes": size,
+            "mtime_ns": stored_stat(path).st_mtime_ns,
+            "rows": None,
+            "sha256": digest,
+        }
         _inspection_path(upload_id).write_text(json.dumps(record), encoding="utf-8")
-        return {"filename": filename, "bytes": size, "rows": None}
+        return {"filename": filename, "bytes": size, "rows": None, "sha256": digest}
     try:
         if bare.endswith(".parquet"):
             rows = pq.ParquetFile(path).metadata.num_rows
@@ -310,9 +317,22 @@ def inspect_upload(
         raise FileError(message) from exc
     if not rows:
         raise FileError("The file has no rows.")
-    record = {"bytes": size, "mtime_ns": stored_stat(path).st_mtime_ns, "rows": rows}
+    record = {
+        "bytes": size,
+        "mtime_ns": stored_stat(path).st_mtime_ns,
+        "rows": rows,
+        "sha256": digest,
+    }
     _inspection_path(upload_id).write_text(json.dumps(record), encoding="utf-8")
-    return {"filename": filename, "bytes": size, "rows": rows}
+    return {"filename": filename, "bytes": size, "rows": rows, "sha256": digest}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _inspection_path(upload_id: Any) -> Path:
@@ -355,7 +375,9 @@ def safe_filename(name: str) -> str:
     return _SAFE_NAME.sub("_", base)[:200]
 
 
-def begin_upload(filename: str) -> tuple[str, str]:
+def begin_upload(filename: str, *, project: Any = None, user: Any = None) -> tuple[str, str]:
+    """``project`` and ``user`` bind the upload: only that project, or without one only
+    that user, can land or attach it."""
     safe = safe_filename(filename)
     lowered = safe.lower()
     if lowered.endswith(".parquet.gz"):
@@ -368,8 +390,25 @@ def begin_upload(filename: str) -> tuple[str, str]:
     directory = upload_dir(upload_id)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "name").write_text(safe, encoding="utf-8")
+    (directory / "owner.json").write_text(
+        json.dumps(
+            {"project": str(project) if project else None, "user": str(user) if user else None}
+        ),
+        encoding="utf-8",
+    )
     upload_data_path(upload_id).touch()
     return upload_id, safe
+
+
+def belongs(upload_id: Any, *, project: Any, user: Any = None) -> bool:
+    """Whether the caller may read the upload; anyone else is told it does not exist."""
+    try:
+        owner = json.loads((upload_dir(upload_id) / "owner.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if owner.get("project"):
+        return owner["project"] == str(project)
+    return bool(owner.get("user")) and owner["user"] == str(user)
 
 
 def upload_filename(upload_id: Any) -> str:

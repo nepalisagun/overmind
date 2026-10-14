@@ -1,5 +1,12 @@
 import { useState } from "react";
 
+import {
+  type Analytics,
+  AnalyticsDetails,
+  AnalyticsSummary,
+  hasAnalytics,
+} from "@/components/datasets/notebook/analytics";
+import { PreparePromptDialog } from "@/components/datasets/notebook/prepare-prompt";
 import { RowsGrid } from "@/components/datasets/notebook/rows-grid";
 import { ScriptCode } from "@/components/datasets/notebook/script-code";
 import { SourceDetails } from "@/components/datasets/notebook/source";
@@ -15,7 +22,8 @@ import {
 } from "@/components/ui/dialog";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Icon, type IconName } from "@/components/ui/icons";
-import { columnsOf, fitOf } from "@/hooks/use-datasets";
+import { columnsOf, downloadAttachment, fitOf } from "@/hooks/use-datasets";
+import { notify } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 import type { Cell } from "@/openapi";
 
@@ -31,6 +39,7 @@ interface VersionActions {
   onExport: (fmt: "jsonl" | "csv") => void;
   onIntent: (intent: "train" | "eval") => void;
   onCapability: (id: string | null) => void;
+  onNewDataset: () => void;
 }
 
 interface Suggestion {
@@ -107,7 +116,7 @@ function SectionHeader({
   onToggle,
 }: {
   label: string;
-  meta?: string;
+  meta?: React.ReactNode;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -583,15 +592,22 @@ function Changes({ impact }: { impact: Impact }) {
   );
 }
 
+interface AttachmentInfo {
+  filename: string;
+  rows?: number | null;
+}
+
 const CONSUMER_BUTTON = "border-primary/40 bg-primary/10 text-primary hover:bg-primary/20";
 
 export function VersionCard({
   datasetId,
+  projectId,
   cell,
   intent,
   capabilityName,
   capabilities,
   sourceSpec,
+  analyticsChanged,
   active,
   editable,
   selected,
@@ -599,11 +615,14 @@ export function VersionCard({
   actions,
 }: {
   datasetId: string;
+  projectId: string;
   cell: Cell;
   intent: string;
   capabilityName: string;
   capabilities: CapabilityChoice[];
   sourceSpec: unknown;
+  /** The analytics differ from the parent version's. */
+  analyticsChanged: boolean;
   active: boolean;
   editable: boolean;
   selected: boolean;
@@ -615,10 +634,13 @@ export function VersionCard({
   const [scriptOpen, setScriptOpen] = useState(true);
   const [outputOpen, setOutputOpen] = useState(false);
   const [tableOpen, setTableOpen] = useState(active);
+  const analytics = (cell.analytics ?? {}) as Analytics;
+  const [analyticsOpen, setAnalyticsOpen] = useState(source || analyticsChanged);
   const fit = fitOf(cell);
   const decision = decisionReport(cell);
   const columns = columnsOf(cell).length;
   const changes = (cell.impact ?? {}) as Impact;
+  const attachment = (cell.attachment ?? {}) as Partial<AttachmentInfo>;
 
   return (
     <article
@@ -645,6 +667,22 @@ export function VersionCard({
             </span>
           </span>
           <span className="nodrag flex h-full items-center border-l border-border/70">
+            <PreparePromptDialog cellId={cell.id} datasetId={datasetId} version={cell.version} />
+            <Button
+              aria-label={`New dataset from ${cell.version}`}
+              className="h-full rounded-none"
+              disabled={!editable}
+              onClick={(e) => {
+                e.stopPropagation();
+                actions.onNewDataset();
+              }}
+              size="icon-xs"
+              title="New dataset from this version"
+              type="button"
+              variant="ghost"
+            >
+              <Icon.datasetAdd />
+            </Button>
             <ExportDialog
               columns={columns}
               onExport={actions.onExport}
@@ -761,7 +799,7 @@ export function VersionCard({
           )}
         </div>
         {source ? (
-          <SourceDetails spec={sourceSpec} />
+          <SourceDetails projectId={projectId} spec={sourceSpec} />
         ) : (
           <>
             {cell.script ? (
@@ -781,6 +819,30 @@ export function VersionCard({
               <div className="px-3 pt-1 pb-2.5">
                 <ScriptCode aria-label={`Script of ${cell.version}`} source={cell.script} />
               </div>
+            )}
+            {attachment.filename && (
+              <p className="flex items-center gap-1.5 px-2.5 pb-2.5 text-xs text-muted-foreground">
+                <Icon.file className="size-3 shrink-0" />
+                <span className="shrink-0">Attached file</span>
+                <span aria-hidden>·</span>
+                <button
+                  className="min-w-0 truncate text-foreground hover:underline"
+                  onClick={() =>
+                    void downloadAttachment(datasetId, cell.id, attachment.filename!).catch((e) =>
+                      notify.error(e, "Download failed")
+                    )
+                  }
+                  type="button"
+                >
+                  {attachment.filename}
+                </button>
+                {attachment.rows != null && (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span className="shrink-0 tabular-nums">{plural(attachment.rows, "row")}</span>
+                  </>
+                )}
+              </p>
             )}
             {cell.stdout && (
               <>
@@ -812,6 +874,17 @@ export function VersionCard({
             </div>
           )}
         </div>
+        {hasAnalytics(analytics) && (
+          <div className="border-t border-border/70">
+            <SectionHeader
+              label="Analytics"
+              meta={<AnalyticsSummary analytics={analytics} />}
+              onToggle={() => setAnalyticsOpen((open) => !open)}
+              open={analyticsOpen}
+            />
+            {analyticsOpen && <AnalyticsDetails analytics={analytics} />}
+          </div>
+        )}
       </div>
     </article>
   );

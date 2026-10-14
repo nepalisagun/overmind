@@ -3,6 +3,8 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 
+import { NewDatasetDialog } from "@/components/datasets/new-dataset-dialog";
+import { type Analytics, sameAnalytics } from "@/components/datasets/notebook/analytics";
 import { NotebookControls } from "@/components/datasets/notebook/canvas-controls";
 import {
   type CapabilityChoice,
@@ -27,6 +29,8 @@ import {
   invalidateDataset,
   isBusy,
   rankOf,
+  useCancelExecutionMutation,
+  useCancelImportMutation,
   useDatasetEvents,
   useDatasetQuery,
   usePatchDatasetMutation,
@@ -58,6 +62,9 @@ export function DatasetNotebook({
   const capabilitiesQuery = useProjectCapabilitiesQuery(projectId);
   const patch = usePatchDatasetMutation(datasetId);
   const resume = useResumeImportMutation(datasetId);
+  const cancelImport = useCancelImportMutation(datasetId);
+  const cancelRun = useCancelExecutionMutation(datasetId);
+  const [copyFrom, setCopyFrom] = useState<Cell | null>(null);
   const [showMinimap, setShowMinimap] = usePersistedState("workshopFlow:showMinimap", false);
   const [selectedId, setSelectedId] = useState<string | null>(cellParam ?? null);
   const [focus, setFocus] = useState<FlowFocus | null>(
@@ -80,7 +87,12 @@ export function DatasetNotebook({
       setLanding({ stage: event.stage, traces: event.traces });
       return;
     }
-    if (event.type === "land_done" || event.type === "land_failed") setLanding({});
+    if (
+      event.type === "land_done" ||
+      event.type === "land_failed" ||
+      event.type === "land_cancelled"
+    )
+      setLanding({});
     refresh();
   });
 
@@ -147,9 +159,16 @@ export function DatasetNotebook({
                 `${datasetDisplayName(dataset)}-${cell.version}`
               ).catch((e) => notify.error(e, "Export failed")),
             onIntent: guard((next: "train" | "eval") => patch.mutate({ intent: next })),
+            onNewDataset: guard(() => setCopyFrom(cell)),
             onUse: guard(handOff),
           }}
           active={cell.id === dataset.active}
+          analyticsChanged={
+            !sameAnalytics(
+              (cell.analytics ?? {}) as Analytics,
+              (cells.find((parent) => parent.id === cell.parent)?.analytics ?? {}) as Analytics
+            )
+          }
           capabilities={capabilityChoices}
           capabilityName={dataset.capabilityName ?? ""}
           cell={cell}
@@ -157,11 +176,24 @@ export function DatasetNotebook({
           editable={editable && !patch.isPending}
           intent={intent}
           onSelect={() => setSelectedId(cell.id)}
+          projectId={projectId}
           selected={cell.id === selectedId}
           sourceSpec={dataset.sourceSpec}
         />
       ) : null,
-    [dataset, guard, patch, datasetId, handOff, capabilityChoices, editable, intent, selectedId]
+    [
+      dataset,
+      cells,
+      guard,
+      patch,
+      datasetId,
+      projectId,
+      handOff,
+      capabilityChoices,
+      editable,
+      intent,
+      selectedId,
+    ]
   );
 
   if (datasetQuery.isPending) {
@@ -227,8 +259,21 @@ export function DatasetNotebook({
             </span>
           )}
         </div>
+        {dataset.state === "landing" && (
+          <Button
+            aria-busy={cancelImport.isPending}
+            disabled={cancelImport.isPending}
+            onClick={guard(() => cancelImport.mutate())}
+            size="xs"
+            variant="secondary"
+          >
+            <Icon.stop />
+            Stop import
+          </Button>
+        )}
         <WorkshopStatus
           dataset={dataset}
+          onCancelRun={guard((id: string) => cancelRun.mutate(id))}
           onShowVersion={(label) => {
             const target = cells.find((cell) => cell.version === label);
             if (target) show(target.id);
@@ -255,15 +300,26 @@ export function DatasetNotebook({
                 </>
               ) : (
                 <>
-                  <Icon.warning
-                    className={cn(
-                      "size-5",
-                      dataset.state === "error" ? "text-destructive" : "text-muted-foreground"
-                    )}
-                  />
+                  {dataset.state === "stopped" ? (
+                    <Icon.stop className="size-5 text-muted-foreground" />
+                  ) : (
+                    <Icon.warning
+                      className={cn(
+                        "size-5",
+                        dataset.state === "error" ? "text-destructive" : "text-muted-foreground"
+                      )}
+                    />
+                  )}
                   <p className="text-sm text-foreground">
-                    {dataset.state === "error" ? "The import failed" : "No rows were imported"}
+                    {dataset.state === "error"
+                      ? "The import failed"
+                      : dataset.state === "stopped"
+                        ? "Import stopped"
+                        : "No rows were imported"}
                   </p>
+                  {dataset.state === "stopped" && (
+                    <p className="text-xs text-muted-foreground">No rows were imported.</p>
+                  )}
                   {dataset.error && (
                     <p className="text-xs text-muted-foreground" role="alert">
                       {dataset.error}
@@ -281,10 +337,14 @@ export function DatasetNotebook({
                         Retry import
                       </Button>
                     )}
-                    <Button asChild size="sm" variant="secondary">
+                    <Button
+                      asChild
+                      size="sm"
+                      variant={dataset.state === "stopped" ? "default" : "secondary"}
+                    >
                       <Link search={{ create: true, projectId }} to="/datasets">
                         <Icon.datasetAdd />
-                        New dataset
+                        {dataset.state === "stopped" ? "Start again" : "New dataset"}
                       </Link>
                     </Button>
                   </div>
@@ -303,6 +363,23 @@ export function DatasetNotebook({
           />
         )}
       </div>
+      <NewDatasetDialog
+        initialCapabilityId={dataset.capability ?? undefined}
+        initialVersion={
+          copyFrom
+            ? {
+                cellId: copyFrom.id,
+                datasetId,
+                datasetName: datasetDisplayName(dataset),
+                rows: copyFrom.rows,
+                version: copyFrom.version,
+              }
+            : undefined
+        }
+        onOpenChange={(open) => !open && setCopyFrom(null)}
+        open={!!copyFrom}
+        projectId={projectId}
+      />
     </div>
   );
 }
