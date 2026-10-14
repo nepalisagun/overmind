@@ -7,6 +7,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -55,6 +56,7 @@ def _sandbox(budget: int):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     token = secrets.token_hex(8)
+    scratch = tempfile.TemporaryDirectory(prefix="sandbox-test-")
     proc = subprocess.Popen(
         [sys.executable, "-m", "sandbox", "--host", "127.0.0.1", "--port", str(port)],
         cwd=Path(__file__).resolve().parents[1],
@@ -63,23 +65,26 @@ def _sandbox(budget: int):
             "SANDBOX_TOKEN": token,
             "SANDBOX_ALLOW_SHARED_UID": "1",
             "SANDBOX_MEMORY_BYTES": str(budget),
+            # Its own memory ledger: parallel test servers must not share /tmp/sandbox.
+            "TMPDIR": scratch.name,
         },
     )
     url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 30
-    while True:
-        try:
-            if httpx.get(f"{url}/health", timeout=1).status_code == 200:
-                break
-        except httpx.TransportError:
-            pass
-        assert proc.poll() is None and time.monotonic() < deadline, "sandbox did not start"
-        time.sleep(0.1)
     try:
+        while True:
+            try:
+                if httpx.get(f"{url}/health", timeout=1).status_code == 200:
+                    break
+            except httpx.TransportError:
+                pass
+            assert proc.poll() is None and time.monotonic() < deadline, "sandbox did not start"
+            time.sleep(0.1)
         yield url, token
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+        scratch.cleanup()
 
 
 @pytest.fixture(scope="module")

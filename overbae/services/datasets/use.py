@@ -16,13 +16,20 @@ from overbae.services.datasets.lifecycle import DatasetError
 logger = logging.getLogger(__name__)
 
 
-def check(dataset: Dataset, intent: str, *, cell: Cell | None = None) -> Cell:
+def _article(word: str) -> str:
+    return "an" if word[:1] in "aeiou" else "a"
+
+
+def check(
+    dataset: Dataset, intent: str, *, cell: Cell | None = None, decision: bool = False
+) -> Cell:
     if cell is not None and cell.dataset_id != dataset.id:
         raise DatasetError("That version belongs to another dataset.", code="cell_mismatch")
     stored = public_intent(dataset.intent)
     if stored != intent:
         raise DatasetError(
-            f"{dataset.name} is a {stored} dataset; this needs {intent}.", code="intent"
+            f"{dataset.name} is {_article(stored)} {stored} dataset; this needs {intent}.",
+            code="intent",
         )
     if cell is None:
         cell = dataset.active_cell
@@ -36,7 +43,7 @@ def check(dataset: Dataset, intent: str, *, cell: Cell | None = None) -> Cell:
                 f"The source of {dataset.name} did not land: {dataset.error}", code="land_failed"
             )
         raise DatasetError(f"{dataset.name} has no version.", code="no_version")
-    ok, reason = cell.fits(intent)
+    ok, reason = cell.fits_decision() if decision else cell.fits(intent)
     if not ok:
         raise DatasetError(f"{dataset.name} · {cell.label}: {reason}", code="contract")
     try:
@@ -51,14 +58,14 @@ def check(dataset: Dataset, intent: str, *, cell: Cell | None = None) -> Cell:
 
 
 @transaction.atomic
-def use(dataset: Dataset, intent: str, *, cell: Cell | None = None) -> Cell:
+def use(dataset: Dataset, intent: str, *, cell: Cell | None = None, decision: bool = False) -> Cell:
     # Share generation's lock so a consumed version cannot change between batches.
     dataset = (
         Dataset.objects.select_for_update(of=("self",))
         .select_related("capability")
         .get(pk=dataset.pk)
     )
-    cell = check(dataset, intent, cell=cell)
+    cell = check(dataset, intent, cell=cell, decision=decision)
     freeze(cell)
     return cell
 

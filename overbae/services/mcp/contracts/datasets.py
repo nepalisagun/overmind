@@ -88,6 +88,8 @@ def _capability_link(capability) -> ResourceLinkContract:
 class FitReport(MCPModel):
     ok: bool
     reason: str = Field(default="", max_length=500)
+    # Present only for decision rows, which decision models read instead of chat consumers.
+    format: Literal["decision"] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CapabilityRef(MCPModel):
@@ -480,6 +482,10 @@ def mutation_output(
 
 
 def _fit(cell: Cell, intent: str) -> FitReport:
+    decision = (cell.intent_report or {}).get("decision") or {}
+    if decision.get("reason") != "no decision rows" and decision:
+        ok, reason = cell.fits_decision()
+        return FitReport(ok=ok, reason=sanitize_error(reason, 500), format="decision")
     ok, reason = cell.fits(intent)
     return FitReport(ok=ok, reason=sanitize_error(reason, 500))
 
@@ -642,6 +648,8 @@ def next_actions(dataset, active: Cell | None) -> list[NextAction]:
                 arguments={"dataset": ds_id},
             )
         ]
+    if active.fits_decision()[0]:
+        return _decision_next_actions(dataset, active)
     intent = public_intent(dataset.intent)
     ok, reason = active.fits(intent)
     if not ok:
@@ -673,6 +681,28 @@ def next_actions(dataset, active: Cell | None) -> list[NextAction]:
             )
         )
     return actions
+
+
+def _decision_next_actions(dataset, active: Cell) -> list[NextAction]:
+    """Decision rows are read only by decision models, so they take their own readiness check."""
+    if public_intent(dataset.intent) == Dataset.Intent.EVAL:
+        return [
+            NextAction(
+                tool="list_datasets",
+                reason=(
+                    "Active version holds decision rows; check it with a train dataset: "
+                    "check_decision_readiness with this as eval_dataset."
+                ),
+                arguments={},
+            )
+        ]
+    return [
+        NextAction(
+            tool="check_decision_readiness",
+            reason="Active version holds decision rows.",
+            arguments={"dataset": str(dataset.id), "version": active.label},
+        )
+    ]
 
 
 def _detail_summary(dataset, total: int, active: Cell | None, running: int) -> str:

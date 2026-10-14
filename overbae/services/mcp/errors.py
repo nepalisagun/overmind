@@ -51,6 +51,8 @@ ErrorCode = Literal[
     "insufficient_credits",
     "plan_limit_exceeded",
     "model_not_found",
+    "model_warming",
+    "model_unavailable",
     "finetune_not_found",
     "finetune_invalid",
     "finetune_not_ready",
@@ -72,6 +74,7 @@ ErrorCode = Literal[
     "instrumentation_plan_not_found",
     "active_model_invalid",
     "inference_failed",
+    "decision_job_not_found",
     "context_length_exceeded",
     "model_swap_prompt_not_ready",
     "insight_not_found",
@@ -93,6 +96,7 @@ class MCPErrorData(MCPModel):
     message: str
     retryable: bool = False
     fields: dict[str, str] = Field(default_factory=dict)
+    retry_after_seconds: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class MCPError(Exception):
@@ -105,12 +109,14 @@ class MCPError(Exception):
         *,
         retryable: bool = False,
         fields: dict[str, str] | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         self.data = MCPErrorData(
             code=code,
             message=message,
             retryable=retryable,
             fields=fields or {},
+            retry_after_seconds=retry_after_seconds,
         )
         super().__init__(message)
 

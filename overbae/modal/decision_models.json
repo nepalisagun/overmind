@@ -1,0 +1,194 @@
+{
+  "models": [
+    {
+      "id": "Cloudflare/clef",
+      "repo": "Cloudflare/clef",
+      "family": "clef",
+      "params": 27400000000,
+      "hidden_size": 5120,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 53.08,
+      "decision_index_edition": "0.3.1",
+      "limits": {
+        "options": 26,
+        "score_levels": 10,
+        "questions": 64
+      }
+    },
+    {
+      "id": "Cloudflare/clef-flash",
+      "repo": "Cloudflare/clef-flash",
+      "family": "clef",
+      "params": 9410000000,
+      "hidden_size": 4096,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 47.61,
+      "decision_index_edition": "0.3.1",
+      "limits": {
+        "options": 26,
+        "score_levels": 10,
+        "questions": 64
+      }
+    },
+    {
+      "id": "OvermindLab/qwen-3.5-0.8B-decision",
+      "repo": "OvermindLab/qwen-3.5-0.8B-decision",
+      "family": "clef",
+      "params": 800000000,
+      "hidden_size": 1024,
+      "architecture_context": 131072,
+      "max_context_length": 32768,
+      "limits": {
+        "options": 26,
+        "score_levels": 10,
+        "questions": 64
+      }
+    },
+    {
+      "id": "OvermindLab/qwen-3.5-2B-decision",
+      "repo": "OvermindLab/qwen-3.5-2B-decision",
+      "family": "clef",
+      "params": 2000000000,
+      "hidden_size": 2048,
+      "architecture_context": 131072,
+      "max_context_length": 32768,
+      "limits": {
+        "options": 26,
+        "score_levels": 10,
+        "questions": 64
+      }
+    },
+    {
+      "id": "vllm-sr/d3-edge",
+      "repo": "vllm-sr/d3-edge",
+      "family": "d3",
+      "params": 594321600,
+      "hidden_size": 1024,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 20.2,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "vllm-sr/d3-lite",
+      "repo": "vllm-sr/d3-lite",
+      "family": "d3",
+      "params": 852985920,
+      "hidden_size": 1024,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 32.3,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "vllm-sr/d3-nano",
+      "repo": "vllm-sr/d3-nano",
+      "family": "d3",
+      "params": 2213241664,
+      "hidden_size": 2048,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 38.9,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "vllm-sr/d3-mini",
+      "repo": "vllm-sr/d3-mini",
+      "family": "d3",
+      "params": 4539265536,
+      "hidden_size": 2560,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 52.6,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "vllm-sr/d3-flash",
+      "repo": "vllm-sr/d3-flash",
+      "family": "d3",
+      "params": 8392695024,
+      "hidden_size": 4096,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 55.8,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "vllm-sr/d3",
+      "repo": "vllm-sr/d3",
+      "family": "d3",
+      "params": 26085330160,
+      "hidden_size": 5120,
+      "architecture_context": 262144,
+      "max_context_length": 32768,
+      "decision_index": 66.3,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "LiquidAI/d1-omni-600M",
+      "repo": "LiquidAI/d1-omni-600M",
+      "family": "d1",
+      "params": 587143681,
+      "hidden_size": 1024,
+      "architecture_context": 16384,
+      "max_context_length": 16384,
+      "inference_gpu": "L4",
+      "decision_index": 9.1,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 10,
+        "questions": 100
+      }
+    },
+    {
+      "id": "LiquidAI/d1-3B",
+      "repo": "LiquidAI/d1-3B",
+      "family": "d1",
+      "params": 3120000000,
+      "hidden_size": 2048,
+      "architecture_context": 32768,
+      "max_context_length": 32768,
+      "inference_gpu": "L4",
+      "decision_index": 38.9,
+      "decision_index_edition": "0.3.2",
+      "limits": {
+        "options": 255,
+        "score_levels": 255,
+        "questions": 100
+      }
+    }
+  ]
+}
