@@ -5,6 +5,7 @@ import type { ColumnDef } from "@tanstack/react-table";
 import { toast } from "sonner";
 
 import { EntityRef } from "@/components/entity-ref";
+import { WorkflowState } from "@/components/model-workflows/common";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -35,10 +36,12 @@ import { notify } from "@/lib/notify";
 import type { EvaluationsSearch } from "@/lib/schemas";
 import { clearUnseenCompletion, useUnseenCompletionKeys } from "@/lib/unseen-job-completions";
 import { cn } from "@/lib/utils";
-import type { EvalRunList, EvalRunProgress } from "@/openapi";
-import { EvalRunsListStatusEnum } from "@/openapi";
+import type { EvalRunProgress, EvaluationActivity } from "@/openapi";
+import { EvalRunsActivityListStatusEnum } from "@/openapi";
 
 const plural = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? "" : "s"}`;
+type RunIdentity = Pick<EvaluationActivity, "id" | "kind">;
+const runKey = (run: RunIdentity) => `${run.kind}:${run.id}`;
 
 const STATUS_FILTER_LABELS: Record<string, string> = {
   cancelled: "Cancelled",
@@ -54,10 +57,7 @@ export function StatusBadge({ status, progress }: { status: string; progress?: n
 
 function runProgressPercent(progress?: EvalRunProgress | null): number | null {
   if (!progress) return null;
-  const isGenerating = progress.phase === "generating" || progress.phase === "pending";
-  const done = isGenerating ? progress.prepared : progress.scored;
-  const total = isGenerating ? progress.total : progress.scoreTotal;
-  return progress.phase === "aggregating" ? 100 : total > 0 ? (done / total) * 100 : null;
+  return progress.rows > 0 ? (progress.done / progress.rows) * 100 : null;
 }
 
 type RunsFilters = Pick<
@@ -87,7 +87,7 @@ export function RunsTable({
   const deleteRun = useDeleteEvalRunMutation(projectId);
   // Rows hidden while their undoable delete window is open.
   const [pendingDelete, setPendingDelete] = useState<Set<string>>(() => new Set());
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<Map<string, RunIdentity>>(() => new Map());
   const [bulkDeletePending, setBulkDeletePending] = useState(false);
   const {
     run_capability: capabilityFilter,
@@ -116,13 +116,13 @@ export function RunsTable({
     pageSize,
     projectId,
     search: searchParam,
-    status: statusFilter !== "all" ? (statusFilter as EvalRunsListStatusEnum) : undefined,
+    status: statusFilter !== "all" ? (statusFilter as EvalRunsActivityListStatusEnum) : undefined,
   });
 
   const pageData = useMemo(() => {
     if (!data) return data;
     if (pendingDelete.size === 0) return data;
-    const results = data.results.filter((r) => !r.id || !pendingDelete.has(r.id));
+    const results = data.results.filter((r) => !pendingDelete.has(runKey(r)));
     return { ...data, results };
   }, [data, pendingDelete]);
 
@@ -177,43 +177,45 @@ export function RunsTable({
   };
 
   const pageRows = pageData?.results ?? [];
-  const allSelected = pageRows.length > 0 && pageRows.every((r) => selectedIds.has(r.id!));
-  const someSelected = pageRows.some((r) => selectedIds.has(r.id!));
+  const allSelected = pageRows.length > 0 && pageRows.every((r) => selected.has(runKey(r)));
+  const someSelected = pageRows.some((r) => selected.has(runKey(r)));
 
-  const toggleSelect = (id: string) =>
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+  const toggleSelect = (run: RunIdentity) =>
+    setSelected((prev) => {
+      const next = new Map(prev);
+      const key = runKey(run);
+      next.has(key) ? next.delete(key) : next.set(key, { id: run.id, kind: run.kind });
       return next;
     });
 
   const toggleSelectAll = () =>
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      for (const r of pageRows) allSelected ? next.delete(r.id!) : next.add(r.id!);
+    setSelected((prev) => {
+      const next = new Map(prev);
+      for (const run of pageRows) {
+        const key = runKey(run);
+        if (allSelected) next.delete(key);
+        else next.set(key, { id: run.id, kind: run.kind });
+      }
       return next;
     });
 
   const clearSelection = () => {
-    setSelectedIds(new Set());
+    setSelected(new Map());
   };
 
   const handleBulkDelete = async () => {
-    const ids = [...selectedIds];
     setBulkDeletePending(true);
     try {
-      const results = await Promise.allSettled(ids.map((id) => deleteRun.mutateAsync(id)));
-      const failed = ids.filter((_, i) => results[i].status === "rejected");
-      const deleted = ids.length - failed.length;
-      if (deleted > 0) toast.success(`${plural(deleted, "run")} deleted`);
-      if (failed.length > 0) toast.error(`${plural(failed.length, "run")} not deleted`);
-      setSelectedIds((current) => {
-        const next = new Set(current);
-        ids.forEach((id, i) => {
-          if (results[i].status === "fulfilled") next.delete(id);
-        });
-        return next;
-      });
+      const runs = [...selected.values()];
+      const results = await Promise.allSettled(runs.map((run) => deleteRun.mutateAsync(run)));
+      const deleted = runs.filter((_, i) => results[i].status === "fulfilled").map(runKey);
+      setSelected((prev) => new Map([...prev].filter(([key]) => !deleted.includes(key))));
+      setPendingDelete((prev) => new Set([...prev, ...deleted]));
+      if (deleted.length) toast.success(`${plural(deleted.length, "run")} deleted`);
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") {
+        notify.error(failure.reason, "Couldn't delete some of the selected runs");
+      }
     } finally {
       setBulkDeletePending(false);
     }
@@ -225,34 +227,37 @@ export function RunsTable({
       next.delete(id);
       return next;
     });
-  const handleDelete = (id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
+  const handleDelete = (run: RunIdentity) => {
+    const key = runKey(run);
+    setSelected((prev) => {
+      const next = new Map(prev);
+      next.delete(key);
       return next;
     });
     notify.undoable({
-      commit: () =>
-        deleteRun.mutate(id, {
-          onError: (e) => {
-            notify.error(e, "Couldn't delete run");
-            removePending(id);
-          },
-        }),
+      commit: async () => {
+        try {
+          await deleteRun.mutateAsync(run);
+        } catch (e) {
+          notify.error(e, "Couldn't delete run");
+          removePending(key);
+        }
+      },
       message: "Run deleted",
-      optimistic: () => setPendingDelete((p) => new Set(p).add(id)),
-      rollback: () => removePending(id),
+      optimistic: () => setPendingDelete((p) => new Set(p).add(key)),
+      rollback: () => removePending(key),
     });
   };
 
-  const columns: ColumnDef<EvalRunList>[] = [
+  const columns: ColumnDef<EvaluationActivity>[] = [
     {
       cell: ({ row }) => (
         <div className="pl-1">
           <Checkbox
             aria-label={`Select run ${row.original.name}`}
-            checked={selectedIds.has(row.original.id!)}
-            onCheckedChange={() => toggleSelect(row.original.id!)}
+            checked={selected.has(runKey(row.original))}
+            disabled={bulkDeletePending}
+            onCheckedChange={() => toggleSelect(row.original)}
             // The row navigates from its own `onClick`, so the guard has to be on
             // the click: stopping `pointerdown` leaves the later click untouched.
             onClick={(e) => e.stopPropagation()}
@@ -265,6 +270,7 @@ export function RunsTable({
           <Checkbox
             aria-label="Select all runs"
             checked={allSelected ? true : someSelected ? "indeterminate" : false}
+            disabled={bulkDeletePending || pageRows.length === 0}
             onCheckedChange={toggleSelectAll}
           />
         </div>
@@ -290,7 +296,11 @@ export function RunsTable({
       accessorKey: "status",
       cell: ({ row }) => {
         const r = row.original;
-        return (
+        return ["draft", "prepared", "waiting_for_checkpoint", "submission_unknown"].includes(
+          r.status
+        ) ? (
+          <WorkflowState state={r.status} />
+        ) : (
           <StatusBadge
             progress={r.status === "running" ? runProgressPercent(r.progress) : null}
             status={r.status ?? "pending"}
@@ -313,7 +323,7 @@ export function RunsTable({
         );
       },
       header: "Capability",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "capability_name" },
       minSize: 120,
       size: 144,
     },
@@ -330,7 +340,7 @@ export function RunsTable({
         );
       },
       header: "Dataset",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "dataset_name" },
       minSize: 120,
       size: 144,
     },
@@ -340,15 +350,19 @@ export function RunsTable({
         <span className="tabular-nums text-muted-foreground">{row.original.variantCount}</span>
       ),
       header: "Variants",
+      meta: { orderingField: "variant_count" },
       minSize: 80,
       size: 100,
     },
     {
       accessorKey: "evaluatorCount",
       cell: ({ row }) => (
-        <span className="tabular-nums text-muted-foreground">{row.original.evaluatorCount}</span>
+        <span className="tabular-nums text-muted-foreground">
+          {row.original.evaluatorCount ?? "—"}
+        </span>
       ),
       header: "Evaluators",
+      meta: { orderingField: "evaluator_count" },
       minSize: 90,
       size: 112,
     },
@@ -369,10 +383,11 @@ export function RunsTable({
         <Button
           aria-label="Delete run"
           className="text-muted-foreground hover:text-destructive"
+          disabled={bulkDeletePending}
           // Same click guard as the select checkbox — see that cell.
           onClick={(e) => {
             e.stopPropagation();
-            handleDelete(row.original.id!);
+            handleDelete(row.original);
           }}
           size="icon-xs"
           title="Delete run"
@@ -406,9 +421,9 @@ export function RunsTable({
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All statuses</SelectItem>
-              {Object.values(EvalRunsListStatusEnum).map((s) => (
+              {Object.values(EvalRunsActivityListStatusEnum).map((s) => (
                 <SelectItem key={s} value={s}>
-                  {STATUS_FILTER_LABELS[s] ?? s}
+                  {STATUS_FILTER_LABELS[s] ?? sentenceCase(s)}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -475,30 +490,32 @@ export function RunsTable({
   );
 
   const banner =
-    selectedIds.size > 0 ? (
+    selected.size > 0 ? (
       <div className="flex shrink-0 items-center gap-2 rounded-md border bg-wash-subtle px-3 py-2 text-sm">
         <Checkbox
           aria-label="Select all runs"
           checked={allSelected ? true : someSelected ? "indeterminate" : false}
+          disabled={bulkDeletePending || pageRows.length === 0}
           onCheckedChange={toggleSelectAll}
         />
-        <span className="flex-1 text-muted-foreground">{selectedIds.size} selected</span>
+        <span className="flex-1 text-muted-foreground">{selected.size} selected</span>
         <ConfirmDialog
-          confirmLabel={`Delete ${plural(selectedIds.size, "run")}`}
-          description={`This permanently deletes ${plural(selectedIds.size, "selected run")}.`}
+          confirmLabel={`Delete ${plural(selected.size, "run")}`}
+          description={`Remove ${plural(selected.size, "selected run")} from Evaluations? Dataset and training records are kept.`}
           destructive
           isPending={bulkDeletePending}
           onConfirm={handleBulkDelete}
-          title={`Delete ${plural(selectedIds.size, "run")}?`}
+          title={`Delete ${plural(selected.size, "run")}?`}
           trigger={
             <Button className="px-2 text-xs" size="sm" variant="destructive">
-              <Icon.delete /> Delete {selectedIds.size}
+              <Icon.delete /> Delete {selected.size}
             </Button>
           }
         />
         <Button
           aria-label="Clear selection"
           className="px-2 text-xs"
+          disabled={bulkDeletePending}
           onClick={clearSelection}
           size="sm"
           variant="ghost"
@@ -524,7 +541,7 @@ export function RunsTable({
         />
       }
       error={error}
-      getRowId={(row) => row.id!}
+      getRowId={runKey}
       hasActiveFilters={hasActiveFilters}
       isLoading={isLoading}
       onClearFilters={clearFilters}
@@ -540,7 +557,7 @@ export function RunsTable({
         navigate({
           params: { runId: r.id! },
           resetScroll: false,
-          search: (prev) => prev,
+          search: (prev) => ({ ...prev, format: r.kind === "decision" ? "decision" : undefined }),
           to: "/evaluations/runs/$runId",
         })
       }
@@ -552,7 +569,7 @@ export function RunsTable({
       pageSize={pageSize}
       rowClassName={(r) =>
         cn(
-          selectedIds.has(r.id!) && "bg-primary/5",
+          selected.has(runKey(r)) && "bg-primary/5",
           r.id && unseenKeys.has(`eval:${r.id}`) && "bg-wash-subtle"
         )
       }

@@ -3,7 +3,6 @@ import subprocess
 import sys
 
 from .conftest import GOOD_REPLY
-from .datasets import prepare
 from .stack import drain
 from .surfaces import SDK
 
@@ -51,7 +50,8 @@ def test_failing_traces_become_a_measured_winning_diff(
     worker,
     live_api,
     support_desk_llm,
-    rubric_judges,
+    judges,
+    fake_llm,
     tmp_path,
 ):
     cli.scan(sample_agent)
@@ -62,36 +62,48 @@ def test_failing_traces_become_a_measured_winning_diff(
 
     sample_agent.run(*TICKETS, api_url=live_api.url, llm_url=support_desk_llm)
     drain(worker)
-    executions = mcp.call("query_task_executions", {"capability": "answer"})["task_executions"]
-    assert len(executions) == len(TICKETS)
-    assert all(e["success_score"] < 1 for e in executions)
+    failures = mcp.call("query_failures", {"capability": "answer"})["failures"]
+    assert len(failures) == len(TICKETS)
 
     created = mcp.call(
-        "create_dataset",
+        "create_dataset_from_traces",
         {
             "name": "answer misses",
-            "source": {"kind": "traces", "trace_ids": [e["trace_id"] for e in executions]},
+            "trace_ids": [f["trace_id"] for f in failures],
             "intent": "eval",
             "capability": answer["id"],
         },
     )
     dataset = created["dataset"]["id"]
     drain(worker)
-    prepared = prepare(mcp, dataset, "eval")
-    corrected = mcp.call(
-        "add_dataset_version",
+    source = mcp.call("inspect_dataset", {"dataset": dataset})["active"]
+    rows = mcp.call("query_dataset", {"dataset": dataset, "sql": "select * from t"})["rows"]
+    mcp.call(
+        "import_dataset_version",
         {
             "dataset": dataset,
-            "parent": prepared,
-            "title": "Correct the references",
-            "script": f"df['expected_output'] = {GOOD_REPLY!r}\n",
+            "source_cell": source["id"],
+            "source_fingerprint": source["fingerprint"],
+            "request_key": "correct-fixture-references",
+            "name": "Correct the references",
+            "imported_rows": [
+                {
+                    **row,
+                    "input": {
+                        "messages": [
+                            message
+                            for message in row["messages"]
+                            if message["role"] in {"system", "user"}
+                        ]
+                    },
+                    "expected_output": GOOD_REPLY,
+                }
+                for row in rows
+            ],
+            "provenance": "The native agent projects system and user messages for answer replay and applies the support-desk fixture's declared correct reply. Full source transcripts and row identities remain retained.",
         },
     )
-    assert corrected["status"] == "ok", corrected["error"]
-    mcp.call(
-        "activate_dataset_version",
-        {"dataset": dataset, "version": corrected["version"]["version"]},
-    )
+    drain(worker)
     references = mcp.call(
         "query_dataset", {"dataset": dataset, "sql": "select distinct expected_output from t"}
     )["rows"]
@@ -123,7 +135,7 @@ def test_failing_traces_become_a_measured_winning_diff(
     result = mcp.call("inspect_optimizer_result", {"experiment": state["experiment_id"]})
     scores = result["experiment"]["scores"]
     assert result["experiment"]["status"] == "completed"
-    assert result["experiment"]["version"]["version"] == corrected["version"]["version"]
+    assert result["experiment"]["cell"]["version"] == "2.0"
     assert scores["best"] > scores["baseline"]
 
     [baseline] = result["iterations"][0]["candidates"]

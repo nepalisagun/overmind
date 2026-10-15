@@ -1,38 +1,37 @@
-from __future__ import annotations
+"""Decision-family views of the shared model catalog."""
 
-import json
-from functools import lru_cache
-from pathlib import Path
-
-_CATALOG = Path(__file__).with_name("decision_models.json")
-LIMITS = ("options", "score_levels", "questions")
+from overbae.modal.model_registry import get_all_models_by_backend
 
 
-@lru_cache(maxsize=1)
 def models() -> dict[str, dict]:
-    rows = json.loads(_CATALOG.read_text())["models"]
-    for row in rows:
-        _check_limits(row)
-    return {row["id"]: row for row in rows}
-
-
-def _check_limits(row: dict) -> None:
-    limits = row.get("limits")
-    if not isinstance(limits, dict):
-        raise ValueError(f"decision model {row['id']} has no limits")
-    for name in LIMITS:
-        value = limits.get(name)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(
-                f"decision model {row['id']} limit {name} must be a positive integer, got {value!r}"
-            )
-
-
-@lru_cache(maxsize=1)
-def _by_folded_id() -> dict[str, dict]:
-    return {model_id.casefold(): row for model_id, row in models().items()}
+    return {
+        model_id: {
+            **entry,
+            "training_available": entry["decision"]["family"] == "clef"
+            and not entry.get("disabled"),
+        }
+        for model_id, entry in get_all_models_by_backend("decision", include_disabled=True).items()
+    }
 
 
 def get(model_id: str) -> dict | None:
-    """The catalog row for ``model_id``, matched without regard to case."""
-    return _by_folded_id().get(model_id.casefold())
+    return next(
+        (entry for key, entry in models().items() if key.casefold() == model_id.casefold()),
+        None,
+    )
+
+
+def options() -> list[dict]:
+    return [
+        {
+            "id": entry["id"],
+            "name": entry["display"],
+            "family": entry["decision"]["family"],
+            "training_available": entry["training_available"],
+            "unavailable_reason": entry.get("disabled_reason"),
+            "max_context_length": entry["finetuning"]["context_length"],
+            "limits": entry["decision"]["limits"],
+            "decision_index": entry["decision"].get("decision_index"),
+        }
+        for entry in models().values()
+    ]

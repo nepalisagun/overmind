@@ -60,9 +60,7 @@ body {
   @apply m-0;
 }
 
-/* Deliberately no `h1–h4 { font-family: display }` rule: tying the face to the
-   tag put PP Mondwest on ~30 small UI headings by accident. The display face is
-   opt-in through the title ramp (named in lib/typography.ts). */
+/* PP Mondwest is restricted to .page-title; heading tags inherit Geist Pixel. */
 
 code {
   font-family: var(--font-mono);
@@ -79,6 +77,11 @@ code {
 }
 
 @layer components {
+  /* Recharts SVGs receive a browser focus outline even after pointer clicks. */
+  .recharts-surface:focus:not(:focus-visible) {
+    outline: none;
+  }
+
   .page-wrapper {
     @apply space-y-6 pb-8;
   }
@@ -112,17 +115,12 @@ code {
     letter-spacing: var(--tracking-cell);
   }
 
-  /* Weight is NOT a hierarchy lever: all four steps share it, so size and the
-     face are the only things separating a page title from a card title
-     (`check:design` forbids a per-call-site weight utility). 700 is synthesised
-     — PP Mondwest ships a Regular master only. */
   .title-hero,
-  .page-title,
   .title-section,
   .title-card {
-    font-family: var(--font-display);
-    font-weight: 700;
-    letter-spacing: -0.015em;
+    font-family: var(--font-sans);
+    font-weight: 400;
+    letter-spacing: normal;
   }
 
   .title-hero {
@@ -131,8 +129,11 @@ code {
   }
 
   .page-title {
+    font-family: var(--font-display);
     font-size: 1.8225rem;
+    font-weight: 700;
     line-height: 2.025rem;
+    letter-spacing: -0.015em;
   }
 
   .title-section {
@@ -156,8 +157,8 @@ code {
   /* One masked box with two mask layers, so a single background-color drives
      both segments (active rows override --elbow-color). The vertical layer
      stops 12px short so the corner reads as pixel steps, not a filled square.
-     Shared by sidebar sub-nav (fixed --elbow-h pitch math) and lists that
-     measure their row centers live (trace conversation steps). */
+     Shared by sidebar sub-nav (fixed --elbow-h pitch math) and trace details
+     (live-measured row centers). */
   .sidebar-elbow::before {
     position: absolute;
     bottom: 50%;
@@ -299,6 +300,37 @@ code {
   --instrument-cat-6: #a4988b;
 }
 
+@keyframes workshop-working {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes workshop-finished {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.5;
+  }
+  45% {
+    transform: scale(1.15);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.workshop-working {
+  animation: workshop-working 1.2s steps(8, end) infinite;
+}
+.workshop-finished {
+  animation: workshop-finished 400ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .workshop-working,
+  .workshop-finished {
+    animation: none;
+  }
+}
+
 @keyframes progress-sweep {
   0% {
     left: -35%;
@@ -321,44 +353,8 @@ code {
   }
 }
 
-/* Workshop status: opacity and colour only (DESIGN.md Motion: no scale, no bounce). */
-@keyframes workshop-working {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.4;
-  }
-}
-@keyframes workshop-finished {
-  from {
-    color: var(--foreground);
-  }
-}
-.workshop-working {
-  animation: workshop-working 1.2s ease-in-out infinite;
-}
-.workshop-finished {
-  animation: workshop-finished 700ms ease-out both;
-}
-@media (prefers-reduced-motion: reduce) {
-  .workshop-working,
-  .workshop-finished {
-    animation: none;
-  }
-}
-
-/* THE ONE HUE AXIS RULE: every neutral here sits on h≈75° (CIELCh) at a chroma
- * held FLAT as the value changes, capped at ~5 (the ramp tops out at C=2.7).
- * Tiers are spaced by ΔL*, floor ~1.5, not by contrast ratio — adjacent surfaces
- * are 1.06:1 apart. check:contrast asserts both.
- *
- * Ladder, deepest to lightest:
- *   sidebar 1.7 · background 3.4 · card 6.0 · muted 7.9 · secondary 8.4
- *   wash-subtle 8.9 · popover 10.4 · accent 11.4 · wash-raised 11.9
- *   control 13.9 · control-hover 18.2 · border 22.9
- */
+/* Neutrals share h≈75° in CIELCh, chroma below 6. Adjacent surface tiers
+ * are separated by ΔL*, not contrast ratio; check:contrast verifies both. */
 :root {
   --background: #0e0c09;
   --foreground: #f6f3ef;
@@ -370,29 +366,24 @@ code {
   --primary-foreground: #181614;
   --secondary: #1a1816;
   --secondary-foreground: #f6f3ef;
-  /* A step above --secondary so a control stays visible on the card AND on the
-     canvas. */
+  /* Controls remain distinct from both card and canvas. */
   --control: #262320;
   --control-hover: #2f2c29;
   --muted: #191715;
   --muted-foreground: #a9a39c;
-  /* The hover wash stays on the neutral axis, off h≈66, the warning hue the
-     Copper Eye Rule reserves. */
+  /* Keep the hover wash on the neutral axis, away from the warning hue. */
   --accent: #201e1b;
   --accent-foreground: #f6f3ef;
   --accent-warm: #f6f3ef;
-  /* The ONLY two elevation steps (Wash Ladder Rule, DESIGN.md): +2.9 / +5.9 L*
-     over --card. */
+  /* The only two elevation steps: +2.9 / +5.9 L* over --card. */
   --wash-subtle: #1b1917;
   --wash-raised: #211f1c;
+
   --scrim: rgb(0 0 0 / 0.5);
-  /* Held in the status family's L* 67–73 band, so error doesn't read hotter and
-     heavier than every other state. */
+  --elevation-confirmation: 0 2px 4px rgb(0 0 0 / 0.14), 0 12px 32px -8px rgb(0 0 0 / 0.36);
   --destructive: #f65d57;
   --destructive-foreground: #0c0a08;
-  /* Status hues, mirroring the `--instrument-*` scale. Canonical usage is the
-     tint triplet `border-success/40 bg-success/10 text-success`; the
-     -foreground pairs are only for the rare solid fill. */
+  /* Status text uses the tint triplet; -foreground is for solid fills. */
   --success: #3ac28a;
   --success-foreground: #0c0a08;
   --warning: #e6a647;
@@ -408,12 +399,9 @@ code {
   --auth-text: #f6f3ef;
   --auth-text-label: #8a8580;
   --auth-accent: #f6f3ef;
-  /* Pure black on purpose — the artwork is authored against it. The one
-     deliberate C=0 surface in the palette. */
+  /* The artwork is authored against pure black. */
   --auth-splash: #000000;
-  /* L*23, not L*21: at L*21 the /60 faint-rule level sat at 1.17 against
-     --popover, under the DECOR floor. The border ramp is bare/70/60 and has no
-     headroom left below that. */
+  /* Bare/70/60 clears the decorative contrast floor; lower alphas do not. */
   --border: #3a3633;
   --input: #6a645d;
   --ring: #f6f3ef;
@@ -431,8 +419,7 @@ code {
   --cat-4: var(--instrument-cat-4);
   --cat-5: var(--instrument-cat-5);
   --cat-6: var(--instrument-cat-6);
-  /* One step BELOW the canvas (sidebar 1.7 → background 3.4 → card 6.0) so the
-     shell has a left edge without leaning on a border. */
+  /* A tonal step below the canvas separates the sidebar. */
   --sidebar: #080604;
   --sidebar-foreground: #f6f3ef;
   --sidebar-primary: #f6f3ef;
@@ -445,8 +432,7 @@ code {
      class; see .sidebar-elbow above. */
   --sidebar-elbow: #56514d;
 
-  /* The inline mention chip stays light, so a mention reads as an embedded
-     object rather than a status. */
+  /* Inline mentions retain a light surface to read as embedded objects. */
   --chip-inline: #fdfbf8;
   --chip-inline-hover: #f0ebe5;
   --chip-inline-border: #e0d9d2;
@@ -476,6 +462,7 @@ code {
      off-grid. It is the only tracking step the face has. */
   --tracking-cell: 0.038em;
   --spacing: 0.25rem;
+  color-scheme: dark;
 }
 
 @theme inline {
@@ -584,6 +571,7 @@ code {
   --shadow-lg: var(--shadow-lg);
   --shadow-xl: var(--shadow-xl);
   --shadow-2xl: var(--shadow-2xl);
+  --shadow-confirmation: var(--elevation-confirmation);
 }
 
 body {
@@ -639,7 +627,7 @@ button:active *,
 
 /* Clerk renders its own DOM, so its token contract is the only way into the
  * system. It resolves these at runtime and accepts any CSS colour, so var()
- * aliases work and the block follows the palette — keep them aliases, never
+ * aliases share the app palette — keep them aliases, never
  * literals. */
 :root {
   --clerk-color-primary: var(--primary);

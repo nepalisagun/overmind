@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 import pytest
 from conftest import TRAIN_ROWS, frozen_dataset
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -25,7 +27,7 @@ def _setup() -> tuple[APIClient, Project, Dataset]:
     )
     project = Project.objects.create(name="P", slug=f"p-{uuid.uuid4().hex[:8]}")
     ProjectMembership.objects.create(user=user, project=project)
-    dataset = frozen_dataset(project, TRAIN_ROWS, name="ds")
+    dataset = frozen_dataset(project, TRAIN_ROWS, name="ds", contract="train")
     client = APIClient()
     token = RefreshToken.for_user(user)
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
@@ -147,7 +149,7 @@ def test_status_filter_selects_runs_with_any_matching_job_and_still_returns_them
 
 def test_runs_honour_the_jobs_list_filters_and_search():
     client, project, dataset = _setup()
-    other_dataset = frozen_dataset(project, TRAIN_ROWS, name="other")
+    other_dataset = frozen_dataset(project, TRAIN_ROWS, name="other", contract="train")
     wanted = uuid.uuid4()
     _job(project, dataset, group_id=wanted, name="checkout tuning")
     _job(project, other_dataset, group_id=uuid.uuid4(), name="refund tuning")
@@ -163,7 +165,7 @@ def test_runs_never_reach_another_projects_jobs():
     client, project, dataset = _setup()
     _job(project, dataset, group_id=uuid.uuid4())
     stranger = Project.objects.create(name="X", slug=f"x-{uuid.uuid4().hex[:8]}")
-    stranger_dataset = frozen_dataset(stranger, TRAIN_ROWS, name="ds")
+    stranger_dataset = frozen_dataset(stranger, TRAIN_ROWS, name="ds", contract="train")
     _job(stranger, stranger_dataset, group_id=uuid.uuid4())
 
     assert client.get(RUNS_URL).json()["count"] == 1
@@ -171,7 +173,7 @@ def test_runs_never_reach_another_projects_jobs():
 
 def test_dataset_facet_offers_every_dataset_with_a_job_not_just_the_loaded_page():
     client, project, dataset = _setup()
-    old_dataset = frozen_dataset(project, TRAIN_ROWS, name="aardvark")
+    old_dataset = frozen_dataset(project, TRAIN_ROWS, name="aardvark", contract="train")
     _job(project, old_dataset, group_id=uuid.uuid4())
     for _ in range(30):
         _job(project, dataset, group_id=uuid.uuid4())
@@ -187,7 +189,7 @@ def test_dataset_facet_offers_every_dataset_with_a_job_not_just_the_loaded_page(
 
 def test_base_model_facet_is_distinct_and_scoped_to_the_callers_filters():
     client, project, dataset = _setup()
-    other_dataset = frozen_dataset(project, TRAIN_ROWS, name="other")
+    other_dataset = frozen_dataset(project, TRAIN_ROWS, name="other", contract="train")
     _job(project, dataset, base_model="a-model")
     _job(project, dataset, base_model="a-model")
     _job(project, other_dataset, base_model="z-model")
@@ -204,8 +206,96 @@ def test_facets_never_leak_another_projects_values():
     client, project, dataset = _setup()
     _job(project, dataset, base_model="mine")
     stranger = Project.objects.create(name="X", slug=f"x-{uuid.uuid4().hex[:8]}")
-    stranger_dataset = frozen_dataset(stranger, TRAIN_ROWS, name="secret")
+    stranger_dataset = frozen_dataset(stranger, TRAIN_ROWS, name="secret", contract="train")
     _job(stranger, stranger_dataset, base_model="theirs")
 
     assert client.get(reverse("finetuningjob-base-models")).json() == ["mine"]
     assert [row["name"] for row in client.get(reverse("finetuningjob-datasets")).json()] == ["ds"]
+
+
+def test_validation_pins_the_requested_cell_and_rejects_another_dataset_cell():
+    client, project, dataset = _setup()
+    other = frozen_dataset(project, TRAIN_ROWS, contract="train")
+    url = reverse("finetuningjob-validate-dataset")
+    body = {
+        "dataset_id": str(dataset.id),
+        "cell_id": str(dataset.active_cell.id),
+        "validation_enabled": False,
+    }
+    response = client.post(url, body, format="json")
+    assert response.status_code == 200, response.content
+    assert response.json()["stats"]["checkpoint"] == str(dataset.active_cell.id)
+    assert (
+        client.post(url, {**body, "cell_id": str(other.active_cell.id)}, format="json").status_code
+        == 404
+    )
+
+
+@pytest.mark.parametrize(
+    "ordering",
+    [
+        "credits",
+        "-credits",
+        "name",
+        "-name",
+        "models",
+        "-models",
+        "status",
+        "-status",
+        "dataset",
+        "-dataset",
+        "created_at",
+        "-created_at",
+        "duration",
+        "-duration",
+    ],
+)
+def test_run_sorting_pages_whole_groups_with_filtered_members(ordering):
+    client, project, dataset = _setup()
+    a, b = uuid.uuid4(), uuid.uuid4()
+    _job(project, dataset, group_id=a, name="Alpha", cost_usd="2", status="succeeded")
+    _job(project, dataset, group_id=a, name="Alpha", cost_usd="9", status="failed")
+    _job(project, dataset, group_id=b, name="Beta", cost_usd="3", status="succeeded")
+    params = {"project": project.id, "status": "succeeded", "ordering": ordering, "page_size": 1}
+    first = client.get(RUNS_URL, params)
+    second = client.get(RUNS_URL, {**params, "page": 2})
+    assert first.status_code == second.status_code == 200
+    assert first.data["count"] == 2
+    rows = first.data["results"] + second.data["results"]
+    assert {row["run_id"] for row in rows} == {str(a), str(b)}
+    assert len(next(row for row in rows if row["run_id"] == str(a))["jobs"]) == 2
+    if ordering in ("credits", "-credits"):
+        assert rows[0]["run_id"] == str(a if ordering.startswith("-") else b)
+    if ordering in ("name", "-name"):
+        assert rows[0]["run_id"] == str(b if ordering.startswith("-") else a)
+
+
+def test_run_sorting_rejects_unknown_columns():
+    client, project, _ = _setup()
+    assert client.get(RUNS_URL, {"project": project.id, "ordering": "private"}).status_code == 400
+
+
+def test_run_names_sort_by_visible_name_without_model_prefix():
+    client, project, dataset = _setup()
+    alpha = _job(project, dataset, name="Qwen3 8B · Alpha", base_model="qwen/Qwen3-8B")
+    beta = _job(project, dataset, name="Beta · Llama 3.2 1B Instruct")
+    for ordering, first in [("name", alpha), ("-name", beta)]:
+        response = client.get(RUNS_URL, {"ordering": ordering, "page_size": 1})
+        assert response.status_code == 200, response.content
+        assert response.data["results"][0]["run_id"] == str(first.id)
+
+
+@pytest.mark.parametrize("ordering", ["duration", "-duration"])
+def test_duration_sort_keeps_undisplayed_subsecond_durations_last(ordering):
+    client, project, dataset = _setup()
+    start = timezone.now() - timedelta(hours=1)
+    jobs = [
+        _job(project, dataset, started_at=start, completed_at=start + timedelta(seconds=seconds))
+        for seconds in (0.1, 90, 600)
+    ]
+    response = client.get(RUNS_URL, {"project": project.id, "ordering": ordering})
+    assert response.status_code == 200, response.content
+    measured = jobs[1:] if ordering == "duration" else jobs[:0:-1]
+    assert [r["run_id"] for r in response.data["results"]] == [
+        str(j.id) for j in [*measured, jobs[0]]
+    ]

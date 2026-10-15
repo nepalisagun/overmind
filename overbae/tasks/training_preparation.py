@@ -1,7 +1,8 @@
 from celery import shared_task
 
 from overbae.models import TrainingPreparation
-from overbae.services.training_preparation import advance
+from overbae.services import operational_progress
+from overbae.services.training_preparation import advance, sync_setup_jobs
 
 
 @shared_task
@@ -14,4 +15,14 @@ def reconcile():
 
 @shared_task(acks_late=True)
 def inspect_preparation(preparation_id):
-    advance(preparation_id)
+    try:
+        advance(preparation_id)
+    finally:
+        prep = (
+            TrainingPreparation.objects.select_related("cell__dataset")
+            .filter(pk=preparation_id)
+            .first()
+        )
+        if prep:
+            sync_setup_jobs(prep)
+            operational_progress.preparation(prep)

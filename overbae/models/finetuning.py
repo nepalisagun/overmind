@@ -27,12 +27,38 @@ class TrainingPreparation(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class TrainingExperiment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey("overbae.Project", on_delete=models.CASCADE)
+    name = models.CharField(max_length=255)
+    purpose = models.TextField()
+    request_key = models.CharField(max_length=128)
+    variants = models.JSONField(default=list)
+    protocol = models.JSONField(default=dict)
+    evaluation = models.ForeignKey(
+        "overbae.NativeEvaluationPlan", on_delete=models.PROTECT, null=True, blank=True
+    )
+    state = models.CharField(max_length=24, default="draft")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "request_key"], name="unique_training_experiment_request"
+            )
+        ]
+
+
 class FinetuningJob(models.Model):
     """API-side handle for one training run. A Celery worker dispatches the run
     to the configured provider and reconciles the remote state back onto this row.
     """
 
     class Status(models.TextChoices):
+        PREPROCESSING = "preprocessing", "Preparing data"
+        AWAITING_LAUNCH = "awaiting_launch", "Awaiting launch"
+        SUBMISSION_UNKNOWN = "submission_unknown"
         QUEUED = "queued"
         PREPARING = "preparing"
         RUNNING = "running"
@@ -140,10 +166,16 @@ class FinetuningJob(models.Model):
     )
     eval_incumbent_before = models.BooleanField(default=False)
     eval_judge_model = models.CharField(max_length=255, blank=True, default="")
+    benchmark_models = models.JSONField(default=list, blank=True)
     eval_incumbent_after = models.BooleanField(default=False)
     eval_model_before = models.BooleanField(default=True)
     eval_model_after = models.BooleanField(default=True)
 
+    request_key = models.CharField(max_length=128, null=True, blank=True)
+    requested_configuration = models.JSONField(default=dict, blank=True)
+    effective_configuration = models.JSONField(default=dict, blank=True)
+    provider_submission = models.JSONField(default=dict, blank=True)
+    accepted_findings = models.JSONField(default=list, blank=True)
     name = models.CharField(max_length=255, blank=True, default="")
     use_case = models.TextField(blank=True, default="")
 
@@ -156,6 +188,13 @@ class FinetuningJob(models.Model):
     provider = models.CharField(max_length=20, choices=Provider.choices, default=Provider.BASETEN)
 
     base_model = models.CharField(max_length=255)
+    preparation = models.ForeignKey(
+        TrainingPreparation,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="training_jobs",
+    )
     # Forwarded verbatim to the provider (learning_rate, n_epochs, batch_size,
     # lora params, …).
     hyperparameters = models.JSONField(default=dict, blank=True)
@@ -206,6 +245,11 @@ class FinetuningJob(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "request_key"], name="finetune_project_request_unique"
+            )
+        ]
         indexes = [
             models.Index(fields=["project", "-created_at"]),
             models.Index(fields=["status", "-created_at"]),
@@ -256,6 +300,7 @@ class FinetuningJobEval(models.Model):
 
     class Kind(models.TextChoices):
         BASELINE = "baseline"
+        COMPARATOR = "comparator"
         INCUMBENT_AFTER = "incumbent_after"
         MODEL_BEFORE = "model_before"
         CHECKPOINT = "checkpoint"
@@ -328,3 +373,123 @@ class FinetuningJobEval(models.Model):
 
     def __str__(self):
         return f"FinetuningJobEval {self.kind} job={self.job_id} ({self.status})"
+
+
+class NativeEvaluationPlan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey("overbae.Project", on_delete=models.CASCADE)
+    triggered_by = models.ForeignKey(
+        "overbae.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="native_evaluations",
+    )
+    name = models.CharField(max_length=255, default="Decision comparison")
+    request_key = models.CharField(max_length=128, null=True, blank=True)
+    job = models.OneToOneField(
+        FinetuningJob,
+        on_delete=models.PROTECT,
+        related_name="native_evaluation",
+        null=True,
+        blank=True,
+    )
+    calibration_cell = models.ForeignKey(
+        "overbae.Cell",
+        on_delete=models.PROTECT,
+        related_name="native_calibration_plans",
+        null=True,
+        blank=True,
+    )
+    final_cell = models.ForeignKey(
+        "overbae.Cell", on_delete=models.PROTECT, related_name="native_final_plans"
+    )
+    config = models.JSONField(default=dict)
+    state = models.CharField(max_length=32, default="waiting_for_checkpoint", db_index=True)
+    calls = models.JSONField(default=dict)
+    calibration = models.JSONField(default=dict)
+    results = models.JSONField(default=dict)
+    error = models.TextField(blank=True, default="")
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "request_key"], name="unique_native_evaluation_request"
+            )
+        ]
+
+
+class DecisionProviderRequest(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    plan = models.ForeignKey(
+        NativeEvaluationPlan, on_delete=models.CASCADE, related_name="requests"
+    )
+    participant = models.CharField(max_length=64)
+    role = models.CharField(max_length=16)
+    input_sha256 = models.CharField(max_length=64)
+    state = models.CharField(max_length=24, default="pending", db_index=True)
+    attempts = models.JSONField(default=list)
+    response = models.JSONField(null=True, blank=True)
+    prediction = models.JSONField(null=True, blank=True)
+    diagnostics = models.JSONField(default=dict)
+    usage = models.JSONField(default=dict)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["plan", "participant", "role", "input_sha256"],
+                name="unique_decision_provider_request",
+            )
+        ]
+
+
+class DecisionPerformanceRun(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey("overbae.Project", on_delete=models.CASCADE)
+    evaluation = models.ForeignKey(NativeEvaluationPlan, on_delete=models.PROTECT)
+    name = models.CharField(max_length=255)
+    request_key = models.CharField(max_length=128)
+    workload = models.JSONField()
+    state = models.CharField(max_length=24, default="queued")
+    results = models.JSONField(default=dict)
+    error = models.TextField(default="", blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "request_key"], name="unique_decision_performance_run"
+            )
+        ]
+
+
+class DecisionPerformanceRequest(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run = models.ForeignKey(
+        DecisionPerformanceRun, on_delete=models.CASCADE, related_name="requests"
+    )
+    participant = models.CharField(max_length=64)
+    position = models.PositiveIntegerField()
+    state = models.CharField(max_length=24, default="pending")
+    call_id = models.CharField(max_length=255, default="", blank=True)
+    response = models.JSONField(null=True)
+    usage = models.JSONField(default=dict)
+    latency_ms = models.FloatField(null=True)
+    error = models.TextField(default="", blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "participant", "position"],
+                name="unique_decision_performance_request",
+            )
+        ]

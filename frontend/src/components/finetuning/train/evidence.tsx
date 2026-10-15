@@ -9,6 +9,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Icon } from "@/components/ui/icons";
+import { SortableHeader } from "@/components/ui/sortable-header";
+import { useTableSort } from "@/hooks/use-table-sort";
 import { count } from "@/lib/formatters";
 import { PROSE } from "@/lib/typography";
 import { cn, plural } from "@/lib/utils";
@@ -30,20 +32,18 @@ export function MatchScore({
   matchPool: number;
   className?: string;
 }) {
+  if (match == null) return null;
   const standing = matchStanding(matchRank, matchPool);
-  const label =
-    match == null
-      ? "Not graded"
-      : [`Match ${formatScore(match)} out of 100`, standing].filter(Boolean).join(", ");
+  const label = [`Match ${formatScore(match)} out of 100`, standing].filter(Boolean).join(", ");
   return (
     <Badge
       aria-label={label}
       className={cn("shrink-0 tabular-nums", className)}
       size="chip"
       title={label}
-      variant={match == null ? "neutral" : "outline"}
+      variant="outline"
     >
-      {match == null ? "Not graded" : `Match ${formatScore(match)}/100`}
+      {`Match ${formatScore(match)}/100`}
     </Badge>
   );
 }
@@ -241,7 +241,10 @@ export function EvidencePanel({
           )}
         </div>
         <CollapsibleContent>
-          <EvidenceTable className="mt-3" rows={evidence} />
+          <EvidenceTable
+            className="-mx-3 mt-3 [&>p]:px-3 [&_td:first-child]:pl-3 [&_td:last-child]:pr-3 [&_th:first-child]:pl-3 [&_th:last-child]:pr-3"
+            rows={evidence}
+          />
         </CollapsibleContent>
       </Collapsible>
     </div>
@@ -258,6 +261,9 @@ export function EvidenceTable({
   rows: FinetuningEvidence[];
   className?: string;
 }) {
+  const { sort, onSort, sortRows } = useTableSort<
+    "benchmark" | "skill" | "percentile" | "cohortN" | "source"
+  >();
   if (rows.length === 0) return null;
 
   return (
@@ -270,25 +276,45 @@ export function EvidenceTable({
         <caption className="sr-only">Benchmarks behind this model&apos;s standing</caption>
         <thead>
           <tr className="border-b border-border/70">
-            <th className={cn(HEAD, "w-[30%]")} scope="col">
-              Benchmark
-            </th>
-            <th className={cn(HEAD, "w-[28%]")} scope="col">
-              Skill
-            </th>
-            <th className={cn(HEAD, "w-[16%] text-right")} scope="col">
-              Standing
-            </th>
-            <th className={cn(HEAD, "w-[14%] text-right")} scope="col">
-              Cohort
-            </th>
-            <th className={cn(HEAD, "w-[12%] text-right")} scope="col">
-              Reference
-            </th>
+            <SortableHeader
+              className={cn(HEAD, "w-[30%]")}
+              label="Benchmark"
+              onSort={onSort}
+              sort={sort}
+              sortKey="benchmark"
+            />
+            <SortableHeader
+              className={cn(HEAD, "w-[28%]")}
+              label="Skill"
+              onSort={onSort}
+              sort={sort}
+              sortKey="skill"
+            />
+            <SortableHeader
+              className={cn(HEAD, "w-[16%] text-right")}
+              label="Standing"
+              onSort={onSort}
+              sort={sort}
+              sortKey="percentile"
+            />
+            <SortableHeader
+              className={cn(HEAD, "w-[14%] text-right")}
+              label="Cohort"
+              onSort={onSort}
+              sort={sort}
+              sortKey="cohortN"
+            />
+            <SortableHeader
+              className={cn(HEAD, "w-[12%] text-right")}
+              label="Reference"
+              onSort={onSort}
+              sort={sort}
+              sortKey="source"
+            />
           </tr>
         </thead>
         <tbody>
-          {sortEvidence(rows).map((row) => (
+          {sortRows(sortEvidence(rows), (row, key) => row[key]).map((row) => (
             <tr className="border-b border-border/60 last:border-0" key={row.benchmark}>
               <td className={CELL}>
                 <span className="block truncate text-foreground" title={row.benchmark}>
@@ -327,14 +353,6 @@ export function EvidenceTable({
         </tbody>
       </table>
     </div>
-  );
-}
-
-export function UngradedNote({ className }: { className?: string }) {
-  return (
-    <p className={cn(PROSE, "text-xs text-muted-foreground", className)}>
-      No benchmark data. Ranked below every graded model.
-    </p>
   );
 }
 

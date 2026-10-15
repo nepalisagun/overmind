@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pandas as pd
 import pytest
 from conftest import TRAIN_ROWS, frozen_dataset
-from mcp_fixtures import mcp_context, training_setup
+from mcp_fixtures import training_setup
 
 from modal_shared.preparation import preparation_failure
 from overbae.core.errors import InputValidationError
@@ -19,9 +19,13 @@ from overbae.models import (
     Dataset,
     DeployedModel,
     FinetuningJob,
+    Project,
+    ProjectMembership,
     TrainingPreparation,
+    User,
 )
 from overbae.services.datasets import paths, store
+from overbae.services.finetuning_validator import ValidationResult
 from overbae.services.mcp import tools_finetuning
 from overbae.services.mcp.catalog import CATALOG
 from overbae.services.mcp.context import MCPContext, bind_context
@@ -30,20 +34,35 @@ from overbae.services.mcp.resources import read_resource
 pytestmark = pytest.mark.django_db(transaction=True)
 
 
+def _context(*, permission: str | list[str] = "read") -> MCPContext:
+    user = User.objects.create_user(
+        email=f"mcp-ft-{uuid.uuid4().hex[:8]}@test.com",
+        password="pw",
+        clerk_user_id=f"clerk_{uuid.uuid4().hex}",
+    )
+    project = Project.objects.create(name="Fine tuning", slug=f"ft-{uuid.uuid4().hex[:8]}")
+    ProjectMembership.objects.create(user=user, project=project)
+    permissions = [permission] if isinstance(permission, str) else permission
+    token = APIToken(scope={"scope": "project", "permission": permissions})
+    return MCPContext(
+        user=user, token=token, project=project, inference_base_url="http://testserver/api/v1"
+    )
+
+
 def _call(name: str, arguments: dict, context: MCPContext):
     return asyncio.run(CATALOG.call(name, arguments, context))
 
 
 @pytest.mark.parametrize("tool", ["prepare_training_data", "retry_deployment"])
-def test_preparation_and_deployment_refusals_reach_the_agent(monkeypatch, tool):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+@pytest.mark.parametrize("known", [True, False])
+def test_preparation_and_deployment_errors_are_safe_for_agents(monkeypatch, tool, known):
+    context = _context(permission=["read", "write"])
     _, train, _, _ = training_setup(context)
-    detail = "The previous operation has not stopped."
-    failure = InputValidationError(detail)
+    private = "Traceback: /srv/private/worker.py provider_token=hidden"
+    detail = "The previous operation has not stopped." if known else private
+    failure = InputValidationError(detail) if known else ValueError(detail)
     if tool == "prepare_training_data":
-        monkeypatch.setattr(tools_finetuning, "request_preparation", Mock(side_effect=failure))
+        monkeypatch.setattr(tools_finetuning, "begin_preparation", Mock(side_effect=failure))
         arguments = {
             "dataset": str(train.id),
             "base_model": "Qwen/Qwen3-8B",
@@ -56,19 +75,24 @@ def test_preparation_and_deployment_refusals_reach_the_agent(monkeypatch, tool):
         deployed = DeployedModel.objects.create(
             project=context.project, finetuning_job=job, status="failed", model_id="retry-error"
         )
+        monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _: None)
         monkeypatch.setattr(tools_finetuning, "retry_deployment", Mock(side_effect=failure))
         arguments = {"deployment": str(deployed.id)}
     result = _call(tool, arguments, context)
     assert result.isError
-    assert result.structuredContent["error"]["message"] == detail
+    assert private not in json.dumps(result.structuredContent)
+    if known:
+        assert result.structuredContent["error"]["message"] == detail
+    else:
+        assert result.structuredContent["error"]["code"] == "internal_error"
 
 
 def _ok_cell(dataset, *, intent, rows=2, title="source", position=0, active=True, fits=True):
     cell = Cell.objects.create(
         dataset=dataset,
-        parent=dataset.cells.filter(position=0).first() if position else None,
         position=position,
         title=title,
+        state=Cell.State.OK,
         rows=rows,
         fingerprint=f"fp-{position}-{uuid.uuid4().hex[:8]}",
         intent_report={intent: {"ok": fits, "reason": "" if fits else "not a fit"}},
@@ -98,6 +122,9 @@ def _ok_cell(dataset, *, intent, rows=2, title="source", position=0, active=True
     )
     cell.fingerprint = store.file_sha256(path)
     cell.save(update_fields=["fingerprint"])
+    from conftest import review_fixture
+
+    review_fixture(dataset, cell)
     return cell
 
 
@@ -127,9 +154,7 @@ def test_catalog_has_finetuning_tools_and_read_only_keys_hide_writes():
 
 def test_exact_preparation_has_pollable_project_scoped_receipt(settings, monkeypatch):
     settings.FINETUNING_BACKEND = "modal"
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write", "train"]
-    )
+    context = _context(permission=["read", "write", "train"])
     dataset = frozen_dataset(context.project, TRAIN_ROWS, contract="train")
     monkeypatch.setattr(tools_finetuning.inspect_preparation, "delay", lambda *a: None)
     result = _call(
@@ -140,8 +165,13 @@ def test_exact_preparation_has_pollable_project_scoped_receipt(settings, monkeyp
     assert not result.isError, result.structuredContent
     receipt = result.structuredContent["job"]
     assert receipt["kind"] == "training_preparation"
+    training = result.structuredContent["training_job"]
+    assert training["kind"] == "finetune_job" and training["status"] == "preprocessing"
+    visible = _call("get_job", {"kind": training["kind"], "id": training["id"]}, context)
+    assert not visible.isError, visible.structuredContent
     poll = _call("get_job", {"kind": receipt["kind"], "id": receipt["id"]}, context)
     assert not poll.isError, poll.structuredContent
+    assert poll.structuredContent["details"]["training_job"] == training["id"]
 
     async def resource():
         with bind_context(context):
@@ -161,13 +191,13 @@ def test_exact_preparation_has_pollable_project_scoped_receipt(settings, monkeyp
     assert failed.structuredContent["job_error"] == failure["error"]
     assert failed.structuredContent["progress"] == failure
     assert asyncio.run(resource())["error"] == failure["error"]
-    other = mcp_context(inference_base_url="http://testserver/api/v1")
+    other = _context()
     denied = _call("get_job", {"kind": receipt["kind"], "id": receipt["id"]}, other)
     assert denied.isError
 
 
 def test_readiness_rejects_wrong_intent():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
+    context = _context()
     wrong_intent = Dataset.objects.create(
         project=context.project,
         name="Eval-shaped",
@@ -188,7 +218,7 @@ def test_readiness_rejects_wrong_intent():
 
 
 def test_readiness_treats_legacy_ft_as_train():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
+    context = _context()
     dataset = Dataset.objects.create(
         project=context.project,
         name="trading-decision-ft-text",
@@ -207,30 +237,27 @@ def test_readiness_treats_legacy_ft_as_train():
 
 
 def test_readiness_classifies_selected_capability_and_defers_to_data_for_none(fake_llm):
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
+    context = _context()
     capability, dataset, _, _ = training_setup(context)
     capability.description = "Write Python code."
     capability.save(update_fields=["description"])
-    fake_llm.on_json(
-        lambda r: r.system.startswith("Classify the task an AI capability"),
-        lambda r: {"task_type": "code_generation"},
-    )
+    fake_llm.decide = lambda _key, _question: "code_generation"
+    fake_llm.on("Classify the task an AI capability", '{"task_type":"code_generation"}')
     selected = _call(
         "check_finetune_readiness",
         {"dataset": str(dataset.id), "capability": str(capability.id)},
         context,
     )
-    omitted = _call("check_finetune_readiness", {"dataset": str(dataset.id)}, context)
-    unassigned = _call(
-        "check_finetune_readiness", {"dataset": str(dataset.id), "capability": None}, context
-    )
+    unassigned = _call("check_finetune_readiness", {"dataset": str(dataset.id)}, context)
 
     assert not selected.isError, selected.structuredContent
     assert not unassigned.isError, unassigned.structuredContent
     assert selected.structuredContent["task_type"] == "code_generation"
     assert selected.structuredContent["task_type_source"] == "capability"
-    assert omitted.structuredContent["capability"]["id"] == str(capability.id)
-    assert unassigned.structuredContent["capability"] is None
+    assert selected.structuredContent["assessment"]["task_suitability"] == "unmeasured"
+    assert selected.structuredContent["assessment"]["technical"] == (
+        "pass" if selected.structuredContent["ready"] else "blocked"
+    )
     assert unassigned.structuredContent["task_type_source"] == "heuristic"
     definition = next(
         item for item in CATALOG.definitions() if item.name == "check_finetune_readiness"
@@ -239,8 +266,8 @@ def test_readiness_classifies_selected_capability_and_defers_to_data_for_none(fa
 
 
 def test_cross_project_references_are_not_resolved():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
-    other = mcp_context(inference_base_url="http://testserver/api/v1")
+    context = _context()
+    other = _context()
     dataset = Dataset.objects.create(
         project=other.project,
         name="Other train",
@@ -270,44 +297,53 @@ def test_cross_project_references_are_not_resolved():
     assert active.structuredContent["error"]["code"] == "capability_not_found"
 
 
-def test_estimate_prices_the_chosen_cell_without_creating_a_job():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
-    _, dataset, _, _ = training_setup(context)
-    arguments = {"dataset": str(dataset.id), "base_model": "Qwen/Qwen2.5-7B-Instruct"}
-
-    one = _call("estimate_finetune", {**arguments, "n_epochs": 1}, context)
-    four = _call("estimate_finetune", {**arguments, "n_epochs": 4}, context)
-
-    assert not one.isError, one.structuredContent
-    one, four = one.structuredContent, four.structuredContent
-    assert four["trained_tokens"] == 4 * one["trained_tokens"]
-    assert four["cost_estimate"]["usd"] >= one["cost_estimate"]["usd"]
-    assert four["version"]["id"] == str(dataset.active_cell.id)
-    assert four["version"]["rows"] == dataset.active_cell.rows
-    assert not FinetuningJob.objects.filter(project=context.project).exists()
-
-
-def test_start_without_a_capability_requires_the_eval_dataset_and_set():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
+def test_estimate_uses_existing_estimator_without_creating_a_job(monkeypatch):
+    context = _context()
+    dataset = Dataset.objects.create(
+        project=context.project,
+        name="Train",
+        intent=Dataset.Intent.TRAIN,
     )
-    _, train, evaluation, _ = training_setup(context)
-    arguments = {
-        "dataset": str(train.id),
-        "capability": None,
-        "base_model": "Qwen/Qwen2.5-7B-Instruct",
+    cell = _ok_cell(dataset, intent="train", rows=4)
+    calls = {}
+
+    def estimate(dataset_id, **kwargs):
+        calls.update(dataset_id=dataset_id, kwargs=kwargs)
+        return {
+            "cost_estimate": {"usd": 1.25},
+            "time_estimate": {"seconds": 60, "human": "1 min"},
+            "trained_tokens": 1000,
+        }
+
+    monkeypatch.setattr(tools_finetuning, "estimate_for_hyperparams", estimate)
+    result = _call(
+        "estimate_finetune",
+        {
+            "dataset": str(dataset.id),
+            "base_model": "Qwen/Qwen2.5-7B-Instruct",
+            "n_epochs": 4,
+            "use_lora": False,
+        },
+        context,
+    )
+    assert result.isError is False, result.structuredContent
+    assert calls == {
+        "dataset_id": str(dataset.id),
+        "kwargs": {
+            "base_model": "Qwen/Qwen2.5-7B-Instruct",
+            "n_epochs": 4,
+            "use_lora": False,
+            "cell": cell,
+            "validation_cell": None,
+            "validation_enabled": True,
+            "validation_split_ratio": 0.2,
+            "split_method": "random",
+            "hyperparameters": {"monitoring": result.structuredContent["monitoring"]["policy"]},
+        },
     }
-
-    no_eval = _call("start_finetune", arguments, context).structuredContent["error"]
-    no_set = _call(
-        "start_finetune", {**arguments, "eval_dataset": str(evaluation.id)}, context
-    ).structuredContent["error"]
-
-    assert (no_eval["code"], no_eval["fields"]) == (
-        "finetune_not_ready",
-        {"eval_dataset": "required"},
-    )
-    assert (no_set["code"], no_set["fields"]) == ("finetune_not_ready", {"eval_set": "required"})
+    assert result.structuredContent["trained_tokens"] == 1000
+    assert result.structuredContent["cell"]["id"] == str(cell.id)
+    assert result.structuredContent["cell"]["rows"] == 4
     assert not FinetuningJob.objects.filter(project=context.project).exists()
 
 
@@ -317,18 +353,24 @@ def test_start_without_a_capability_requires_the_eval_dataset_and_set():
 def test_start_uses_serializer_and_worker_task(
     monkeypatch, capability_choice, unassigned_set, disable_evals
 ):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     capability, train, _evaluation, _eval_set = training_setup(context)
     if unassigned_set:
         _eval_set.capability = None
         _eval_set.save(update_fields=["capability"])
-    defaults = capability_choice == "omitted" and not unassigned_set
-    if defaults:
-        capability.active_eval_set = _eval_set
-        capability.save(update_fields=["active_eval_set"])
     calls = {}
+    monkeypatch.setattr(
+        tools_finetuning,
+        "validate_dataset",
+        lambda *_args, **_kwargs: ValidationResult(True, "conversational", 1),
+    )
+    monkeypatch.setattr(
+        tools_finetuning,
+        "stamp_hyperparameters_for_model",
+        lambda *_args: {"training_type": {"type": "Lora"}},
+    )
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _user: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_args: None)
     monkeypatch.setattr(
         "overbae.tasks.finetuning.run_finetuning.apply_async",
         lambda **kwargs: calls.update(kwargs=kwargs) or SimpleNamespace(id="celery-ft"),
@@ -346,15 +388,6 @@ def test_start_uses_serializer_and_worker_task(
                 else {}
             ),
             "base_model": "Qwen/Qwen2.5-7B-Instruct",
-            **(
-                {}
-                if defaults
-                else {
-                    "eval_dataset": str(_evaluation.id),
-                    "eval_version": "v0",
-                    "eval_set": str(_eval_set.id),
-                }
-            ),
             **({"baseline_model": capability.model} if capability_choice == "selected" else {}),
             **(
                 {
@@ -371,11 +404,11 @@ def test_start_uses_serializer_and_worker_task(
     )
     assert result.isError is False, result.structuredContent
     job = FinetuningJob.objects.get(project=context.project)
-    assert job.capability_id == (None if capability_choice == "none" else capability.id)
+    assert job.capability_id == (capability.id if capability_choice == "selected" else None)
     if capability_choice == "selected":
         assert job.baseline_model == capability.model
-    assert job.eval_dataset_id == _evaluation.id
-    assert job.eval_set_id == _eval_set.id
+    assert job.eval_dataset_id == (None if disable_evals else _evaluation.id)
+    assert job.eval_set_id == (None if disable_evals else _eval_set.id)
     if disable_evals:
         assert not any(
             (
@@ -393,15 +426,7 @@ def test_start_uses_serializer_and_worker_task(
         f"overmind://jobs/finetune/{job.id}"
     )
     assert job.cell_id == train.active_cell.id
-    versions = result.structuredContent["versions"]
-    assert versions["train"] == {
-        "dataset": str(train.id),
-        "version": "v0",
-        "id": str(job.cell_id),
-        "fingerprint": train.active_cell.fingerprint,
-    }
-    assert versions["eval"]["id"] == str(job.eval_cell_id)
-    assert versions["validation"] is None
+    assert result.structuredContent["cell"]["id"] == str(job.cell_id)
     train.active_cell.refresh_from_db()
     assert train.active_cell.used_at is not None
 
@@ -413,9 +438,7 @@ def test_start_uses_serializer_and_worker_task(
 def test_retry_returns_resource_and_dispatches_for_recoverable_deployment(
     monkeypatch, deployment_status
 ):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     _, train, _, _ = training_setup(context)
     job = FinetuningJob.objects.create(
         project=context.project,
@@ -431,6 +454,7 @@ def test_retry_returns_resource_and_dispatches_for_recoverable_deployment(
         model_id=f"ft-retry-{deployment_status}",
         error_message="previous deployment failure",
     )
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _user: None)
     calls = {}
     monkeypatch.setattr(
         "overbae.tasks.model_deployment.register_finetuned_model.delay",
@@ -464,9 +488,7 @@ def test_retry_returns_resource_and_dispatches_for_recoverable_deployment(
     ],
 )
 def test_retry_rejects_ready_or_in_flight_deployment(deployment_status):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     train = Dataset.objects.create(
         project=context.project, name="Train", intent=Dataset.Intent.TRAIN
     )
@@ -490,9 +512,7 @@ def test_retry_rejects_ready_or_in_flight_deployment(deployment_status):
 
 
 def test_retry_rejects_deployment_without_usable_finetune_job():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     train = Dataset.objects.create(
         project=context.project, name="Train", intent=Dataset.Intent.TRAIN
     )
@@ -516,9 +536,7 @@ def test_retry_rejects_deployment_without_usable_finetune_job():
 
 
 def test_retry_remains_durable_when_broker_is_unavailable(monkeypatch):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     _, train, _, _ = training_setup(context)
     job = FinetuningJob.objects.create(
         project=context.project,
@@ -533,6 +551,7 @@ def test_retry_remains_durable_when_broker_is_unavailable(monkeypatch):
         status=DeployedModel.Status.FAILED,
         error_message="previous failure",
     )
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _user: None)
 
     job.remote_job_id = "remote"
     job.save(update_fields=["remote_job_id"])
@@ -555,9 +574,7 @@ def test_retry_remains_durable_when_broker_is_unavailable(monkeypatch):
 
 
 def test_set_active_model_validates_ready_same_project_and_clear(monkeypatch):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     capability, train, _, _ = training_setup(context)
     deployment = DeployedModel.objects.create(
         project=context.project,
@@ -585,9 +602,7 @@ def test_set_active_model_validates_ready_same_project_and_clear(monkeypatch):
 
 
 def test_benchmark_tool_and_capability_resource_preserve_serving():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write", "train"]
-    )
+    context = _context(permission=["read", "write", "train"])
     capability, train, _, _ = training_setup(context)
     job = FinetuningJob.objects.create(
         project=context.project, capability=capability, dataset=train, base_model="Qwen/Qwen3-8B"
@@ -628,11 +643,9 @@ def test_benchmark_tool_and_capability_resource_preserve_serving():
 
 
 def test_benchmark_tool_rejects_infrastructure_and_foreign_projects():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write", "train"]
-    )
+    context = _context(permission=["read", "write", "train"])
     capability, _, _, _ = training_setup(context)
-    foreign_context = mcp_context(inference_base_url="http://testserver/api/v1")
+    foreign_context = _context()
     for project in (context.project, foreign_context.project):
         deployment = DeployedModel.objects.create(
             project=project, model_id=f"base-{project.id}", status="ready"
@@ -647,33 +660,36 @@ def test_benchmark_tool_rejects_infrastructure_and_foreign_projects():
     assert capability.benchmark_model_id is None
 
 
-def test_run_inference_redacts_service_errors(scripted):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+def test_run_inference_redacts_service_errors(monkeypatch):
+    context = _context(permission=["read", "write"])
     deployment = DeployedModel.objects.create(
         project=context.project,
         model_id="ft-infer",
         status=DeployedModel.Status.READY,
     )
-    scripted("http://inference.test").reply(500, text="provider secret body")
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _user: None)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("provider secret body")
+
+    monkeypatch.setattr("overbae.services.inference_requests.submit", fail)
     result = _call(
         "run_inference",
         {
             "deployment": str(deployment.id),
+            "request_key": "redaction-test",
+            "max_tokens": 32,
             "messages": [{"role": "user", "content": "hello"}],
         },
         context,
     )
     assert result.isError is True
-    assert result.structuredContent["error"]["code"] == "inference_failed"
+    assert result.structuredContent["error"]["code"] == "internal_error"
     assert "provider secret" not in str(result.structuredContent)
 
 
 def test_start_rejects_credential_shaped_hyperparameter_keys():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     capability, train, _, _ = training_setup(context)
     result = _call(
         "start_finetune",
@@ -690,10 +706,8 @@ def test_start_rejects_credential_shaped_hyperparameter_keys():
     assert not FinetuningJob.objects.filter(project=context.project).exists()
 
 
-def test_model_swap_prompt_returns_prompt_and_capability_refs():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+def test_model_swap_prompt_returns_prompt_and_capability_refs(monkeypatch):
+    context = _context(permission=["read", "write"])
     capability, train, _, _ = training_setup(context)
     job = FinetuningJob.objects.create(
         project=context.project,
@@ -708,19 +722,31 @@ def test_model_swap_prompt_returns_prompt_and_capability_refs():
         model_id="ft-pr",
         status=DeployedModel.Status.READY,
     )
+    monkeypatch.setattr(
+        "overbae.services.model_swap_prompt.model_swap_prompt_for_job",
+        lambda _job, pin=False, base_url="": (
+            {
+                "prompt": "Point the client at the new model.",
+                "pin": pin,
+                "capability_id": str(capability.id),
+                "capability_name": capability.name,
+                "old_model": "gpt-4o-mini",
+                "new_model": "ft-pr",
+            },
+            None,
+        ),
+    )
     result = _call("get_model_swap_prompt", {"finetune": str(job.id)}, context)
     assert result.isError is False, result.structuredContent
     body = result.structuredContent
-    assert capability.name in body["prompt"]
-    assert body["old_model"] == capability.model
-    assert body["new_model"] == f"overmind/{capability.id}"
+    assert body["prompt"] == "Point the client at the new model."
+    assert body["old_model"] == "gpt-4o-mini"
+    assert body["new_model"] == "ft-pr"
     assert body["capability_id"] == str(capability.id)
 
 
-def test_model_swap_prompt_reports_why_it_is_unavailable():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+def test_model_swap_prompt_reports_why_it_is_unavailable(monkeypatch):
+    context = _context(permission=["read", "write"])
     capability, train, _, _ = training_setup(context)
     job = FinetuningJob.objects.create(
         project=context.project,
@@ -729,13 +755,20 @@ def test_model_swap_prompt_reports_why_it_is_unavailable():
         base_model="Qwen/Qwen2.5-7B-Instruct",
         status=FinetuningJob.Status.RUNNING,
     )
+    monkeypatch.setattr(
+        "overbae.services.model_swap_prompt.model_swap_prompt_for_job",
+        lambda _job, pin=False, base_url="": (
+            None,
+            "Only successfully trained models can be shipped.",
+        ),
+    )
     result = _call("get_model_swap_prompt", {"finetune": str(job.id)}, context)
     assert result.isError is True
     assert result.structuredContent["error"]["code"] == "model_swap_prompt_not_ready"
 
 
 def test_deployment_resource_has_url_and_bounded_metrics():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
+    context = _context()
     deployment = DeployedModel.objects.create(
         project=context.project,
         model_id="ft-resource",
@@ -756,7 +789,7 @@ def test_deployment_resource_has_url_and_bounded_metrics():
 
 
 def test_finetune_resource_bounds_progress_without_checkpoint_urls():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
+    context = _context()
     job = FinetuningJob.objects.create(
         project=context.project,
         dataset=Dataset.objects.create(
@@ -786,67 +819,86 @@ def test_finetune_resource_bounds_progress_without_checkpoint_urls():
     assert "signed.example" not in json.dumps(resource)
 
 
-def test_readiness_reports_chosen_cell_rows_and_contract_failure():
-    context = mcp_context(inference_base_url="http://testserver/api/v1")
+def test_readiness_reports_chosen_cell_rows_and_contract_failure(monkeypatch):
+    context = _context()
     dataset = Dataset.objects.create(
         project=context.project, name="Train", intent=Dataset.Intent.TRAIN
     )
     cell = _ok_cell(dataset, intent="train", rows=7, fits=False)
+    monkeypatch.setattr(
+        tools_finetuning,
+        "finetune_prerequisite_report",
+        lambda *_args, **_kwargs: {
+            "missing": [],
+            "catalog": {},
+            "n_candidates": 0,
+            "recommendations": [],
+            "has_tool_calling": False,
+            "excluded": [],
+        },
+    )
     result = _call("check_finetune_readiness", {"dataset": str(dataset.id)}, context)
     assert result.isError is False
     output = result.structuredContent
     assert output["ready"] is False
-    assert output["dataset"]["version"]["id"] == str(cell.id)
-    assert output["dataset"]["version"]["rows"] == 7
-    assert output["dataset"]["version"]["fits"] is False
+    assert output["dataset"]["cell"]["id"] == str(cell.id)
+    assert output["dataset"]["cell"]["rows"] == 7
+    assert output["dataset"]["cell"]["fits"] is False
     assert any("training dataset" in item for item in output["missing"])
 
 
 def test_start_uses_explicit_cell_not_active(monkeypatch):
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     capability, train, _evaluation, _eval_set = training_setup(context)
     extra = _ok_cell(train, intent="train", rows=9, title="shaped", position=1, active=False)
-    benchmark = FinetuningJob.objects.create(
-        project=context.project, dataset=train, status=FinetuningJob.Status.SUCCEEDED
-    )
-    DeployedModel.objects.create(
-        project=context.project,
-        finetuning_job=benchmark,
-        model_id="ft-selected-benchmark",
-        status=DeployedModel.Status.READY,
+    called = {}
+
+    def fake_launch(**kwargs):
+        called.update(kwargs)
+        return FinetuningJob.objects.create(
+            project=context.project,
+            dataset=train,
+            capability=capability,
+            cell=kwargs["cell"],
+            base_model=kwargs["base_model"],
+            name="job",
+            status=FinetuningJob.Status.QUEUED,
+        )
+
+    monkeypatch.setattr(tools_finetuning, "launch_finetune", fake_launch)
+    monkeypatch.setattr(
+        tools_finetuning,
+        "validate_dataset",
+        lambda *_args, **_kwargs: ValidationResult(True, "conversational", 1),
     )
     monkeypatch.setattr(
-        "overbae.tasks.finetuning.run_finetuning.apply_async",
-        lambda **_kwargs: SimpleNamespace(id="celery-ft"),
+        tools_finetuning,
+        "stamp_hyperparameters_for_model",
+        lambda *_args: {"training_type": {"type": "Lora"}},
     )
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _user: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_args: None)
     result = _call(
         "start_finetune",
         {
             "dataset": str(train.id),
             "capability": str(capability.id),
             "base_model": "Qwen/Qwen2.5-7B-Instruct",
-            "version": str(extra.id),
-            "eval_dataset": str(_evaluation.id),
-            "eval_set": str(_eval_set.id),
+            "cell": str(extra.id),
             "baseline_model": "ft-selected-benchmark",
         },
         context,
     )
     assert result.isError is False, result.structuredContent
-    job = FinetuningJob.objects.exclude(pk=benchmark.pk).get(project=context.project)
-    assert job.cell_id == extra.id
-    assert job.baseline_model == "ft-selected-benchmark"
+    assert called["cell"].id == extra.id
+    assert called["baseline_model"] == "ft-selected-benchmark"
     extra.refresh_from_db()
-    assert extra.used_at is not None
-    assert result.structuredContent["versions"]["train"]["id"] == str(extra.id)
+    assert extra.used_at is None  # The mocked launch skips the atomic creation/freeze service.
+    assert result.structuredContent["cell"]["id"] == str(extra.id)
 
 
 def test_activation_receipt_can_be_polled_and_is_project_scoped():
-    context = mcp_context(
-        inference_base_url="http://testserver/api/v1", permission=["read", "write"]
-    )
+    context = _context(permission=["read", "write"])
     capability, _, _, _ = training_setup(context)
     deployment = DeployedModel.objects.create(
         project=context.project, model_id="ft-receipt", status="ready"
@@ -860,7 +912,348 @@ def test_activation_receipt_can_be_polled_and_is_project_scoped():
     result = _call("get_job", {"kind": "model_activation", "id": receipt["id"]}, context)
     assert not result.isError, result.structuredContent
     assert result.structuredContent["status"] == "checking"
-    other = mcp_context(inference_base_url="http://testserver/api/v1", permission=["read", "write"])
+    other = _context(permission=["read", "write"])
     result = _call("get_job", {"kind": "model_activation", "id": receipt["id"]}, other)
     assert result.isError
     assert result.structuredContent["error"]["code"] == "resource_not_found"
+
+
+def test_native_readiness_uses_explicit_full_cell_and_external_validation_without_product_evals(
+    settings,
+):
+    settings.FINETUNING_BACKEND = "modal"
+    context = _context()
+    _, _, unrelated_eval, _ = training_setup(context)
+
+    def decision(i):
+        return {
+            "decision": {
+                "state": str(i),
+                "question": "Choose",
+                "kind": "choice",
+                "options": ["A", "B"],
+                "target_probabilities": [0.2, 0.8],
+            }
+        }
+
+    train = frozen_dataset(context.project, [decision(i) for i in range(12)], contract="train")
+    validation = frozen_dataset(
+        context.project, [decision(i + 100) for i in range(3)], contract="train"
+    )
+    result = _call(
+        "check_finetune_readiness",
+        {
+            "dataset": str(train.id),
+            "cell": str(train.active_cell.id),
+            "validation_dataset": str(validation.id),
+            "validation_cell": str(validation.active_cell.id),
+            "validation_enabled": True,
+            "eval_model_before": False,
+            "eval_model_after": False,
+        },
+        context,
+    )
+    assert not result.isError, result.structuredContent
+    body = result.structuredContent
+    assert body["eval_dataset"] is None
+    assert body["dataset"]["validation"]["stats"]["train_examples"] == 12
+    assert body["dataset"]["validation"]["stats"]["val_examples"] == 3
+    assert body["training_contract"]["inference_contract"] == "decision"
+    assert body["task_type"] == "unknown"
+    assert body["task_type_source"] == "unknown"
+    assert body["recommendations"] == []
+    assert "Qwen/Qwen3-0.6B" in {model for tier in body["catalog"].values() for model in tier}
+    assert "google/gemma-4-31B-it" not in {
+        model for tier in body["catalog"].values() for model in tier
+    }
+    assert body["selection"]["validation_cell"] == str(validation.active_cell.id)
+    assert str(unrelated_eval.id) not in json.dumps(body["selection"])
+
+
+def test_repeated_launch_key_returns_one_job_and_rejects_changed_recipe(monkeypatch):
+    context = _context(permission=["read", "write"])
+    _, train, _, _ = training_setup(context)
+    dispatch = Mock(return_value=SimpleNamespace(id="one-dispatch"))
+    monkeypatch.setattr("overbae.tasks.finetuning.run_finetuning.apply_async", dispatch)
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_: None)
+    arguments = {
+        "dataset": str(train.id),
+        "cell": str(train.active_cell.id),
+        "base_model": "Qwen/Qwen2.5-7B-Instruct",
+        "request_key": "one-experiment",
+        "hyperparameters": {"training_type": {"type": "Lora"}, "seed": 17},
+        "eval_model_before": False,
+        "eval_model_after": False,
+    }
+    first = _call("start_finetune", arguments, context)
+    second = _call("start_finetune", arguments, context)
+    assert not first.isError and not second.isError, (
+        first.structuredContent,
+        second.structuredContent,
+    )
+    assert first.structuredContent["job"]["id"] == second.structuredContent["job"]["id"]
+    assert dispatch.call_count == 1
+    assert FinetuningJob.objects.filter(project=context.project).count() == 1
+    changed = _call("start_finetune", {**arguments, "hyperparameters": {"seed": 18}}, context)
+    assert changed.isError
+    assert dispatch.call_count == 1
+
+
+def test_unsupported_gradient_accumulation_is_rejected_before_dispatch(settings, monkeypatch):
+    settings.FINETUNING_BACKEND = "modal"
+    context = _context(permission=["read", "write"])
+    _, train, _, _ = training_setup(context)
+    dispatch = Mock(return_value=SimpleNamespace(id="not-permitted-dispatch"))
+    monkeypatch.setattr("overbae.tasks.finetuning.run_finetuning.apply_async", dispatch)
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_: None)
+    result = _call(
+        "start_finetune",
+        {
+            "dataset": str(train.id),
+            "base_model": "Qwen/Qwen3-0.6B",
+            "request_key": "unsupported-accumulation",
+            "hyperparameters": {"batch_size": 2, "gradient_accumulation_steps": 8},
+            "eval_model_before": False,
+            "eval_model_after": False,
+        },
+        context,
+    )
+    assert result.isError, result.structuredContent
+    assert "batch_size" in json.dumps(result.structuredContent)
+    assert not FinetuningJob.objects.filter(project=context.project).exists()
+    dispatch.assert_not_called()
+    estimate = _call(
+        "estimate_finetune",
+        {
+            "dataset": str(train.id),
+            "base_model": "Qwen/Qwen3-0.6B",
+            "hyperparameters": {"batch_size": 2, "gradient_accumulation_steps": 8},
+            "eval_model_before": False,
+            "eval_model_after": False,
+        },
+        context,
+    )
+    assert estimate.isError
+    assert "batch_size" in estimate.structuredContent["error"]["message"]
+
+
+def test_native_evaluation_is_shared_by_mcp_rest_and_scoped_resources(settings):
+    from overbae.services.native_evaluation import schedule
+
+    settings.STRIPE_SECRET_KEY = ""
+    context = _context(permission=["read", "write", "train"])
+    train = frozen_dataset(context.project, TRAIN_ROWS, contract="train")
+    job = FinetuningJob.objects.create(
+        project=context.project,
+        dataset=train,
+        cell=train.active_cell,
+        base_model="fixture",
+        hyperparameters={"objective": "decision_cross_entropy"},
+    )
+    cells = []
+    for role in ("calibration", "final"):
+        dataset = frozen_dataset(
+            context.project,
+            [
+                {
+                    "input": {
+                        "decision": {
+                            "kind": "choice",
+                            "state": role,
+                            "question": "Choose",
+                            "options": ["a", "b"],
+                        }
+                    },
+                    "expected_output": {"probabilities": [1, 0]},
+                }
+            ],
+            contract="eval",
+        )
+        cells.append(dataset.active_cell)
+    arguments = {
+        "job": str(job.id),
+        "calibration_cell": str(cells[0].id),
+        "final_cell": str(cells[1].id),
+    }
+    first = _call("schedule_native_evaluation", arguments, context)
+    assert not first.isError, first.structuredContent
+    plan = schedule(job, calibration_cell=cells[0], final_cell=cells[1])
+    assert first.structuredContent["plan"]["id"] == str(plan.id)
+    receipt = _call("get_job", {"kind": "native_evaluation", "id": str(plan.id)}, context)
+    assert not receipt.isError, receipt.structuredContent
+    other = _context(permission=["read", "write", "train"])
+    assert _call("get_job", {"kind": "native_evaluation", "id": str(plan.id)}, other).isError
+    assert _call("schedule_native_evaluation", arguments, other).isError
+
+
+@pytest.mark.parametrize("baseline", [None, True, False])
+def test_native_baseline_choice_is_pinned_without_disabling_validation(
+    baseline, settings, monkeypatch
+):
+    settings.FINETUNING_BACKEND = "modal"
+    context = _context(permission=["read", "write"])
+    source = [
+        {
+            "decision": {
+                "state": str(i),
+                "question": "Choose",
+                "kind": "choice",
+                "options": ["A", "B"],
+                "target_probabilities": [0.2, 0.8],
+            }
+        }
+        for i in range(12)
+    ]
+    train = frozen_dataset(context.project, source, contract="train")
+    dispatch = Mock(return_value=SimpleNamespace(id="baseline-choice"))
+    monkeypatch.setattr("overbae.tasks.finetuning.run_finetuning.apply_async", dispatch)
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_: None)
+    recipe = {"training_type": {"type": "Lora"}}
+    if baseline is not None:
+        recipe["pre_training_baseline"] = baseline
+    arguments = {
+        "dataset": str(train.id),
+        "base_model": "Qwen/Qwen3.5-4B",
+        "request_key": "baseline-choice",
+        "hyperparameters": recipe,
+    }
+    quote = _call(
+        "estimate_finetune", {k: v for k, v in arguments.items() if k != "request_key"}, context
+    )
+    assert not quote.isError, quote.structuredContent
+    assert quote.structuredContent["training_contract"]["pre_training_baseline"] is (
+        baseline is not False
+    )
+    first = _call("start_finetune", arguments, context)
+    assert not first.isError, first.structuredContent
+    job = FinetuningJob.objects.get(pk=first.structuredContent["job"]["id"])
+    enabled = baseline is not False
+    assert job.validation_enabled is True
+    assert job.hyperparameters["pre_training_baseline"] is enabled
+    assert (
+        job.requested_configuration["configuration"]["hyperparameters"]["pre_training_baseline"]
+        is enabled
+    )
+    repeated = _call("start_finetune", arguments, context)
+    assert not repeated.isError, repeated.structuredContent
+    changed = _call(
+        "start_finetune",
+        {**arguments, "hyperparameters": {**recipe, "pre_training_baseline": not enabled}},
+        context,
+    )
+    assert changed.isError
+    assert dispatch.call_count == 1
+
+    async def read():
+        with bind_context(context):
+            return list(await read_resource(f"overmind://finetunes/{job.pk}"))
+
+    resource = json.loads(asyncio.run(read())[0].content)
+    assert resource["record"]["contract"]["pre_training_baseline"] is enabled
+
+
+def test_native_estimate_reuses_completed_launch_with_implicit_packing(settings, monkeypatch):
+    settings.FINETUNING_BACKEND = "modal"
+    context = _context(permission=["read", "write"])
+    source = [
+        {
+            "decision": {
+                "state": str(i),
+                "question": "Choose",
+                "kind": "choice",
+                "options": ["A", "B"],
+                "target_probabilities": [0.2, 0.8],
+            }
+        }
+        for i in range(20)
+    ]
+    train = frozen_dataset(context.project, source, contract="train")
+    monkeypatch.setattr(
+        "overbae.tasks.finetuning.run_finetuning.apply_async",
+        Mock(return_value=SimpleNamespace(id="forecast")),
+    )
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_: None)
+    monkeypatch.setattr("overbae.services.training_forecast.hardware", lambda *_: ("H100", 1))
+    arguments = {
+        "dataset": str(train.id),
+        "base_model": "Qwen/Qwen3.5-0.8B",
+        "validation_enabled": False,
+        "hyperparameters": {
+            "n_epochs": 2,
+            "max_steps": 10,
+            "batch_size": 16,
+            "context_length": 4096,
+            "training_type": {"type": "Lora"},
+        },
+    }
+    launch = _call("start_finetune", {**arguments, "request_key": "measured-recipe"}, context)
+    assert not launch.isError, launch.structuredContent
+    job = FinetuningJob.objects.get(pk=launch.structuredContent["job"]["id"])
+    assert job.hyperparameters["packing"] is False
+    job.status = "succeeded"
+    job.provider = "modal"
+    job.effective_configuration = {"gpu_type": "H100", "gpu_count": 1}
+    job.progress = {
+        "trained_steps": 10,
+        "total_steps": 10,
+        "compute_usage": [
+            {
+                "usage_id": "measured-worker",
+                "gpu_type": "H100",
+                "gpu_count": 1,
+                "elapsed_seconds": 200,
+            }
+        ],
+    }
+    job.save()
+    quote = _call("estimate_finetune", arguments, context)
+    assert not quote.isError, quote.structuredContent
+    forecast = quote.structuredContent["forecast"]
+    assert forecast["evidence_jobs"] == [str(job.pk)], forecast["rejected_measurements"]
+    assert forecast["evidence"][0]["scaled_seconds"] == pytest.approx(200)
+    changed = _call(
+        "estimate_finetune",
+        {**arguments, "hyperparameters": {**arguments["hyperparameters"], "max_steps": 5}},
+        context,
+    )
+    assert not changed.isError, changed.structuredContent
+    assert changed.structuredContent["forecast"]["evidence_jobs"] == []
+
+
+@pytest.mark.parametrize("baseline", ["false", 0, None, {}, []])
+def test_native_baseline_rejects_non_boolean_choices(baseline, settings, monkeypatch):
+    settings.FINETUNING_BACKEND = "modal"
+    context = _context(permission=["read", "write"])
+    train = frozen_dataset(
+        context.project,
+        [
+            {
+                "decision": {
+                    "state": "state",
+                    "question": "Choose",
+                    "kind": "choice",
+                    "options": ["A", "B"],
+                    "target_probabilities": [1, 0],
+                }
+            }
+        ],
+        contract="train",
+    )
+    monkeypatch.setattr("overbae.api.credit_gate.require_credits", lambda _: None)
+    monkeypatch.setattr("overbae.services.plan_limits.require_plan_quota", lambda *_: None)
+    result = _call(
+        "start_finetune",
+        {
+            "dataset": str(train.id),
+            "base_model": "Qwen/Qwen3.5-4B",
+            "hyperparameters": {"pre_training_baseline": baseline},
+        },
+        context,
+    )
+    assert result.isError
+    assert "pre_training_baseline" in json.dumps(result.structuredContent)
+    assert not FinetuningJob.objects.filter(project=context.project).exists()

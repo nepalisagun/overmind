@@ -180,9 +180,8 @@ components:
 
 ## Overview
 
-The console is a quiet workshop, and it is dark-only. The canvas is a warm
-near-black with a brown undertone, never `#000`. The ink is a warm near-white,
-never pure white. Nothing is lifted,
+The console is a quiet, dark-only workshop. The canvas is warm near-black;
+the ink is warm near-white. Nothing is lifted,
 nothing glows, nothing bounces. An engineer comes here to read production
 facts about their agent and leave with a decision, so the interface holds
 still and the data is the most prominent thing on screen.
@@ -193,93 +192,74 @@ cell, chip, metric, paragraph and button is set in Geist Pixel. The result is
 a CRT-era workshop typeset with care: warm where developer tools are usually
 cold, and pixel-sharp where SaaS consoles are usually soft.
 
-The constraints are the design. Shadows do not exist as an option: every
-`--shadow-*` token resolves to `none`, so depth comes from tonal layering and
-hairline borders alone. Corners top out at 3px. Colour is rationed: the copper
+The constraints are the design. Standard shadow tokens resolve to `none`;
+depth comes from tonal layering and hairline borders. Confirmation dialogs
+alone use a subtle drop shadow. Corners top out at 3px. Colour is rationed: the copper
 brand mark is the only saturated element in the product, and orange anywhere
 else means warning. `check:design`, `check:contrast` and `check:controls` fail
 the build on a violation.
 
 In short:
 
-- Warm neutral throughout: warm near-black canvas, warm near-white ink, hairline borders.
-- Flat: zero shadows, tonal layering and hairlines only.
-- Pixel geometry: a 1px / 2px / 3px radius ramp and nothing above it.
-- Mondwest for titles, Geist Pixel for everything else, NeueBit for navigation.
+- Warm neutral throughout: near-black canvas, near-white ink, muted warm borders.
+- Flat surfaces, with a subtle drop shadow reserved for confirmation dialogs.
+- Pixel geometry: a 1px / 2px / 3px radius ramp, including the Workshop bezel and composers.
+- Mondwest for main page titles, Geist Pixel for other content, NeueBit for navigation.
 - Sentence case everywhere; uppercase and wide tracking are banned.
 - The copper eye carries the brand, so nothing else has to.
-- Dark is the only theme: no theme switch, no OS colour-scheme following, dark from first paint.
+- Dark is the only theme, from first paint through every product surface.
 - The guardrails are scripts, not conventions.
 
 ## Colours
 
-One warm-neutral dark palette, with saturation reserved almost entirely for
-state. The tokens live in `:root` in `styles.css`; there is no `.dark` class, no
-stored theme and no `dark:` variant, and `index.html` declares
-`color-scheme: dark` so the first paint is dark.
+A single warm-neutral dark palette, with saturation reserved almost entirely
+for state. Stored theme choices and operating-system appearance do not change it.
 
 ### Primary
 
-- **Workshop Ink** (`#f6f3ef`): The warm near-white that carries all primary
-  text, the primary button fill, and the focus ring. Its warm undertone is why
-  the interface reads warm rather than clinical. Text on a primary fill is the
-  warm near-black `#181614`. The system is monochrome, and the accent is
-  whichever end of the ink range contrasts.
+- **Workshop Ink** (`#f6f3ef`): Primary text, primary button fill and focus ring.
+  The primary foreground is the warm near-black `#181614`.
 
 ### Secondary
 
-- **Control Face** (`#262320`): The neutral control fill, one step above the
-  muted surface so a button is visible on both the card and the canvas. This
-  is the default resting state for a labelled button, because an outline on
-  every control reads cheap at this density. Hover steps to `#2f2c29`.
+- **Control Face** (`#262320`): The neutral control fill, distinct from both
+  card and canvas. Hover steps to `#2f2c29`.
 
 ### Tertiary
 
-- **Instrument Panel** (`#151311` on `#0e0c09`): A parallel surface scale used
-  only by the Data Workshop console, which renders as an analog instrument:
-  opaque layered panels, an unlit-gauge tone (`#2f2c29`), a recessed inset, and
-  its own state hues for healthy / caution / blocked / analysing / stale.
+- **Instrument Panel** (`#151311` on `#0e0c09`): The Workshop uses the same
+  opaque layered surfaces and semantic state colours as the rest of the Console.
 
 ### Neutral
 
-- **Warm Canvas** (`#0e0c09`): The page background. A deep black with a warm
-  undertone rather than a flat `#000`.
-- **Wall** (`#080604`): The sidebar, one step below the canvas. It is the wall
-  the app card sits against, not part of the canvas.
-- **Card** (`#151311`): Elevated surfaces, one step above the canvas. A C=0
-  neutral inside a warm ramp makes the ramp read as a stain. `--popover`
-  (`#1e1c1a`) sits one step above the card so a menu reads as lifted.
-- **Warm Umber** (`#191715` muted / `#1a1816` secondary): Quiet fills. Two
-  distinct values, so each rung of the ladder does something.
-- **Hover Wash** (`#201e1b`): The `--accent` tint. It sits far enough from the
-  canvas to show on the sidebar and stays out of the warning hue band that the
-  Copper Eye rule reserves.
+- **Warm Canvas** (`#0e0c09`): Near-black with a warm undertone.
+- **Wall** (`#080604`): Sidebar, one step below the canvas.
+- **Card** (`#151311`): Raised surface; popovers step to `#1e1c1a`.
+- **Muted / Secondary** (`#191715` / `#1a1816`): Distinct neutral fills.
+- **Hover Wash** (`#201e1b`): Neutral hover feedback, not a warning hue.
 - **Quiet Ink** (`#a9a39c`): Secondary text and default icon colour.
-- **Hairline Border** (`#3a3633`): Every border and divider, at one of three
-  levels. See the three border levels rule under Layout.
+- **Border** (`#3a3633`): Outlines and dividers at the three sanctioned levels.
 
 ### The elevation wash
 
 Two steps and only two: `bg-wash-subtle` and `bg-wash-raised`.
 
-|                 | value     | ΔL\* from card |
+| Token           | Colour    | ΔL\* from card |
 | --------------- | --------- | -------------- |
 | `--wash-subtle` | `#1b1917` | +2.9           |
 | `--wash-raised` | `#211f1c` | +5.9           |
 
-Both lift off the card; the raised step reads as closer.
-
 ### Status
 
 One status vocabulary, shared by every badge, alert, chip and instrument
-readout, tuned for AA text on the dark surfaces:
+readout, using semantic tokens without `dark:` variants:
 
 - **Field Green** (`#3ac28a`): success
 - **Burnt Amber** (`#e6a647`): warning
 - **Steel Blue** (`#6fa8dc`): info
-- **Brick Red** (`#f65d57`): destructive and error. Muted, never pure red. It
-  sits at the same L\* band as its three siblings (67 to 73), so error does not
-  read hotter than the other states.
+- **Brick Red** (`#f65d57`): destructive and error.
+  Muted, never pure red. The value sits at the same L\* band as its three
+  siblings (67 to 73), so error does not read hotter than the other states.
 
 ### Categorical
 
@@ -307,20 +287,19 @@ There is one copy of every colour decision.
 `<Badge>` are visually identical by construction. The `-foreground` pairs exist
 only for the rare solid fill.
 
-**The One Hue Axis rule.** Every neutral sits on h≈75° in CIELCh, at a chroma
-held under a ceiling of 6 so it cannot run away as the value changes. Chroma
-may rise up the ramp (1.0 at the sidebar to 2.7 at the border), but the ceiling
-is the enforced part. A C=0 card against a C=10 brown makes the brown read as a
-stain and the card read clinical, and a canvas on a cool hue contradicts the
-warm undertone. `check:contrast` asserts the chroma ceiling and the hue band.
+**The One Hue Axis rule.** Every neutral sits on h≈75° in
+CIELCh, at a chroma held under a ceiling of 6 so it cannot run away as the value
+darkens. Chroma may rise down the ramp, but the ceiling is the enforced part. A white card against a C=10
+tan makes the tan read as a stain and the white read clinical, and a canvas on
+a cool hue contradicts the warm undertone. `check:contrast` asserts the chroma
+ceiling and the hue band.
 
 **The Tier Is Measured In L\* rule.** Two adjacent surfaces are separated by
 perceived lightness, floor ΔL\* 1.2, never by contrast ratio. Ratio compresses
-at both ends of the curve: `--card` against `--background` is 1.06:1, a
-number that says nothing about whether the eye reads one surface or two. A
-contrast table can run green for a palette whose tiers are byte-identical. The
-sidebar is the one tier allowed to separate either by tone or by a visible
-`--sidebar-border`; the palette carries both. Neither is banned,
+at the dark end of the curve: `--card` against `--background` is 1.06:1, a number that says nothing about whether the eye reads one
+surface or two. A contrast table can run green for a palette whose tiers are
+byte-identical. The sidebar is the one tier allowed to separate either by tone
+or by a visible `--sidebar-border`; the palette carries both. Neither is banned,
 because then the shell has no left edge at any level.
 
 **The Wash Ladder rule.** Elevation is `bg-wash-subtle` / `bg-wash-raised` and
@@ -329,8 +308,8 @@ nothing else. `bg-muted/N` is banned by `check:design`: alpha steps of 0.25 to
 nothing. Two steps is the whole ladder.
 
 **The Contrast Is Checked rule.** Colour decisions are easy one at a time and
-impossible to hold in your head as a set. `bun run check:contrast` parses the
-`:root` token blocks out of `styles.css` and asserts WCAG 2.1 AA on every pairing the UI
+impossible to hold in your head as a set. `bun run check:contrast` parses the dark-only
+root tokens out of `styles.css` and asserts WCAG 2.1 AA on every pairing the UI
 renders: 4.5:1 body text, 3.0:1 large text and non-text UI. Adding a token means
 running it.
 
@@ -341,7 +320,7 @@ Body and prose font: Geist Pixel Square (fallback `system-ui, -apple-system, san
 Navigation accent: NeueBit (fallback `system-ui, sans-serif`).
 
 Three self-hosted faces with three non-overlapping jobs. Mondwest appears only
-on titles and gives page headers a presence a SaaS console does not usually
+on the main page title and gives page headers a presence a SaaS console does not usually
 have. Geist Pixel is the platform default: set on `body`, so a label, table
 cell, chip, button, metric or paragraph needs no class at all. NeueBit is the
 navigation accent, scoped to two surfaces, the sidebar nav rows and the
@@ -367,16 +346,16 @@ it; prose resets to `normal`.
 
 ### Hierarchy
 
-Titles pick exactly one of four steps. Size and face are the only hierarchy
-levers; every step shares the same weight.
+Headings pick one of four steps. Only the main page header uses Mondwest;
+card, dialog, sheet, section and empty-state headings use Geist Pixel.
 
-- **Display / `title-hero`** (700, 36px, 40px line): Hero and empty-state
+- **Display / `title-hero`** (Geist Pixel, 400, 36px, 40px line): Hero and empty-state
   headlines. At most one per screen.
-- **Headline / `page-title`** (700, ~29px, 32.4px line): The single page header.
+- **Headline / `page-title`** (Mondwest, 700, ~29px, 32.4px line): The single page header.
   Use the `PageHeader` component; never hand-roll it.
-- **Title / `title-section`** (700, 20px, 28px line): A section heading within a
+- **Title / `title-section`** (Geist Pixel, 400, 20px, 28px line): A section heading within a
   page.
-- **Title-card / `title-card`** (700, 18px, 24px line): Card, dialog, sheet and
+- **Title-card / `title-card`** (Geist Pixel, 400, 18px, 24px line): Card, dialog, sheet and
   alert titles.
 - **Body** (400, 14px): The dominant UI size. The tokenized ramp is Tailwind's
   unmodified default: xs 12, sm 14, base 16, lg 18, xl 20, 2xl 24, 4xl 36.
@@ -392,8 +371,8 @@ levers; every step shares the same weight.
 
 ### Named rules
 
-**The Three Faces rule.** Mondwest for titles, NeueBit for navigation, Geist
-Pixel for everything else. "Everything else" is the default and needs no class. A
+**The Three Faces rule.** Mondwest only for main page titles, NeueBit for navigation,
+Geist Pixel for all other content, including popup, card and section titles. "Everything else" is the default and needs no class. A
 call site never names a font family; it imports a role from `lib/typography.ts`
 (`TITLE.page`, `PROSE`, `LABEL.chip`) so the set of surfaces using each face
 stays greppable. Inline `fontFamily` is banned outright, with no allowlist.
@@ -403,10 +382,9 @@ stays greppable. Inline `fontFamily` is banned outright, with no allowlist.
 `app-sidebar.tsx`, `routes/_auth.tsx` and the two registries. A face keeps its
 meaning by being the only thing that has that job.
 
-**The Size Is Hierarchy rule.** All four title steps share one weight, because
-Mondwest ships a Regular master only and a weight utility renders synthesized
-bold. Pairing a `text-*` size with a title class is banned too; that is how four
-steps collapse back into a dozen ad-hoc sizes.
+**The Size Is Hierarchy rule.** Each heading role owns its size and weight.
+Use the role without per-call-site overrides. Mondwest stays exclusive to
+`TITLE.page`; all other heading roles use the regular Geist Pixel master.
 
 **The Sentence Case rule.** Every label, chip, badge, tab and column header is
 sentence case with acronyms preserved, via `sentenceCase` / `humanizeKey` in
@@ -455,6 +433,19 @@ Detail surfaces built from stacked, header-stripped cards use one padding scale.
 Pick a row in this table before inventing a value. The failure mode is a page
 where every card pads differently and the internal dividers do not line up.
 
+Horizontal section dividers and table row rules span the full inside width of
+their containing card, panel or dialog. Put horizontal padding on the content
+inside each section, not outside the divider. Within an already padded body,
+cancel that inset with matching negative margins and restore it on the section's
+content. Nested bordered surfaces use their own edges; chart axes and separators
+within prose remain local to that content.
+
+Data-column headers sort on click and expose their direction with the shared
+chevron and `aria-sort`. Header buttons support keyboard activation. Sort raw
+numbers and timestamps, never their formatted labels; keep missing measurements
+last. Paginated lists sort the full matching set before paging. Preserve section
+headers, summary rows and conversation membership. Action-only columns do not sort.
+
 | Slot                                     | Padding                                                |
 | ---------------------------------------- | ------------------------------------------------------ |
 | Header strip (single-line label)         | `px-4 py-2.5`, `border-b border-border/60`, muted fill |
@@ -498,12 +489,21 @@ a fourth.
 
 ## Elevation and depth
 
-There are no shadows. Every `--shadow-*` token resolves to `none`, so
-`shadow-lg` is dead code, and `check:design` flags it as such.
-Nothing in this product is lifted off the page.
+Standard shadow tokens resolve to `none`, so `shadow-lg`
+is dead code, and `check:design` flags it as such. Confirmation dialogs are
+the user-requested exception: `shadow-confirmation` uses the palette-matched
+`--elevation-confirmation` token, with a faint contact shadow and a soft,
+downward cast. No other surface uses it.
 
-Depth is carried three ways instead. Tonal layering: background `#0e0c09`
-steps to card `#151311` to popover `#1e1c1a`. Hairline borders: a 1px rule does the
+Confirmations follow the shared small-dialog frame: background surface, a 26rem
+natural width within the 75vw/75vh ceiling, 20px horizontal insets, a 16px header
+inset and a 12px footer inset. Header and footer rules span the frame. Titles
+and descriptions use the shared typography and compact spacing. Actions use
+standard button variants, including the filled destructive button and its
+palette-matched foreground; they wrap only when needed. Cancel keeps initial focus.
+
+Depth is carried three ways instead. Tonal layering steps from
+background `#0e0c09` to card `#151311` to popover `#1e1c1a`. Hairline borders: a 1px sand rule does the
 work an elevation shadow would. Inset edges: the workshop console draws its
 panel border with `box-shadow: inset 0 0 0 1px` rather than `border`, so the
 edge sits inside the layout box and never shifts child positions.
@@ -512,7 +512,8 @@ edge sits inside the layout box and never shifts child positions.
 
 **The Flat Room rule.** Selection, elevation and emphasis read through border,
 ring and background tone. If a surface needs to read as closer, change its tone
-or its edge. Never add a shadow, a scale transform or a lift.
+or its edge. Only confirmation dialogs use the named shadow token; never add
+a scale transform or hover lift.
 
 ## Shapes
 
@@ -553,13 +554,13 @@ the token can't reach it.
 
 - **Shape:** Barely nicked corners (2px), 150ms colour-only transition.
 - **Height ramp:** One shared control ramp: `xs` 24px, `sm` 28px, default 32px,
-  `lg` 36px. `xs` is the version card's scale: every bar in a card is 32px.
+  `lg` 36px. `xs` is the notebook cell's scale: every bar in a cell is 32px.
   A row of controls stays aligned by giving them all the same `size`, never by
   patching `h-*` onto one.
 - **Primary:** Ink fill, canvas text (`bg-primary text-primary-foreground`),
   hover to 85% ink.
-- **Secondary:** The neutral control face: a soft `#262320` fill and no
-  border, hovering to `#2f2c29`. An outline on every control reads cheap at this
+- **Secondary:** The neutral control face: a soft `#efe4d7` fill and no
+  border, hovering to `#e5d7c7`. An outline on every control reads cheap at this
   density, and the fill still makes the button obvious at rest.
 - **Outline:** A true hairline, reserved for controls that must read against an
   already-filled surface.
@@ -585,7 +586,7 @@ the token can't reach it.
 - **Shadow:** None. See Elevation and depth.
 - **Padding:** `p-7` header, `px-7 pb-7 pt-0` content. Internal separation uses
   `divide-y divide-border/40` rather than padded blocks.
-- **Title:** Always `TITLE.card` (18px Mondwest).
+- **Title:** Always `TITLE.card` (18px Geist Pixel).
 
 ### Badges / chips
 
@@ -625,7 +626,7 @@ Three sizes, by context:
 
 The brand eye renders in `currentColor` so it takes the sidebar foreground.
 Page-title icons are local two-tone wrappers (ink plus white) in
-`ui/icons/page-title.tsx`; call sites render them with `invert`. The pixel monitor marking the Agents section renders with
+`ui/icons/page-title.tsx`. The pixel monitor marking the Agents section renders with
 `[image-rendering:pixelated]`.
 
 ### Scrollbars
@@ -633,94 +634,266 @@ Page-title icons are local two-tone wrappers (ink plus white) in
 An overlay scrollbar: fully transparent at rest, painted only while the element
 is scrolling (`data-scrolling`, stamped by `lib/autohide-scrollbars`) or while
 the pointer is on the bar. The thumb derives from `--foreground` via `color-mix`
-so it follows the palette, inset by a 3px transparent border so it reads as a
+so it shares the surface palette, inset by a 3px transparent border so it reads as a
 slim pill. The gutter is always reserved, so appearing and disappearing never
 reflows content.
 
-### Data Workshop canvas
+### Data Workshop notebook
 
-The dataset page fills its frame with a canvas of version cards on the card
-surface with a dot grid; no page header, the breadcrumb names the dataset. A
-40px bar above the canvas is one line of `xs` muted text on the left: the
-import line ("Importing…", "Extracting text…") once a source exists, the split
-summary (**Split · 45 training, 15 evaluation rows**, an info hover card, and a
-link to the other set), or **No versions yet · Connect a coding agent to add
-them**; items sit apart behind a hairline divider, and on a phone only the first
-shows. On the right: the workshop status and the controls (Rename dataset, the
-dataset-list switcher and the minimap toggle, ghost icon buttons). With no
-version yet, the canvas centres the state instead: a spinner and
-"Importing…", or **The import failed** with the error, **Retry import** when
-the import can resume, and **New dataset**. Rename dataset opens a
-popover with Name and **Save**; intent and capability change only through the
-contract chip's shortcuts. Each version is a node under its parent,
-laid out top-down by ELK on a 20px grid, joined by square-cornered
-`muted-foreground` edges with no labels. A card can be dragged by its chip and
-keeps its place; **Reset layout** in the canvas controls clears the places.
-The wheel pans; pinch zooms. Scrolling inside a script or a table scrolls it,
-not the canvas. Until the person pans, zooms or clicks, every new layout
-re-frames the focused card (cards grow as their rows load); after that, a card
-that changes size keeps its place on screen and the layout moves around it. A
-card is never wider than the canvas minus 12px each side.
+Self-hosted login uses the email/password card. There are no ChatGPT connection,
+funding or model-selection controls in login, Settings or Data Workshop.
 
-Each card is a rounded frame with a chip on its top border: the version
-(`v3`), the title (**Source** for `v0`) and Export behind a hairline, then
-**Used** with a lock once a run used it (its tooltip names who reads it). The active card draws its frame and
-chip at 1.5px in the `success` tone with a small green square before the
-version; a selected card draws a `primary/60` frame. Inside, the first bar holds the
-card's actions (below), so they never fall below the fold; then every bar is
-32px with `xs` controls and the same chevron header: **Script** (read-only,
-Python highlighting, run time in its meta) or, for rows the agent wrote,
-"Rows written by your coding agent", **Output** when the script printed, then
-the changes, then **Data** (`147 rows × 7 columns` in its meta; open by default
-only on the active card). The changes are one muted line,
-`120 → 96 rows · 24 removed · 3 added`, then in `warning` **Rows were
-renumbered, so they cannot be matched to the parent**, **Context removed from
-N inputs**, **Instructions changed in N rows**. The source card shows its
-files (name, size, rows) and the extraction limitations instead of a script.
+The Workshop landing page is a searchable, filterable dataset table with a page
+heading and project count. Dataset listings and their empty states have no New
+dataset action. Columns show name, intent,
+active version, row count, source, capability and last update. Intent uses a
+monochrome outlined chip, not a status tint. Selecting a row
+opens the existing cell-based notebook. There is no chat-style landing composer.
 
-The table shows new rows on `success/10` and changed values as a word-level
-diff against the parent version: removed on `destructive/15` struck through,
-added on `success/20`. A chat column reads as
-`role: text` turns in one line. The row number is a button that opens the row
-in place: the same cells wrap to their full text, a chat column becomes a
-conversation (role label, then the turn's text and tool calls, each turn
-diffed against the parent's), and a document row adds one **From** line
-(file · page). Internal `_overmind_*` columns are never shown.
+Dataset navigation and content share a continuous outer bezel (3px). The 248px
+column starts collapsed, including on landing. The notebook folder button reveals
+only the selected project's datasets, with search and paginated loading. There
+is no separate navigation header; mobile keeps a close control beside search.
+Desktop dataset rows are 28px with no vertical gaps; mobile
+rows are 36px and keep actions visible. Selected rows use the accent surface.
+Names truncate with full names and source/row facts in hover/focus details. The
+column uses the existing grid animation with reduced-motion support. Closed
+navigation is inert and stops polling. Mobile temporarily hides the mounted
+notebook while navigation is open; closing it returns to the same cells.
 
-The actions bar is one line under the chip. On the active card: an
-**Active** chip, then a contract chip (**Ready for training** / **Ready for
-evaluation**, else the first failure: **Not in the training format**, **Does
-not match Research Agent**, **Purpose not set**). Its hover card gives each
-check as Expects / Columns / Found / To fix in the person's terms, never a
-tool name, and, when one fails, shortcuts: use the purpose whose format holds,
-switch to a better-ranked capability, or remove the capability. The chip is a
-button, so focus opens the card. Then the consumers in the primary tint on the
-right: **Train a model**, or **Run the optimiser** and **Score a training
-job**. Every other card shows **Set active** as a plain outline on the right.
-New versions fade in where the layout places them; a re-measured card flashes
-`wash-raised` back to `card`.
+Dataset creation uses the medium 40rem dialog frame and training setup's compact
+field labels. Selected traces appear once beneath the title. The name leads,
+capability and purpose share a row, and a two-line Intent field is explicitly
+optional with an example placeholder. Split controls appear only for Train + eval;
+their row counts stay inline. On narrow screens, fields stack and only the body scrolls.
 
-The workshop status reads **Running N scripts** while runs are queued or
-running, else **Activity**. It opens a popover with the last 20 runs, newest
-first: kind (Preview, Query, Version, Rows), title or first script line, a
-status badge only while waiting or running or after a failure, run time, when,
-the parent version, the last error line (the exception) in `destructive` for a
-failure, and a button to the version a run created.
+The dataset page retains its existing cells at their original notebook width and
+scale 1. The grid-snapped canvas progresses downward; sibling branches share a
+horizontal layer beneath their parent. Square elbow connectors show recorded
+lineage without fixed end stubs that can double back in narrow layer gaps.
+Connector ports are centered on visible cell-frame border strokes, not the outer
+padded box. That outer spacing stays transparent so it cannot cover edge paths.
+Only connected inputs and outputs show a port.
+Condition labels use card fill, a 1px neutral outline and 2px corners.
+Cells open at full scale; zoom and Fit view are explicit camera controls, not
+changes to cell dimensions. Reset and linked-cell focus return to scale 1, while resize
+preserves the chosen zoom. The Agent trajectory's minimap treatment is available
+through the right-hand controls, hidden initially and remembered in this browser.
+The canvas shows the selected successful process and its recorded partition outputs. Corrections
+replace that process; there is no repair-history or restore view.
+Live cell arrivals receive a bounded opacity reveal after graph placement; changed
+content or state briefly washes the existing frame with a neutral surface token.
+Cells never move independently of their connectors. Initial load, unchanged
+refreshes, usage metadata and exact-cell inspection remain quiet. Reduced motion uses
+a shorter, gentler acknowledgement; background/offscreen updates do not replay.
+There is no platform chat or bottom chat composer. Dataset metadata changes use
+shared lifecycle endpoints. The rail on the right groups its controls in a compact,
+opaque card-colored box with a 1px neutral border and small corners. It holds
+a folder button that expands or collapses the existing workspace column and,
+when cells exist, the minimap toggle. There is no cell-search button or cell
+selector strip. The folder changes to its open state while expanded.
+Zoom, Fit view and Reset sit at the bottom right, with the minimap beside them
+when visible. Canvas and landing content reserve space along the right edge.
+The sidebar closes on workspace selection or leaving the route; toggling it
+preserves the notebook. It uses the existing grid animation,
+with no separate pane, dialog or scrim.
 
-The switcher opens the project's datasets in a 248px column at the card's
-left edge, under a **Datasets** header with a close button, with search, a
-status glyph only for a dataset that is working or failed and delete on hover; on a
-phone the column covers the page. Escape inside the column closes it and focus
-returns to the switcher. Deleting the open dataset returns to the dataset list.
+Each cell is a rounded frame with a chip on its top border. The chip is
+sticky: while a cell scrolls through the column its chip stays at the top and
+the next cell's chip pushes it away. The chip holds the version, read-only title,
+Export (CSV or JSONL), state and a lock when frozen. The active cell draws its
+frame and its chip at 1.5px in the `success` tone with a small green square
+before the version. Inside, every bar is 32px with `xs` controls: the two
+collapsible strips with the same chevron header, read-only **Script** when present and **Data**
+(`rows × columns` in its meta), the table's search and filter row, and its
+pagination. The frame reserves 12px above its content for the overlapping title
+chip, including cells with only Data and no Source or Script section. Data has
+a top divider only when another section precedes it. Expanded scripts and retained
+package source scroll within a 320px maximum height; the file controls stay above
+the code viewport. Short scripts use their natural height.
+Cells have no Execution details section; durable run facts remain
+available through the version selector and MCP. The table shows new rows on `success/10` and changed values as a
+word-level diff in place: removed on `destructive/15` struck through, added on
+`success/20`. A click opens the row in place: the same cells stop truncating
+and wrap to their full text (objects as indented JSON), and a second click
+closes it. No extra row, no sheet, no per-type rendering.
+
+The rows search field and Filter button form one connected control with matching
+24px heights, outer corners and a single shared border. Their shared baseline does
+not depend on inline-input line boxes; the existing filter glyph and behavior stay
+unchanged. Active filter and sort chips remain outside this group.
+The filter popover uses the same 24px controls, with muted labels, full-width
+row dividers, outlined fields and a neutral Add filter button.
+
+Source cells show a compact row of outlined source chips, not a collapsible text
+section. File chips show the filename, row count and original-file download;
+long filenames truncate with their full name available on hover. Other sources
+show their recorded type, including derived datasets. The brief, checksums and
+extraction commentary stay out of this cell summary; retained provenance remains
+available through MCP.
+
+The footer has a 32px minimum height and wraps at narrow widths. First an **Active** indicator (`success` chip
+with a tick). Then a contract chip that names the first failure (**Not a
+train table**, **Does not match Research Agent**, **Intent pending**, else
+**Fits**). Its hover card gives each contract as Needs / Columns / Found / Fix
+and allows direct intent/capability changes where the dataset is not frozen. There
+is no automatic repair action; transformations are authored by the native coding agent. Then the
+consumers in the primary tint on the right: a train table offers **Train a
+model**; an eval table offers **Run the optimiser** and **Use in a training
+job** (the eval dataset that scores the job); each opens the wizard on its
+page with the current published dataset selected, without changing its active cell.
+Other cells have no activation control or empty action footer. The Console cannot
+change the active dataset version. A failed cell prints its traceback under an
+**Error** label.
+
+The quality chip shows **Quality passed** or a warning-tinted **Review recommended**.
+Its hover card lists measured checks and remaining work. Quality and capability
+findings never disable consumer buttons. Review recommendations remain in the
+workshop, not training setup. Setup has no per-model preprocessing cards or
+preprocessing gate; model-specific preparation runs within the launched job.
+Overlap is advisory in setup.
+Unreadable data, invalid technical formats and incompatible model settings still
+block execution. There is no extra quality-approval step.
+
+Training setup lists **Training mode** (Decision or Generative) separately from
+**Task type**. The task uses its recorded classification and provenance; missing
+classification reads **Not classified** without a fabricated source label.
+Model cards show match scores, costs and duration estimates only when measured.
+They omit ungraded badges, benchmark-ranking notes and forecast-status prose.
+Setup omits development-monitoring controls and explanatory text; estimates and
+launch use the same backend-appropriate default monitoring policy.
+
+Decision training runs show **Prediction labels** alongside Dataset in the existing
+run metadata, using neutral chips without a separate section, icon or label count.
+Single-question labels retain their question as accessible/hover context; multiple
+questions keep their own captions. Option order and declared score axes are preserved.
+Labels come from the exact pinned training cell, including
+options with zero target probability; shared cells appear once across model variants.
+Long labels wrap, larger collections scroll, and bounded summaries show their label-set
+coverage. Unavailable labels remain explicitly unavailable, never inferred from predictions.
+
+Training validation appears as a **Validation loss** graph in the same metrics grid
+and card as loss, learning rate and gradient norm. It plots recorded fixed-sample
+checks by training step. Monitoring tables, timings, examples, checkpoints and
+policy details are not shown in this card; retained records remain available
+through REST and MCP. Missing measurements stay empty rather than becoming zero.
+
+Training metric cards retain their outer frame. The title strip and summary footer
+have full-width dividers; the plot spans the card's inner width without a second
+frame or inset axis gutter. The plot has no margins; endpoint labels overlay it.
+A faint dashed grid follows the numeric axis ticks rather than fixed fractions
+of the frame. Non-negative metrics start
+at zero, with the bottom zero label omitted; only the upper bound and first and
+last steps are labelled. Negative measurements retain their lower bound label.
+Constant and single-point series remain visible. The footer shows three statistics from unaggregated recorded
+measurements: latest, lowest and change from first for loss; latest, highest and
+percentage-point change for accuracy; latest, peak and initial for learning rate;
+latest, peak and average for gradient norm. Terminal runs say **Last recorded**.
+Comparisons show separate model summaries, never pooled statistics. A single
+measurement has no measured change.
+
+Evaluations use one **Runs** list for generated responses and probability comparisons.
+Search, filters and pagination span both formats; **New evaluation** selects the
+scoring format. Selection and single/bulk deletion cover both formats. Selection
+retains each row's format across pages; partial deletion clears successful rows
+and keeps failures selected. Decision deletion removes the list entry while
+retaining request identities and evidence referenced by training or prediction
+reuse. Active or unresolved work and unfinished experiment dependencies block
+deletion with an actionable error. Both formats include a run-details card with full-width dividers.
+Probability runs show participants, the baseline, exact dataset versions and row
+counts, optional calibration data, timestamps and status. Completion time comes
+from the recorded scoring observation; missing credit usage remains unmeasured.
+Evaluation details have no Optimise action. Probability metrics appear above the shared-style
+comparison table, with models as rows and measured metrics as columns. The baseline
+appears once. Model comparison uses the same DataTable, compact model/baseline
+badges and resizable columns as other Console lists, with benchmark group rows
+preserved while sorting. Scores are plain tabular values, without link-like
+underlines or permanent direction arrows. Coverage remains a column with a warning
+indicator for missing, invalid or incompatible predictions; hover/focus exposes
+the exact counts. Score hover/focus exposes denominators,
+confidence intervals, paired differences and recorded adjusted scores. Confidence is a
+separate metric card: observed correctness and claimed probability share a 0–100%
+bar with a hatched gap and a confidence marker. Soft targets use “Reference support”,
+never invented correctness. Original and adjusted measurements appear together when
+available, without a Raw/Calibrated toggle. Use final-evaluation reliability evidence,
+weight bands by decision count, and omit unmeasured confidence. The table retains
+calibration error across confidence bands; equal overall averages do not imply calibration.
+Accuracy, cross entropy and Brier lead; score/ranking errors appear when measured.
+Mode agreement and top-choice reference mass are omitted when their denominators
+match hard-label accuracy, and retained for soft or mixed targets. The Console
+omits report downloads, receipt/diagnostic JSON sections and workload measurement
+controls; the retained records and services remain available through REST and MCP.
+Their cards use full-width plots, compact labelled bars, a faint numeric grid and
+the shared hover tooltip with a vertical guide. Accuracy uses a percentage scale;
+cross entropy, Brier and error metrics keep their native numeric units. Missing
+measurements are omitted, never converted to zero or sample distributions.
+
+Running probability benchmarks show per-model stage, scored/expected coverage
+and updating provisional metrics. Each metric averages measured benchmark means,
+not unlike score units; multiple benchmarks expand below the model row. Calibration
+and held-out final results have separate tabs. Datapoint rows open the existing
+full-size, two-pane inspector: frozen state/question once on the left, all models'
+ordered option probabilities and references listed vertically on the right. Adjusted
+probabilities appear alongside originals when measured. The inspector shares the
+generative view's compact pane headers and read-only model badges, without tabs or
+a model selector. The output list scrolls independently on desktop; narrow screens
+stack it after the shared input. Probability values use compact shared
+table rows with full-width rules, followed by aligned evaluation-score rows.
+Mean-only ordinal targets
+retain their explicit axis and reference mean. Missing outputs never borrow another
+model's answer; each model retains its own pending and error states. This remains
+an inspection page, without execution actions.
+
+Probability datapoints use the shared DataTable: compact single-line input
+previews, a reference column and prediction/probability pairs, read-only model badges, bounded
+resizable columns, standard pagination and roving keyboard row navigation.
+Predicted options use success/check or error/cross chips only when a retained
+accuracy score establishes correctness against a single-answer target. Soft and
+ordinal targets stay neutral. References show the actual answer, a soft-target
+chip with the full distribution on hover, or an explicit mean. Probability stays
+a neutral numeric value with a compact magnitude bar, never a success threshold;
+a high-probability wrong answer remains visibly wrong. A compact key identifies
+outcome colors and the probability bars. Icons and accessible labels retain the
+meaning without color. Missing and unscored outputs have separate neutral/warning
+chips, and tied maxima remain explicit in accessible labels and tooltips.
+State previews distinguish examples without repeating the question in every row;
+the full question and state remain in the preview title and inspector. Open rows
+use the shared active-row tint. Wide model comparisons scroll within the table.
+The datapoint toolbar uses shared search and model/outcome selectors. Search
+matches frozen input text, source row keys and benchmark names across the entire
+suite before pagination. Outcomes match raw recorded scores for the selected
+model, or any model when all are shown; soft/ordinal targets never become hard
+correctness labels. Model selection also narrows visible prediction columns.
+Filter changes reset pagination, zero matches retain the clear-filters control,
+and aggregate benchmark metrics remain unfiltered. Exact-row inspection remains
+independent of the table filters.
+
+Evaluation score cards use the same full-width header divider and plot frame.
+Score, box and violin views use compact 48px rows with evaluator/model names above
+their marks; score means stay visible at the right. The plot starts at the card's
+inner edge, with no legend or axis gutter. Only score endpoints are labelled;
+the dashed grid retains its measured 0–100% scale. Histogram and density views
+keep their legend above the plot; histogram counts retain a labelled upper bound.
+Hover uses the shared split-row tooltip: means for scores, per-series bucket counts
+for histograms, relative density for distributions, and quartiles/range/mean for
+box and violin views. The same values are accessible with arrow keys; Escape
+dismisses the tooltip. Pointer clicks do not add a chart focus outline.
+A vertical dashed guide follows the hovered score position and keyboard selection.
+
+Graph tooltips use the shared `GraphTooltip`: the step, epoch, iteration or timestamp
+is above the values. Each series is a full-width split row with its line colour and
+name on the left and its formatted value on the right, without nested row boxes or
+inset gutters. Training series use the model name;
+other graphs retain their evaluator or metric identity. Tooltips use the dark
+popover surface and full-width header divider.
+Pointer clicks on graphs do not add a focus outline. Keyboard focus retains its
+indicator and chart navigation.
 
 ### Motion (system-wide)
 
 150ms for colour and background transitions, 200ms for dialog open/close, `ease`
 and `ease-out` throughout. No spring physics, no bounce. Hover changes colour,
 background and border only: never scale, never lift, never shadow.
-Status glyphs that report work pulse their opacity while it runs and fade their
-colour in once when it completes; a version card fades in (500ms) or flashes
-its surface (500ms). Under reduced motion all of these stop or shorten to 120ms.
 
 ## Language
 
@@ -755,8 +928,8 @@ they name a symbol or quote a wire value.
 - Ask `lib/colors.ts` for a meaning and `lib/typography.ts` for a role. Add
   new colour meaning to the registry, not to the call site.
 - Use the tint triplet `border-{tone}/40 bg-{tone}/10 text-{tone}` for every
-  status chip; `--success` / `--warning` / `--info` / `--destructive` carry
-  their own AA tuning.
+  status chip, and let `--success` / `--warning` / `--info` / `--destructive`
+  supply their semantic colours.
 - Pick one of the four title steps (`TITLE.hero` / `.page` / `.section` /
   `.card`) and let size carry the hierarchy.
 - Keep the radius ramp at `rounded-xs` (1px) for sub-8px elements,
@@ -769,6 +942,8 @@ they name a symbol or quote a wire value.
 - Write labels in sentence case with acronyms preserved.
 - Write every user-facing string in British English: `optimise`, `analyse`,
   `colour`, `centre`, `catalogue`.
+- Keep the Console dark-only. Do not add theme selectors, stored-theme
+  resolution or operating-system theme listeners.
 
 ## Don't
 
@@ -776,8 +951,8 @@ they name a symbol or quote a wire value.
   (`bg-blue-500`, `text-zinc-400`) anywhere in app code.
 - Use the brand copper outside `overmind-eye-copper.svg`. Orange in the UI
   means warning.
-- Add a shadow. Every shadow token resolves to `none`; use tone, border or
-  ring.
+- Add a shadow outside confirmation dialogs. Use tone, border or ring for
+  every other surface; the only elevation token is `shadow-confirmation`.
 - Use `rounded-lg`, `rounded-xl`, `rounded-full`, bare `rounded`, or an
   arbitrary `rounded-[Npx]`.
 - Pair a title class with a `text-*` size or a weight utility. Mondwest has one
@@ -789,9 +964,7 @@ they name a symbol or quote a wire value.
   a semantic name from the `Icon` registry so one concept maps to one glyph.
 - Hand-roll a spinner (`animate-spin`), a `window.confirm()`, or a second
   score-tier map. Use `Spinner`, `ConfirmDialog`, and `scoreTone`.
-- Write a `dark:` variant, a theme switch or a stored theme. The Console is
-  dark-only, and Tailwind's bare `dark:` follows the OS colour scheme;
-  `check:design` fails the variant.
+- Add `dark:` variants. Components use the single semantic palette directly.
 - Correct alignment with `mt-px` or `pt-0.5`. Fix the line boxes.
 - Animate on hover with scale, lift or shadow growth.
 - Anglicise a contract to match the prose. CSS properties, DOM and library

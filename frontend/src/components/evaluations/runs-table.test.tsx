@@ -69,7 +69,7 @@ vi.mock("@/hooks/use-datasets", () => ({
   }),
 }));
 
-import { EvalRunsListStatusEnum } from "@/openapi";
+import { EvalRunsActivityListStatusEnum } from "@/openapi";
 import { RunsTable } from "./runs-table";
 
 afterEach(() => {
@@ -151,7 +151,7 @@ describe("RunsTable dataset filter", () => {
   });
 });
 
-// The eval-runs endpoint 400s on statuses outside `EvalRunsListStatusEnum` —
+// The eval-runs endpoint 400s on statuses outside `EvalRunsActivityListStatusEnum` —
 // notably `JobStatusEnum`'s `partially_completed`.
 describe("RunsTable status filter", () => {
   it("offers exactly the eval-run statuses plus the unfiltered sentinel", () => {
@@ -159,7 +159,7 @@ describe("RunsTable status filter", () => {
 
     expect(optionValuesFor("Filter by status")).toEqual([
       "all",
-      ...Object.values(EvalRunsListStatusEnum),
+      ...Object.values(EvalRunsActivityListStatusEnum),
     ]);
   });
 });

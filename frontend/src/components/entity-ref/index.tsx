@@ -24,6 +24,8 @@ const CHIP =
 /** TanStack types `to` against `params`, so each kind needs its own literal
  * branch — a generic route table would need a cast. */
 export function EntityLink({
+  cellId,
+  evaluationFormat,
   children,
   className,
   id,
@@ -32,6 +34,8 @@ export function EntityLink({
   projectId,
   ...rest
 }: {
+  cellId?: string;
+  evaluationFormat?: "decision";
   children: ReactNode;
   className: string;
   id: string;
@@ -59,7 +63,7 @@ export function EntityLink({
           className={className}
           onClick={onClick}
           params={{ datasetId: id }}
-          search={search}
+          search={cellId ? { ...search, cell: cellId } : search}
           to="/datasets/$datasetId"
           {...rest}
         >
@@ -72,6 +76,7 @@ export function EntityLink({
           className={className}
           onClick={onClick}
           params={{ runId: id }}
+          search={{ ...search, format: evaluationFormat }}
           to="/evaluations/runs/$runId"
           {...rest}
         >
@@ -147,7 +152,10 @@ export function EntityLink({
   }
 }
 
-const CARDS: Record<EntityKind, ComponentType<{ id: string; name: string }>> = {
+const CARDS: Record<
+  EntityKind,
+  ComponentType<{ id: string; name: string; evaluationFormat?: "decision" }>
+> = {
   capability: CapabilityCard,
   dataset: DatasetCard,
   evalRun: EvalRunCard,
@@ -159,6 +167,8 @@ const CARDS: Record<EntityKind, ComponentType<{ id: string; name: string }>> = {
 };
 
 export function EntityRef({
+  cellId,
+  evaluationFormat,
   className,
   id,
   kind,
@@ -166,6 +176,8 @@ export function EntityRef({
   projectId,
   showIcon = true,
 }: {
+  cellId?: string;
+  evaluationFormat?: "decision";
   className?: string;
   id: string;
   kind: EntityKind;
@@ -181,7 +193,9 @@ export function EntityRef({
     <HoverCard>
       <HoverCardTrigger asChild>
         <EntityLink
+          cellId={cellId}
           className={cn(CHIP, className)}
+          evaluationFormat={evaluationFormat}
           id={id}
           kind={kind}
           onClick={(e) => e.stopPropagation()}
@@ -197,7 +211,7 @@ export function EntityRef({
           as long as the card. No Suspense boundary — plain `useQuery` never suspends,
           so one would silently never fire. */}
       <HoverCardContent className="p-0">
-        <Card id={id} name={label} />
+        <Card evaluationFormat={evaluationFormat} id={id} name={label} />
       </HoverCardContent>
     </HoverCard>
   );

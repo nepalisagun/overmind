@@ -17,7 +17,7 @@ describe("schemas", () => {
       expect(result.ordering).toBe("-start_time_ns");
       expect(result.page).toBe(1);
       expect(result.page_size).toBe(25);
-      expect(result.view).toBe("executions");
+      expect(result.view).toBe("roots");
     });
 
     it("parses valid search params", () => {
@@ -29,6 +29,10 @@ describe("schemas", () => {
       expect(result.projectId).toBe("proj-1");
       expect(result.timeRange).toBe("past24h");
       expect(result.search).toBe("test");
+    });
+
+    it("opens old reporting links in Traces", () => {
+      expect(tracesSearchSchema.parse({ view: "overview" }).view).toBe("roots");
     });
 
     it("parses DRF-style filter lookups", () => {
@@ -111,11 +115,6 @@ describe("schemas", () => {
     it("falls back to unfiltered for a status only the generic Job model has", () => {
       const result = evaluationsSearchSchema.parse({ run_status: "partially_completed" });
       expect(result.run_status).toBe("all");
-    });
-    it("keeps the library's capability preset separate from the runs capability filter", () => {
-      const result = evaluationsSearchSchema.parse({ capability: "capability-1", view: "library" });
-      expect(result.capability).toBe("capability-1");
-      expect(result.run_capability).toBe("all");
     });
   });
 

@@ -34,16 +34,11 @@ import { PageHeader } from "@/components/ui/page-header";
 import { PageShell } from "@/components/ui/page-shell";
 import { QueryError } from "@/components/ui/query-error";
 import { Skeleton } from "@/components/ui/skeleton";
+import { SortableHeader } from "@/components/ui/sortable-header";
 import { LoadingState } from "@/components/ui/spinner";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { Table, TableBody, TableCell, TableHeader, TableRow } from "@/components/ui/table";
 import { useElapsedSeconds } from "@/hooks/use-elapsed-seconds";
+import { useTableSort } from "@/hooks/use-table-sort";
 import { scoreTextClass } from "@/lib/colors";
 import { featureFlags } from "@/lib/feature-flags";
 import { formatElapsed } from "@/lib/formatters";
@@ -145,6 +140,15 @@ function iterationBest(iteration: OptimizerIteration): number | null {
 function iterationLabel(iteration: OptimizerIteration): string {
   if (iteration.order === 0) return "Baseline";
   return iteration.name || `Iteration ${iteration.order}`;
+}
+
+function comparisonIterationLabel(iteration: OptimizerIteration, comparedModels: string[]): string {
+  const models = [...(iteration.candidates ?? [])]
+    .sort((a, b) => a.candidateIndex - b.candidateIndex)
+    .map((candidate) => candidate.modelName || candidate.targetModel)
+    .filter(Boolean)
+    .join(", ");
+  return models || comparedModels[iteration.order - 1] || "Selected models";
 }
 
 type CandidateCoverage = {
@@ -498,14 +502,10 @@ function IterationRow({
   );
   const best = iterationBest(iteration);
   const delta = best != null && baseline != null && iteration.order > 0 ? best - baseline : null;
-  const comparisonLabel = candidates
-    .map((candidate) => candidate.modelName || candidate.targetModel)
-    .filter((model): model is string => Boolean(model))
-    .join(", ");
   // Comparison rows name their model even before its candidate exists: order i
   // maps 1:1 onto the i-th selected model.
   const rowLabel = comparison
-    ? comparisonLabel || comparedModels[iteration.order - 1] || "Selected models"
+    ? comparisonIterationLabel(iteration, comparedModels)
     : iterationLabel(iteration);
 
   return (
@@ -768,6 +768,9 @@ function RunActivity({
 }
 
 function OptimiserRunPage() {
+  const { sort, onSort, sortRows } = useTableSort<
+    "order" | "status" | "candidates" | "score" | "created"
+  >();
   const { experimentId } = Route.useParams();
   const { projectId } = Route.useSearch();
   const queryClient = useQueryClient();
@@ -957,7 +960,7 @@ function OptimiserRunPage() {
         </div>
 
         {(comparison || hybrid) && comparedModels.length > 0 && (
-          <section className="flex flex-col gap-2 border-t border-border/70 pt-3">
+          <section className="-mx-4 flex flex-col gap-2 border-t border-border/70 px-4 pt-3">
             <h3 className="text-xs text-muted-foreground">Selected models</h3>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
               {comparedModels.map((modelId) => (
@@ -1049,7 +1052,7 @@ function OptimiserRunPage() {
           />
         </div>
 
-        <div className="flex flex-col gap-3 border-t border-border/70 pt-3">
+        <div className="-mx-4 flex flex-col gap-3 border-t border-border/70 px-4 pt-3">
           <div className="flex items-center gap-2">
             <Icon.chart className="size-4 shrink-0 text-muted-foreground" />
             <h3 className="text-xs leading-none">
@@ -1076,7 +1079,7 @@ function OptimiserRunPage() {
           )}
         </div>
 
-        <dl className="grid grid-cols-2 gap-x-8 gap-y-3 border-t border-border/70 pt-3 sm:grid-cols-3 lg:grid-cols-5">
+        <dl className="-mx-4 grid grid-cols-2 gap-x-8 gap-y-3 border-t border-border/70 px-4 pt-3 sm:grid-cols-3 lg:grid-cols-5">
           {!comparison && !hybrid && (
             <>
               <div className="flex flex-col gap-1">
@@ -1161,17 +1164,57 @@ function OptimiserRunPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="px-4">{comparison ? "Models" : "Iteration"}</TableHead>
-                  <TableHead className="w-34 px-4 text-center">Status</TableHead>
-                  <TableHead className="w-26 px-4 text-center">
-                    {comparison ? "Models tested" : "Candidates"}
-                  </TableHead>
-                  <TableHead className="w-30 px-4 text-center">Score</TableHead>
-                  <TableHead className="w-38 px-4 text-center">Created</TableHead>
+                  <SortableHeader
+                    className="px-4"
+                    label={comparison ? "Models" : "Iteration"}
+                    onSort={onSort}
+                    sort={sort}
+                    sortKey="order"
+                  />
+                  <SortableHeader
+                    className="w-34 px-4 text-center"
+                    label="Status"
+                    onSort={onSort}
+                    sort={sort}
+                    sortKey="status"
+                  />
+                  <SortableHeader
+                    className="w-26 px-4 text-center"
+                    label={comparison ? "Models tested" : "Candidates"}
+                    onSort={onSort}
+                    sort={sort}
+                    sortKey="candidates"
+                  />
+                  <SortableHeader
+                    className="w-30 px-4 text-center"
+                    label="Score"
+                    onSort={onSort}
+                    sort={sort}
+                    sortKey="score"
+                  />
+                  <SortableHeader
+                    className="w-38 px-4 text-center"
+                    label="Created"
+                    onSort={onSort}
+                    sort={sort}
+                    sortKey="created"
+                  />
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {iterations.map((it) => (
+                {sortRows(iterations, (it, key) =>
+                  key === "order"
+                    ? comparison
+                      ? comparisonIterationLabel(it, comparedModels)
+                      : it.order
+                    : key === "status"
+                      ? it.status
+                      : key === "candidates"
+                        ? (it.candidates?.length ?? 0)
+                        : key === "score"
+                          ? iterationBest(it)
+                          : it.createdAt?.getTime()
+                ).map((it) => (
                   <IterationRow
                     baseline={baseline}
                     comparedModels={comparedModels}

@@ -5,6 +5,30 @@ description: End-to-end workflow for adding or changing Overmind MCP tools, reso
 
 # Adding or changing MCP
 
+Contract 7.8.0 makes automatic signal defaults and evidence inspection MCP-ready.
+`list_signals` returns `default_enabled` and effective `enabled` values; explicit
+capability settings override project settings. `plan_drift` remains opt-in.
+`query_traces(signal_event=UUID)` scopes to that event's retained source traces;
+signal resources include conversation identity and the retained trace inventory.
+
+Contract 7.6.2 is MCP-ready: exhausted prediction collection completes scoring
+from verified available outputs. `results.completion` retains per-suite/per-arm
+expected, scored, missing, invalid and incompatible counts, plus stage issues.
+`completed_with_issues` is a result annotation, not a new job lifecycle state.
+Missing outputs are not quality zeros; paired metrics use shared scored inputs.
+Incomplete calibration leaves raw scores available without invented temperatures.
+Verification/report failures and unresolved native submissions still need inspection.
+Unknown external intents remain missing with uncertain costs; they are not replayed
+and do not prevent collecting subsequent inputs. A paused external collector can
+resume its explicit stage without a native call ID.
+
+Contract 7.6.1 makes automatic native-evaluation recovery MCP-ready through existing
+job receipts: stage retry time/history, running state and polling guidance. Shared
+services retry transient local work and collect saved native calls; timed-out
+external predictions retry only missing responses within three attempts and retain
+uncertain prior costs. Bare submission intents remain unresolved. No new tool is
+required; explicit resume uses the same bounded request recovery.
+
 Platform-agent procedure for changing the server. The skill shipped by
 `overmind init` is `overmind/skills/overmind/` — do not copy this file there.
 
@@ -26,6 +50,14 @@ includes `console_url` from `FRONTEND_URL` for ordinary browser navigation.
 Do not make a plugin or a custom UI a prerequisite for platform operations.
 
 ## MCP-impact classification
+
+Contract 7.6.0 adds MCP-ready `save_training_plan` and `training_plan` workflow
+inspection. Pilot/full experiment bindings consume immutable task/data/partition
+and attributed evidence snapshots. Contract 7.6.3 removes mandatory pilot selection
+from full-run eligibility: full runs may launch directly; optional pilot selection
+still requires matching measured development metrics and a verified checkpoint. The bounded discovery budget is 91 KiB
+for 76 tools. Source/package byte transfers remain CLI-guided. Hardware profiles
+are not quality evidence, and exploratory jobs are not universally gated.
 
 For every new or modified Overmind capability, function, API workflow, or
 Console workflow, make an explicit MCP-impact decision in the same change. A
@@ -89,18 +121,18 @@ forbid extra fields. `tests/test_mcp_analytics.py` holds these invariants.
 
 ## Layer ownership
 
-| Layer              | Location                            | Responsibility                                                                                                     |
-| ------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Transport          | `services/mcp/server.py`            | MCP protocol, allowed hosts/origins, request-size limit, SDK callbacks.                                            |
-| Authentication     | `services/mcp/auth.py`              | Authenticate an account/project API key or MCP OAuth token, enforce credential limits, and bind context.           |
-| Context            | `services/mcp/context.py`           | Make immutable `{user, token, project, client_ip}` available only during the request.                              |
-| Catalog            | `services/mcp/catalog.py`           | Publish a curated visible tool set, validate contracts, invoke handlers, and turn known failures into MCP results. |
-| Contracts          | `services/mcp/contracts/`           | Strict Pydantic input/output models, resource links, page metadata, and job receipts.                              |
-| Feature adapters   | `services/mcp/tools_*.py`           | Resolve project-scoped references and adapt a semantic MCP intent onto domain services.                            |
-| Domain logic       | existing `services/`, models, tasks | Own business rules, persistence, authorization-sensitive state transitions, and background work.                   |
-| Results and errors | `result_compat.py`, `errors.py`     | Preserve all typed output for every client and emit safe, stable error values.                                     |
-| Resources          | `resources.py`                      | Read-only, project-scoped entity state and static CLI handoff guidance.                                            |
-| Prompts            | `prompts.py`                        | Native multi-step workflow instructions composed from the public catalog.                                          |
+| Layer              | Location                                 | Responsibility                                                                                                                                                                              |
+| ------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Transport          | `services/mcp/server.py`                 | MCP protocol, allowed hosts/origins, request-size limit, SDK callbacks.                                                                                                                     |
+| Authentication     | `services/mcp/auth.py`                   | Authenticate an account/project API key or MCP OAuth token, enforce credential limits, and bind context.                                                                                    |
+| Context            | `services/mcp/context.py`                | Make immutable `{user, token, project, client_ip}` available only during the request.                                                                                                       |
+| Catalog            | `services/mcp/catalog.py`                | Publish a curated visible tool set, validate contracts, invoke handlers, and turn known failures into MCP results.                                                                          |
+| Contracts          | `services/mcp/contracts/`                | Strict Pydantic input/output models, resource links, page metadata, and job receipts.                                                                                                       |
+| Feature adapters   | `services/mcp/tools_*.py`                | Resolve project-scoped references and adapt a semantic MCP intent onto domain services.                                                                                                     |
+| Domain logic       | `services/`, `innermind/`, models, tasks | Own business rules, persistence, authorization-sensitive state transitions, and background work. Evaluation and signal tools call `innermind` (runs, comparison, context, health, signals). |
+| Results and errors | `result_compat.py`, `errors.py`          | Preserve all typed output for every client and emit safe, stable error values.                                                                                                              |
+| Resources          | `resources.py`                           | Read-only, project-scoped entity state and static CLI handoff guidance.                                                                                                                     |
+| Prompts            | `prompts.py`                             | Native multi-step workflow instructions composed from the public catalog.                                                                                                                   |
 
 Tools must call the domain layer directly. They may share serializers or
 entity-resolution helpers where those express domain semantics, but must not
@@ -141,14 +173,115 @@ currently enforces the public `read_only`/`read` versus mutation/`write`
 boundary. If more granular API-key enforcement is introduced, implement it in
 the catalog/auth layer for every tool—do not add one-off handler checks.
 
-The public surface remains read and write only. The catalog rejects destructive
-tool names and destructive metadata. Do not add delete, remove, cancel, or
-undeploy operations without an explicit public-surface decision. The documented
-lifecycle exceptions are `retry_deployment` and `cancel_dataset_job` (stops a
-dataset import or script run; nothing it produced is kept); do not add other
-retry or cancel operations without an explicit public-surface decision.
+The public surface remains permission-scoped read/write. Deliberate lifecycle operations are `cancel_dataset`, `retry_deployment`, `retry_data_partition`, native-comparison pause/resume, and performance resume. Do not infer generic destructive operations from these exceptions. A comparison pause prevents new claims; in-flight work may complete and retain receipts. Unacknowledged native submissions and bare external intents require reconciliation. Recorded external prediction transport failures use the bounded automatic recovery policy, retaining uncertain costs.
+
+Contract 5.1 retains draft → optional background preparation → explicit launch. `run_inference` requires a stable request key and returns an `inference_request` job; read its result with `get_job`. Unknown acknowledgements are reconciled without another submission. `inspect_operation` pages durable operational events; reads never invoke workers. `overmind://interface/current` and `list_projects` return the request-derived MCP endpoint, Console origin and permission-scoped tool count/catalog fingerprint. Compare these with the intended environment and refresh `tools/list` on a mismatch; never silently change endpoints or credentials. The interface resource also returns lifecycle rules; it does not attest that remote GPU images are deployed. Ordinary action receipts stay compact and point to detailed resources. Nested partition, sampling, workload and inference settings are typed; training hyperparameters are an intentional model-dependent extension validated by the training serializer/catalog. Manifest budget is 72 KiB including the five reusable-pipeline lifecycle tools and their typed inputs. Package bytes remain CLI-guided; script execution and binding lifecycle are MCP-ready. Pipeline revisions return explicit `flow` nodes, input edges, conditions and output. Native agents declare script conditions with code-line provenance; measured branch outcomes remain separate run facts. Forks execute from their declared parents; compatible disjoint branches converge through inputs. Cycles and job-level conditional skipping are not supported.
 
 ## Adding or changing a tool
+
+Contract 7.7 adds MCP-ready version-bound Workshop analytics to cell inspection
+and completed pipeline receipts, shared with REST/Console. `explore_dataset`
+backfills older cells; reads never scan. Surface warning/error and `not_checked`
+results before consumer handoff, with exact fingerprint and coverage. This is
+advisory evidence, not a universal quality gate.
+
+Contract 5.2 adds `author-dataset-transformation` and
+`inspect_dataset_workbench(pipeline=REVISION_UUID)` for exact recipe lookup,
+paged family history and revision-scoped runs/bindings. Stale family writes return
+`revision_conflict`. The server instructions explicitly permit approved isolated
+script packages; semantic/provider work remains native-agent-owned. The interface
+resource declares row-routing limits and unmeasured branch-coverage guarantees.
+
+Contract 5.3 returns project-bound upload argv for drafts, row-check scopes and
+failed check details, queue age/poll interval/terminal time for Workshop runs,
+and a separate unmeasured task-suitability assessment in training readiness.
+Prompts and server instructions require capability inspection and a verified
+platform handoff; local artifacts alone do not complete Overmind preparation.
+Workbench results carry project scope and executable next_actions; dataset inspection
+points to the exact active pipeline receipt instead of an earlier landing job.
+
+Contract 5.4 adds `inputs` for distinct
+earlier parents, concatenated in declared order. Declarative `merge` retains their
+disjoint observations; overlapping source_row identities fail. Flow exposes terminal
+and unconsumed steps; receipts retain per-input counts, fingerprints and cell IDs.
+Training preparation converges intended branches to trainable output, with unresolved
+review evidence preserved. This is not a relational key join or job-level skipping.
+
+Contract 5.5 adds cell `transformation` attribution to `inspect_dataset`: exact
+completed run, revision, package checksum and entrypoint, checked against publication
+membership and output fingerprint. External imports and unrecorded history never
+claim platform execution. Existing package resources share checksum-verified file
+pagination with REST; read every retained helper/manifest without executing code.
+Author meaningful logic in each entrypoint and only reusable functions in helpers.
+
+Contract 5.6 keeps Workshop polling, idempotent run receipts and workbench history
+compact: measured counts, checks, identities and timings remain inline; each run's
+`evidence_resource` retains the original row examples and preview samples. Reading
+that resource never executes work. Query results over 200 columns or 32 KiB fail
+explicitly without clipping data or column metadata.
+
+Contract 5.6.1 exposes PDF native-text recovery facts through existing source
+inspection and upload guidance. Recovery engine, pages and measured encoding
+artifacts are distinct from OCR confidence and semantic/visual correctness.
+
+Contract 5.7 adds measured script runtime phases and preview duration, a bounded
+query deadline, actionable package-parameter diagnostics and checksum-verified
+original-source CLI exports. Native training readiness returns only the eligible
+catalogue, not chat rankings or heuristic prices. `batch_size` is the effective
+optimizer batch; unsupported accumulation/micro-batch overrides are rejected
+before dispatch and in estimates with a recoverable authored diagnostic.
+Training estimates preserve the requested baseline choice. New Modal charges and
+forecast duration evidence use deduplicated worker receipts, not collector delay;
+`recorded_basis` exposes the saved charge calculation. Terminal training timelines
+are closed by finalization or passive local reconciliation, without another provider
+call. Historical unverified charges and all-in invoice components remain explicit.
+
+Contract 6.1 adds `inspect_training_progress` and `cancel_finetune`. Monitoring
+policy, checks, generated evidence, sample identities and retained checkpoint
+metadata are MCP-ready; charts are frontend-only and checkpoint bytes remain a
+CLI handoff. Inspection reads persisted receipts without invoking workers.
+Readiness/preparation/estimate/launch accept the same strict monitoring policy;
+provider capabilities and unmeasured check costs remain explicit. Cancellation
+records intent first and preserves durable evidence. Evidence responses have a
+128 KiB lossless bound and return an error rather than clipping values. The current
+tool-manifest budget is 91 KiB. Refresh the connected catalogue after deployment.
+Native per-question metrics and assessments have `collections` descriptors in
+check/checkpoint overviews. Pass a descriptor's `field` JSON Pointer with
+`offset`/`limit` for exact retained object entries or array items. Append escaped
+keys or indices to inspect a nested field that exceeds the response limit.
+`field`, `check` and `probe` are mutually exclusive and job-scoped; REST
+monitoring-evidence uses the same field pagination.
+Check `facts.delivery` reports the first valid loss result's collector receipt time
+and check-finish observation time. These are not worker timestamps or user-feedback
+scores; passive inspection never emits another lifecycle analytics event.
+
+Contract 6.2 adds `generation.kind=json_fields` with bounded explicit JSON Pointers
+through the existing shared monitoring policy. Model-catalogue discovery advertises
+it; no new tool is needed. Checks expose per-field and complete-example pass rates,
+unscorable references and technical coverage. This is MCP-ready; the Console uses
+the same receipts. Field meanings stay native-agent-owned. Worker deployment is
+required for new runs; existing pinned runs retain their original contract.
+
+Contract 6.2.1 retains `latest_generation_check` in compact job monitoring even
+when a newer check contains only loss. Receipt-collected classification
+`facts.assessment` compares the same scored subset with its majority-label baseline
+and identifies represented labels without predictions. Source receipt, rule
+version, coverage and assessment time are separate from immutable worker metrics.
+Reads never derive missing assessments or change training. This is MCP-ready
+through existing job/inspection resources; no new tool or worker deployment.
+
+Contract 6.0 requires a retained Python package for every new Workshop revision.
+The save schema removes inline steps; shared services reject package-free historical
+revisions for validation, new runs and bindings. Historical receipts remain readable
+with original attribution. Workbench authoring facts replace the operation catalogue;
+pipeline.executable identifies package-backed revisions, not verified semantic quality.
+MCP input errors point to pipeline-upload and overmind://dataset-upload; optional
+installed guidance is not the enforcement boundary.
+
+`get_model_catalog` also returns each foundation's nullable `openrouter_id` and
+`openrouter_status`. Availability is catalogue evidence, not inference success or
+credential readiness. The shared benchmark resolver uses the same exact identities;
+`not_listed` and `catalog_unavailable` are distinct from an available provider route.
 
 1. Classify the change above. Reuse a current tool when the agent intent is
    unchanged; do not mirror a REST endpoint merely because it exists.
@@ -212,6 +345,36 @@ resume, or inspect. Implement its project-filtered payload in
 removes sensitive fields. Keep access tokens, credentials, API keys, cookies,
 private material, presigned URLs, and checkpoint URLs out of both tool and
 resource output.
+Known numeric token measurements (such as `tokens`, `supervised_tokens`,
+`trained_tokens`, `max_tokens`, and `padded_tokens`) remain visible; strings, containers, and nonfinite values under
+those keys do not bypass credential redaction.
+
+Deployment job reads expose the shared deployment stage and its real status-change
+timestamp. Activation progress exposes its deadline and next scheduled poll;
+terminal activations have no next poll. These are scheduling facts, not worker
+heartbeats or evidence of forward progress.
+
+Operational receipts expose source and observation time independently, measured
+counters and a paginated event timeline. Provider events are copied by background
+controllers into durable project-scoped records; MCP inspection reads only those
+records. Shared-pool startup is labelled separately from request-specific adapter
+and generation events. Missing telemetry stays unavailable, with provider cursor
+backlog and dropped-publication counts visible. Never expose raw provider logs,
+prompts, credentials or another tenant's adapters as diagnostics.
+
+Native evaluation job reads summarize every benchmark's coverage and macro
+metrics before bounding the response. They omit duplicated score receipts and
+per-benchmark details, and expose authenticated `report.json_path` and
+`report.markdown_path` downloads on the same server. The complete report retains
+all benchmarks, paired intervals and diagnostic slices; calibration results stay
+marked in-sample. Never present a bounded benchmark preview as complete results.
+
+Dataset transfer receipts use get_job(kind=dataset_transfer) and its job resource.
+The CLI performs a read-only MCP handshake and project-scoped transfer preflight
+with one resolved connection; it never certifies another sandbox's permissions.
+Stable transfer keys survive client interruptions and publication retries. The
+interface resource advertises transfer_protocol_version. JSON wrapper selection
+is explicit, not semantic inference.
 
 MCP carries JSON state, not local binary bytes. For uploads, exports,
 checkpoints, repository edits, or local execution, return or link the
@@ -268,3 +431,56 @@ Before shipping an agent-relevant change, verify all applicable items:
 - [ ] The curated catalog, prompt list, resource list, user-facing Overmind
   skill (`overmind/skills/overmind/`), and MCP tests are updated together.
   Regenerate API clients when the API contract changed.
+
+Training experiment changes expose `request_key`, explicit selection and contract receipts in readiness/estimate/start, elapsed time and remaining-time ranges with their recent metric-window evidence in `get_job`, and the generated run record in the finetune resource. `schedule_native_evaluation` is a metered GPU operation with train scope; its paired plan is a `native_evaluation` job/resource. `cancel_dataset` prevents pipeline publication or requests source-landing cancellation; it does not cancel external coding-agent or model-provider execution. Both routes share Console domain services and project scoping.
+
+Dataset inspection uses cell_offset/cell_limit pagination, with active identity separate from the page. Large summaries expose truncation metadata; scripts, audit internals and previews are bounded before transport serialization. Reading a dataset never computes a missing whole-source profile synchronously; an unmeasured profile points to explore_dataset. These limits apply to the dataset resource and named inspection tool.
+
+Contract 6.3.0 adds stored native decision-quality summaries, including applicable same-subset categorical assessments, to training progress. Native training uses the pinned Unsloth decision runtime through the existing preparation, launch, cancellation, records and operational-inspection tools.
+
+Native comparison scoring stores a checksum-bound report receipt and compact metrics; full diagnostic slices remain downloadable. To recover interrupted local work on a paused comparison, pass its local `verify_inputs`, `fit_calibration` or `score` stage to `resume_native_evaluation`. This fences the prior local lease and reuses retained inputs; it does not resubmit provider calls.
+
+A paused native evaluation collector can resume an explicit stage with its exact recorded `call_id`. Missing or different IDs are rejected; recovery fences the interrupted lease and observes the same provider call without a new submission.
+
+Contract 6.4.0 adds `resume_dataset_import` for stopped source imports. Dataset
+inspection and dataset-run jobs expose the saved source-import state and retry
+availability. Recovery shares the REST and Console service and never starts an
+autonomous preparation agent.
+
+Contract 6.5.0 adds the shared `preparation` graph to Workshop inspection and
+manifest guidance for explicit row batching and consumer validation. Corrections
+replace the displayed process; there is no repair-history/restore UI. Source
+transfer and package bytes are CLI-guided; execution, validation and lineage
+inspection are MCP-ready. MCP readiness reuses its prerequisite validation result
+instead of scanning the full training/validation population twice.
+
+Contract 7.0.0 removes the preparation-findings tools and status fields. Workshop continues to expose retained scripts, the selected process, execution receipts and publication validation. Dataset-scoped pipeline saves automatically retain the current script association; retrying older receipts does not restore it.
+
+Contract 7.1.0 makes native inference MCP-ready: `run_inference` accepts either
+chat messages or input-only decisions, matched to the deployment's recorded
+`inference_contract`. Decision results retain ordered probabilities and artifact
+identity through the same durable request lifecycle. `deploy_finetune` backfills
+successful historical training jobs through the automatic deployment service;
+existing deployments are reused and application routing is unchanged.
+
+Contract 7.2.0 adds `inspect_native_evaluation`: recorded model stages, provisional
+per-benchmark metrics and paginated, identity-aligned input/reference/probability
+samples. REST and MCP share the local indexed projection. Reads can enqueue local
+indexing of retained historical evidence, never provider inference. Calibration
+and final roles remain separate; a key selects one exact source row, including zero.
+The bounded discovery budget is 82 KiB, including native deployment backfill and
+the probability inspection tool; optional output schemas remain omitted.
+
+Contract 7.3.0 adds search, participant and outcome filters to native evaluation
+inspection. They apply to the full saved sample index before pagination; outcome
+matching uses raw recorded scores, scoped to a participant or any model. Soft
+targets never count as hard correctness. Aggregate metrics remain unchanged.
+An exact sample key is independent of, and cannot be combined with, these filters.
+
+Contract 7.4.0 adds `view=labels` to `inspect_native_evaluation`: paginated per-label precision, recall, F1 and counts shared with Console/REST. Search labels or benchmark names; order by `label`, `benchmark`, `expected` or `participant-key:precision|recall|f1` with optional `-` for descending. Label inspection cannot combine sample keys or outcomes. Only hard references with fixed benchmark option order qualify; soft targets are not collapsed. Reads can rebuild the local projection for historical results without provider calls. Missing predictions and zero denominators stay explicit.
+
+Contract 7.5.0 makes `prepare_training_data` create the dashboard job atomically and return `training_job` alongside the preparation receipt. `get_job(kind=training_preparation)` also links that job. Matching `start_finetune` calls promote it after normal launch admission; preparing/awaiting-launch jobs and preparation retries cannot dispatch GPU training.
+
+Eval-set resources expose complete evaluator sources with `limit` (1–100, default
+20), `offset`, `total` and `next_offset`. Audits must follow every page; the
+resource remains project-scoped and does not start scoring.

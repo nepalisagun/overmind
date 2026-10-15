@@ -3,43 +3,71 @@ from collections.abc import Sequence
 from typing import Any
 
 from conftest import EVAL_ROWS, TRAIN_ROWS, frozen_dataset
-from factories import make_project, make_user
+from factories import make_matrix_row, make_project, make_user
 
-from overbae.models import APIToken, Capability, EvalSet, EvalSetMember, Evaluator
+from overbae.models import APIToken, Capability, EvalMatrix, EvalSet
 from overbae.services.mcp.context import MCPContext
 
+MAX_MANIFEST_BYTES = 91 * 1024
+
 EXPECTED_TOOL_NAMES = {
+    "save_training_plan",
+    "deploy_finetune",
+    "inspect_native_evaluation",
+    "resume_dataset_import",
+    "inspect_training_progress",
+    "cancel_finetune",
+    "explore_dataset",
+    "derive_dataset",
+    "prepare_native_evaluation",
+    "launch_native_evaluation",
+    "pause_native_evaluation",
+    "reuse_evaluation_predictions",
+    "prepare_training_experiment",
+    "create_training_profile",
+    "list_decision_models",
+    "list_decision_training_models",
+    "create_data_partition",
+    "retry_data_partition",
+    "create_native_evaluation",
+    "resume_native_evaluation",
+    "create_training_experiment",
+    "launch_training_experiment",
+    "list_model_workflows",
+    "measure_decision_performance",
+    "resume_decision_performance",
     "list_projects",
     "inspect_capability_health",
     "query_failures",
     "query_traces",
-    "query_task_executions",
     "get_job",
+    "inspect_operation",
     "list_datasets",
+    "start_dataset",
     "inspect_dataset",
     "query_dataset",
-    "create_dataset",
-    "try_dataset_script",
-    "probe_dataset_version",
-    "add_dataset_version",
-    "add_synthetic_examples",
-    "diff_dataset_versions",
-    "activate_dataset_version",
+    "create_dataset_from_traces",
+    "create_dataset_from_llm_calls",
+    "inspect_dataset_workbench",
+    "save_dataset_pipeline",
+    "validate_dataset_pipeline",
+    "cancel_dataset_pipeline_run",
+    "save_dataset_pipeline_binding",
+    "set_dataset_pipeline_binding_state",
+    "run_dataset_pipeline_binding",
+    "run_dataset_pipeline",
+    "import_dataset_version",
     "update_dataset",
-    "resume_dataset_import",
-    "cancel_dataset_job",
     "check_evaluation_readiness",
-    "upsert_evaluator",
+    "create_eval_matrix_row",
+    "delete_eval_matrix_row",
     "create_eval_set",
     "run_evaluation",
     "compare_evaluations",
-    "annotate_evaluation_sample",
     "check_finetune_readiness",
     "prepare_training_data",
     "estimate_finetune",
     "start_decision_job",
-    "check_decision_readiness",
-    "run_decision_model",
     "start_finetune",
     "retry_deployment",
     "set_active_model",
@@ -55,6 +83,10 @@ EXPECTED_TOOL_NAMES = {
     "get_instrumentation_plan",
     "verify_instrumentation",
     "get_model_catalog",
+    "cancel_dataset",
+    "schedule_native_evaluation",
+    "list_signals",
+    "set_signal_subscription",
 }
 
 
@@ -62,11 +94,13 @@ def mcp_context(permission: str | Sequence[str] = "read", **fields: Any) -> MCPC
     user = make_user()
     project = make_project(member=user)
     token = APIToken(
+        project=project,
+        user=user,
         scope={
             "scope": "project",
             "resourceIds": [str(project.id)],
             "permission": [permission] if isinstance(permission, str) else list(permission),
-        }
+        },
     )
     return MCPContext(user=user, token=token, project=project, **fields)
 
@@ -93,15 +127,12 @@ def training_setup(context: MCPContext):
         capability=capability,
         name="Default evals",
     )
-    evaluator = Evaluator.objects.create(
-        project=context.project,
-        name="Exact match",
-        kind=Evaluator.Kind.DETERMINISTIC,
-        config={"check": "exact_match"},
-    )
-    EvalSetMember.objects.create(
-        eval_set=eval_set,
-        evaluator=evaluator,
-        role=EvalSetMember.Role.GENERATIVE,
+    eval_set.rows.add(
+        make_matrix_row(
+            context.project,
+            "Exact match",
+            type=EvalMatrix.Type.DETERMINISTIC,
+            source="def evaluate(span):\n    return span.output == span.expected\n",
+        )
     )
     return capability, train, evaluation, eval_set

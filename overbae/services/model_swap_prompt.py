@@ -72,6 +72,8 @@ def alias_target_deployment(
         return None, f"{deployed.model_id} is not ready to serve (status: {deployed.status})."
     if str(deployed.project_id) != str(capability.project_id):
         return None, "The deployed model belongs to a different project than the capability."
+    if deployed.inference_contract != "chat":
+        return None, "Decision models use typed inference, not an OpenAI chat model swap."
     return deployed, None
 
 

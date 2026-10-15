@@ -12,14 +12,18 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable
+import re
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any
 
+from modal_shared.decisions import decision_line
+from overbae.models import Cell, Dataset
+from overbae.services.datasets import rows as row_store
 from overbae.services.datasets.contract import training_line
+from overbae.services.datasets.examples import normalize_record
 from overbae.services.datasets.text import approx_tokens
-from overbae.services.finetuning_tool_validation import ToolCallingCheck
-from sandbox.examples import normalize_record
+from overbae.services.finetuning_split import split_datapoint_ids
 
 logger = logging.getLogger(__name__)
 
@@ -56,93 +60,95 @@ class ValidationResult:
         }
 
 
-def validate_rows(rows: Iterable[dict]) -> ValidationResult:
-    """No DB or file I/O."""
-    validator = RowValidator()
-    for row in rows:
-        validator.add(row)
-    return validator.result()
+def validate_rows(rows: list[dict]) -> ValidationResult:
+    """Validate already-materialised JSONL rows (no DB or file I/O)."""
+    rows = [normalize_record(row) if isinstance(row, dict) else row for row in rows]
+    if any(isinstance(row, dict) and "decision" in row for row in rows):
+        return validate_decision_rows(rows)
+    return _apply_tool_calling_checks(_openai_format_check(rows), rows)
 
 
-class RowValidator:
-    def __init__(self, *, max_errors: int = 20) -> None:
-        self.max_errors = max_errors
-        self.format: str | None = None
-        self._sample: list = []
-        self.count = 0
-        self.errors: list[str] = []
-        self._capped = False
-        self._threshold: int | None = None
-        self._long = 0
-        self._tools = ToolCallingCheck()
+def validate_decision_rows(rows) -> ValidationResult:
+    errors = []
+    count = 0
+    for count, row in enumerate(rows, 1):
+        try:
+            decision_line(row)
+        except (ValueError, AttributeError) as exc:
+            if len(errors) < 20:
+                errors.append(f"Example {count}: {exc}")
+    if not count:
+        errors.append("The dataset has no rows.")
+    return ValidationResult(valid=not errors, format="decision", num_examples=count, errors=errors)
 
-    def add(self, row: Any) -> None:
-        row = normalize_record(row) if isinstance(row, dict) else row
-        if self.format is None:
-            self._sample.append(row)
-            if len(self._sample) >= _FORMAT_SAMPLE:
-                self._start()
-            return
-        self._check(row)
 
-    def _start(self) -> None:
-        self.format = _detect_format(self._sample)
-        if self.format == "conversational":
-            self._threshold = _long_row_warning_threshold()
-        sample, self._sample = self._sample, []
-        for row in sample:
-            self._check(row)
-
-    def _check(self, row: Any) -> None:
-        self.count += 1
-        self._tools.add(row)
-        if self._threshold and approx_tokens(row) > self._threshold:
-            self._long += 1
-        if self._capped:
-            return
-        if len(self.errors) >= self.max_errors:
-            self.errors.append(
-                f"... and more errors beyond example {self.count} (first {self.max_errors} shown)."
-            )
-            self._capped = True
-            return
-        self.errors.extend(_row_errors(f"Example {self.count}", row, self.format))
-
-    def result(self) -> ValidationResult:
-        if self.format is None:
-            self._start()
-        if not self.count:
-            return ValidationResult(
-                valid=False,
-                format="unknown",
-                num_examples=0,
-                errors=["No trainable examples found (all datapoints lack output)."],
-            )
-        warnings = []
-        if self.count < 10:
-            warnings.append(
-                f"Only {self.count} example(s). At least 10 are recommended for reliable results."
-            )
-        if self._long:
-            warnings.append(
-                f"{self._long} example(s) may exceed {self._threshold:,} tokens — "
-                "rows longer than the model's max fine-tuning context will fail "
-                "pre-flight validation before training."
-            )
-        result = ValidationResult(
-            valid=not self.errors,
-            format=self.format,
-            num_examples=self.count,
-            errors=list(self.errors),
-            warnings=warnings,
-            stats={"total_examples": self.count, "format": self.format},
-        )
-        tool_check = self._tools.result()
-        result.stats.update(tool_check.stats)
-        if tool_check.issue_count:
-            result.valid = False
-            result.errors.extend(tool_check.errors)
+def _validate_native_dataset(
+    checkpoint,
+    *,
+    validation_enabled,
+    validation_split_ratio,
+    validation_dataset_id,
+    validation_cell_id,
+    split_method,
+):
+    row_store.verify(checkpoint)
+    result = validate_decision_rows(row.extra for row in row_store.iter_rows(checkpoint))
+    result.stats = {
+        "checkpoint": str(checkpoint.id),
+        "total_examples": result.num_examples,
+        "train_examples": result.num_examples,
+        "val_examples": 0,
+        "validation_mode": "off",
+        "split_method": split_method,
+        "format": "decision",
+    }
+    if not validation_enabled or not result.valid:
         return result
+    if validation_dataset_id:
+        dataset = Dataset.objects.filter(
+            pk=validation_dataset_id, project_id=checkpoint.dataset.project_id
+        ).first()
+        validation = (
+            dataset.cells.filter(pk=validation_cell_id).first()
+            if dataset and validation_cell_id
+            else dataset.active_cell
+            if dataset
+            else None
+        )
+        if validation is None or not validation.fingerprint:
+            result.valid = False
+            result.errors.append("The validation dataset has no readable version in this project.")
+            return result
+        row_store.verify(validation)
+        checked = validate_decision_rows(row.extra for row in row_store.iter_rows(validation))
+        result.valid = checked.valid
+        result.errors.extend(
+            error.replace("Example", "Validation example", 1) for error in checked.errors
+        )
+        result.stats.update(val_examples=checked.num_examples, validation_mode="separate")
+        overlap = row_store.contamination(checkpoint, validation)["overlap_count"]
+        if overlap:
+            result.warnings.append(
+                f"{overlap} training rows overlap the validation dataset. Validation scores may be inflated."
+            )
+    else:
+        split = checkpoint.dataset.source_spec.get("split", {})
+        try:
+            training, validation, warnings = split_datapoint_ids(
+                row_store.iter_rows(checkpoint),
+                validation_split_ratio,
+                method=split_method,
+                group_by=split.get("group_by", []),
+                stratify_by=split.get("stratify_by"),
+            )
+            result.stats.update(
+                train_examples=len(training), val_examples=len(validation), validation_mode="split"
+            )
+            result.warnings.extend(warnings)
+        except ValueError as exc:
+            result.valid = False
+            result.errors.append(str(exc))
+    return result
 
 
 def validate_dataset(
@@ -158,9 +164,6 @@ def validate_dataset(
     """Validate a dataset's active cell (or the named one); with
     ``validation_enabled`` the ``stats`` also carry the wizard preview's
     train/val counts."""
-    from overbae.models import Cell, Dataset
-    from overbae.services.datasets import rows as row_store
-
     dataset = Dataset.objects.filter(pk=dataset_id).first()
     if dataset is None:
         return ValidationResult(
@@ -179,143 +182,120 @@ def validate_dataset(
             num_examples=0,
             errors=["The dataset has no version that ran."],
         )
-    total = row_store.count(checkpoint)
-    if not total:
-        return ValidationResult(
-            valid=False, format="unknown", num_examples=0, errors=["The dataset has no rows."]
-        )
-
-    val_checkpoint = None
-    split_warnings: list[str] = []
-    if validation_enabled and validation_dataset_id:
-        val_dataset = Dataset.objects.filter(pk=validation_dataset_id).first()
-        if val_dataset is None:
-            return ValidationResult(
-                valid=False,
-                format="unknown",
-                num_examples=total,
-                errors=[f"Validation dataset {validation_dataset_id} not found."],
-            )
-        val_checkpoint = (
-            Cell.objects.filter(pk=validation_cell_id, dataset=val_dataset).first()
-            if validation_cell_id
-            else val_dataset.active_cell
-        )
-        if val_checkpoint is None or not val_checkpoint.fingerprint:
-            return ValidationResult(
-                valid=False,
-                format="unknown",
-                num_examples=total,
-                errors=["The validation dataset has no version that ran."],
-            )
-        overlap = row_store.contamination(checkpoint, val_checkpoint)["overlap_count"]
-        if overlap:
-            split_warnings.append(
-                f"{overlap} training rows overlap the validation dataset. Validation scores may be inflated."
-            )
-        if not row_store.count(val_checkpoint):
-            return ValidationResult(
-                valid=False,
-                format="unknown",
-                num_examples=total,
-                errors=["The validation dataset has no rows."],
-            )
-
-    result, row_errors = _validate_lines(row_store.iter_rows(checkpoint), label_prefix="Row")
-    val_result = None
-    if val_checkpoint is not None:
-        val_result, val_row_errors = _validate_lines(
-            row_store.iter_rows(val_checkpoint), label_prefix="Validation row"
-        )
-        row_errors.extend(val_row_errors)
-    try:
-        split_stats = _split_preview_stats(
-            total,
-            row_store.count(val_checkpoint) if val_checkpoint is not None else None,
-            lambda: row_store.iter_rows(checkpoint),
+    if (checkpoint.intent_report.get("train") or {}).get("format") == "decision":
+        return _validate_native_dataset(
+            checkpoint,
             validation_enabled=validation_enabled,
             validation_split_ratio=validation_split_ratio,
             validation_dataset_id=validation_dataset_id,
+            validation_cell_id=validation_cell_id,
             split_method=split_method,
-            split_config=dataset.source_spec.get("split", {}),
         )
-    except ValueError as exc:
-        split_stats = {}
-        row_errors.append(str(exc))
-    split_stats["checkpoint"] = str(checkpoint.id)
-    result.warnings.extend(split_warnings)
-    if row_errors:
-        result.valid = False
-        result.errors.extend(row_errors)
-    if val_result is not None:
-        if not val_result.valid:
-            result.valid = False
-            result.errors.extend(
-                e.replace("Example", "Validation example", 1) for e in val_result.errors
-            )
-        result.warnings.extend(val_result.warnings)
-    result.stats.update(split_stats)
-    return result
-
-
-def _validate_lines(datapoints, *, label_prefix: str) -> tuple[ValidationResult, list[str]]:
-    validator = RowValidator()
-    errors: list[str] = []
-    for i, dp in enumerate(datapoints, 1):
-        try:
-            validator.add(row_to_finetuning_line(dp))
-        except ValueError as exc:
-            if len(errors) < 20:
-                errors.append(f"{label_prefix} {i}: {exc}")
-    return validator.result(), errors
-
-
-def _split_preview_stats(
-    total: int,
-    val_total: int | None,
-    datapoints,
-    *,
-    validation_enabled: bool,
-    validation_split_ratio: float,
-    validation_dataset_id: str | None,
-    split_method: str,
-    split_config: dict,
-) -> dict[str, Any]:
-    """Return wizard preview fields merged into ``ValidationResult.stats``."""
-    from overbae.services.finetuning_split import split_datapoint_ids
-
-    stats: dict[str, Any] = {
-        "total_examples": total,
-        "train_examples": total,
+    result = stream_chat_validation(checkpoint)
+    split_stats = {
+        "checkpoint": str(checkpoint.id),
+        "total_examples": result.num_examples,
+        "train_examples": result.num_examples,
         "val_examples": 0,
         "validation_mode": "off",
         "split_method": split_method,
     }
-
-    if not validation_enabled:
-        return stats
-
-    if validation_dataset_id and val_total is not None:
-        stats.update(
-            {"train_examples": total, "val_examples": val_total, "validation_mode": "separate"}
+    if validation_enabled and validation_dataset_id:
+        val_dataset = Dataset.objects.filter(
+            pk=validation_dataset_id, project_id=dataset.project_id
+        ).first()
+        val_cell = (
+            (
+                val_dataset.cells.filter(pk=validation_cell_id).first()
+                if validation_cell_id
+                else val_dataset.active_cell
+            )
+            if val_dataset
+            else None
         )
-        return stats
+        if val_cell is None or not val_cell.fingerprint:
+            result.valid = False
+            result.errors.append("The validation dataset has no readable version in this project.")
+        else:
+            val_result = stream_chat_validation(val_cell)
+            result.valid = result.valid and val_result.valid
+            result.errors.extend(
+                error.replace("Example", "Validation example", 1) for error in val_result.errors
+            )
+            result.warnings.extend(val_result.warnings)
+            split_stats.update(val_examples=val_result.num_examples, validation_mode="separate")
+            overlap = row_store.contamination(checkpoint, val_cell)["overlap_count"]
+            if overlap:
+                result.warnings.append(
+                    f"{overlap} training rows overlap the validation dataset. Validation scores may be inflated."
+                )
+    elif validation_enabled:
+        split = dataset.source_spec.get("split", {})
+        try:
+            training, validation, warnings = split_datapoint_ids(
+                row_store.iter_rows(checkpoint),
+                validation_split_ratio,
+                method=split_method,
+                group_by=split.get("group_by", []),
+                stratify_by=split.get("stratify_by"),
+            )
+            split_stats.update(
+                train_examples=len(training), val_examples=len(validation), validation_mode="split"
+            )
+            result.warnings.extend(warnings)
+        except ValueError as exc:
+            result.valid = False
+            result.errors.append(str(exc))
+    result.stats.update(split_stats)
+    return result
 
-    train_ids, val_ids, _warnings = split_datapoint_ids(
-        datapoints(),
-        validation_split_ratio,
-        method=split_method,
-        group_by=split_config.get("group_by", []),
-        stratify_by=split_config.get("stratify_by"),
-    )
-    stats.update(
-        {
-            "train_examples": len(train_ids),
-            "val_examples": len(val_ids),
-            "validation_mode": "split",
-        }
-    )
-    return stats
+
+def stream_chat_validation(cell):
+    row_store.verify(cell)
+    source = iter(row_store.iter_rows(cell))
+    result = ValidationResult(valid=True, format="unknown", num_examples=0)
+    formats = set()
+    long_examples = 0
+    while batch := list(islice(source, 512)):
+        converted, errors = [], []
+        for offset, row in enumerate(batch, result.num_examples + 1):
+            try:
+                converted.append(row_to_finetuning_line(row))
+            except ValueError as exc:
+                if len(errors) < 20:
+                    errors.append(f"Row {offset}: {exc}")
+        checked = validate_rows(converted)
+        formats.add(checked.format)
+        result.valid = result.valid and checked.valid and not errors
+        for error in checked.errors:
+            errors.append(
+                re.sub(
+                    r"Example (\d+)", lambda m: f"Example {int(m[1]) + result.num_examples}", error
+                )
+            )
+        result.errors.extend(errors[: max(0, 20 - len(result.errors))])
+        long_examples += checked.stats.get("long_examples", 0)
+        result.num_examples += len(batch)
+        for key in (
+            "tool_calling_examples",
+            "tool_calling_issues",
+            "tool_calling_affected_examples",
+        ):
+            result.stats[key] = result.stats.get(key, 0) + checked.stats.get(key, 0)
+    result.format = next(iter(formats)) if len(formats) == 1 else "mixed" if formats else "unknown"
+    if not result.num_examples:
+        result.valid = False
+        result.errors.append("The dataset has no rows.")
+    elif result.num_examples < 10:
+        result.warnings.append(
+            f"Only {result.num_examples} example(s). At least 10 are recommended for reliable results."
+        )
+    if long_examples:
+        result.warnings.append(
+            f"{long_examples} example(s) may exceed {_long_row_warning_threshold():,} tokens; exact preprocessing checks the selected model."
+        )
+    result.stats.update(format=result.format, total_examples=result.num_examples)
+    return result
 
 
 def row_to_finetuning_line(row) -> dict:
@@ -338,14 +318,82 @@ def _long_row_warning_threshold() -> int | None:
     return min_sft_context_length(catalog_backend) if catalog_backend else None
 
 
-def _row_errors(label: str, row: Any, detected_format: str) -> list[str]:
-    if not isinstance(row, dict):
-        return [f"{label}: must be a JSON object, got {type(row).__name__}."]
-    if detected_format == "conversational" or "messages" in row:
-        return _validate_conversational_row(label, row)
-    if detected_format == "instruction" or ("prompt" in row and "completion" in row):
-        return _validate_instruction_row(label, row)
-    return [f"{label}: unrecognised format — row must have 'messages' or 'prompt'+'completion'."]
+def _apply_tool_calling_checks(
+    result: ValidationResult,
+    rows: list[dict],
+) -> ValidationResult:
+    from overbae.services.finetuning_tool_validation import check_tool_calling_rows
+
+    tool_check = check_tool_calling_rows(rows)
+    if tool_check.issue_count == 0:
+        result.stats.update(tool_check.stats)
+        return result
+
+    result.valid = False
+    result.errors.extend(tool_check.errors)
+    result.stats.update(tool_check.stats)
+    return result
+
+
+def _openai_format_check(rows: list[dict], *, max_errors: int = 20) -> ValidationResult:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not rows:
+        return ValidationResult(
+            valid=False,
+            format="unknown",
+            num_examples=0,
+            errors=["No trainable examples found (all datapoints lack output)."],
+        )
+
+    detected_format = _detect_format(rows)
+
+    for i, row in enumerate(rows, 1):
+        if len(errors) >= max_errors:
+            errors.append(f"... and more errors beyond example {i} (first {max_errors} shown).")
+            break
+
+        if not isinstance(row, dict):
+            errors.append(f"Example {i}: must be a JSON object, got {type(row).__name__}.")
+            continue
+
+        label = f"Example {i}"
+
+        if detected_format == "conversational" or "messages" in row:
+            errors.extend(_validate_conversational_row(label, row))
+        elif detected_format == "instruction" or ("prompt" in row and "completion" in row):
+            errors.extend(_validate_instruction_row(label, row))
+        else:
+            errors.append(
+                f"{label}: unrecognised format — row must have 'messages' or 'prompt'+'completion'."
+            )
+
+    if len(rows) < 10:
+        warnings.append(
+            f"Only {len(rows)} example(s). At least 10 are recommended for reliable results."
+        )
+
+    long = 0
+    if detected_format == "conversational":
+        threshold = _long_row_warning_threshold()
+        if threshold:
+            long = sum(1 for r in rows if approx_tokens(r) > threshold)
+            if long:
+                warnings.append(
+                    f"{long} example(s) may exceed {threshold:,} tokens — "
+                    "rows longer than the model's max fine-tuning context will fail "
+                    "pre-flight validation before training."
+                )
+
+    return ValidationResult(
+        valid=len(errors) == 0,
+        format=detected_format,
+        num_examples=len(rows),
+        errors=errors,
+        warnings=warnings,
+        stats={"total_examples": len(rows), "format": detected_format, "long_examples": long},
+    )
 
 
 def _validate_conversational_row(label: str, row: dict) -> list[str]:
@@ -507,13 +555,10 @@ def _validate_instruction_row(label: str, row: dict) -> list[str]:
     return issues
 
 
-_FORMAT_SAMPLE = 10
-
-
 def _detect_format(rows: list[dict]) -> str:
     if not rows:
         return "unknown"
-    sample = rows[:_FORMAT_SAMPLE]
+    sample = rows[:10]
     has_messages = sum(1 for r in sample if "messages" in r)
     has_prompt = sum(1 for r in sample if "prompt" in r and "completion" in r)
 

@@ -61,6 +61,7 @@ function InferencePage() {
     status,
   } = Route.useSearch();
   const navigate = Route.useNavigate();
+  const [ordering, setOrdering] = useState<string | undefined>();
   const [searchText, setSearchText] = useState(search);
   const debouncedSearch = useDebouncedValue(searchText, 400);
 
@@ -82,6 +83,7 @@ function InferencePage() {
 
   const { data, isLoading, error } = useDeployedModelsQuery({
     capability: capability === "all" ? undefined : capability,
+    ordering,
     page,
     pageSize,
     projectId,
@@ -103,8 +105,6 @@ function InferencePage() {
     patchFilters({ inf_capability: "all", inf_search: "", status: undefined });
   };
 
-  // No sortable headers: the backend's `ordering_fields` omit latency and
-  // tokens/sec (its `list()` shows medians, not the SQL means it would sort on).
   const columns: ColumnDef<DeployedModel>[] = [
     {
       accessorKey: "modelId",
@@ -117,7 +117,7 @@ function InferencePage() {
         />
       ),
       header: "Model",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "finetuning_job__name" },
       minSize: 160,
       size: 240,
     },
@@ -125,7 +125,7 @@ function InferencePage() {
       accessorKey: "baseModelId",
       cell: ({ row }) => <BaseModelCell baseModelId={row.original.baseModelId} />,
       header: "Base model",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "base_model_id" },
       minSize: 120,
       size: 150,
     },
@@ -141,7 +141,7 @@ function InferencePage() {
           DASH
         ),
       header: "Capability",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "finetuning_job__capability__name" },
       minSize: 120,
       size: 150,
     },
@@ -157,7 +157,7 @@ function InferencePage() {
         />
       ),
       header: "Training job",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "finetuning_job__name" },
       minSize: 120,
       size: 170,
     },
@@ -165,7 +165,7 @@ function InferencePage() {
       cell: ({ row }) => <CopyableModelRef modelId={row.original.modelId} />,
       header: "Reference",
       id: "reference",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "model_id" },
       minSize: 130,
       size: 180,
     },
@@ -173,7 +173,7 @@ function InferencePage() {
       accessorKey: "status",
       cell: ({ row }) => <ModelStatusCell id={row.original.id} status={row.original.status} />,
       header: "Status",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "status" },
       minSize: 110,
       size: 130,
     },
@@ -183,6 +183,7 @@ function InferencePage() {
         <span className={NUM_CELL}>{(row.original.requestCount ?? 0).toLocaleString()}</span>
       ),
       header: "Requests",
+      meta: { orderingField: "request_count" },
       minSize: 90,
       size: 110,
     },
@@ -190,6 +191,7 @@ function InferencePage() {
       accessorKey: "totalTokens",
       cell: ({ row }) => <span className={NUM_CELL}>{fmtInt(row.original.totalTokens)}</span>,
       header: "Tokens",
+      meta: { orderingField: "total_tokens" },
       minSize: 90,
       size: 110,
     },
@@ -199,6 +201,7 @@ function InferencePage() {
         <span className={NUM_CELL}>{fmtTps(row.original.avgTokensPerSecond)}</span>
       ),
       header: "Throughput",
+      meta: { orderingField: "avg_tokens_per_second" },
       minSize: 100,
       size: 120,
     },
@@ -206,6 +209,7 @@ function InferencePage() {
       accessorKey: "avgLatencyMs",
       cell: ({ row }) => <span className={NUM_CELL}>{fmtMs(row.original.avgLatencyMs)}</span>,
       header: "Latency",
+      meta: { orderingField: "avg_latency_ms" },
       minSize: 90,
       size: 110,
     },
@@ -217,6 +221,7 @@ function InferencePage() {
         </span>
       ),
       header: "Last active",
+      meta: { orderingField: "last_active_at" },
       minSize: 110,
       size: 140,
     },
@@ -251,6 +256,10 @@ function InferencePage() {
           hasActiveFilters={hasActiveFilters}
           isLoading={isLoading}
           onClearFilters={handleClearFilters}
+          onOrderingChange={(next) => {
+            setOrdering(next);
+            patchFilters({});
+          }}
           onPageChange={(p) =>
             navigate({
               replace: true,
@@ -273,6 +282,7 @@ function InferencePage() {
               to: "/inference/$modelId",
             });
           }}
+          ordering={ordering}
           page={page}
           pageSize={pageSize}
           rowClassName={(m) => (isDeleted(m) ? "cursor-default opacity-60" : undefined)}

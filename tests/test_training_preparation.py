@@ -1,3 +1,4 @@
+import gzip
 import json
 from datetime import timedelta
 from types import SimpleNamespace
@@ -6,23 +7,53 @@ from unittest.mock import Mock, patch
 import pytest
 from conftest import TRAIN_ROWS, frozen_dataset
 from django.utils import timezone
+from modal.exception import NotFoundError
 from rest_framework.test import APIClient
 
 from modal_shared.preparation import preparation_failure
-from modal_shared.training_data import materialize_tokens, row_key
-from overbae.models import FinetuningJob, FinetuningJobEval, Project, ProjectMembership, User
+from overbae.models import FinetuningJob, Project, ProjectMembership, User
 from overbae.services import training_preparation as preparation
 from overbae.services.datasets.lifecycle import DatasetError
+from overbae.services.plan_limits import usage_count
 from overbae.services.sft_assets.preprocess import preprocess_rows
 from overbae.tasks.finetuning import run_finetuning
 
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def preparation_volume(monkeypatch):
+    monkeypatch.setattr(preparation.training_release, "verify", lambda release: release)
+    uploaded = []
+
+    class Batch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, local, remote):
+            with gzip.open(local, "rt", encoding="utf-8") as source:
+                uploaded.append((remote, [json.loads(line) for line in source]))
+
+    monkeypatch.setattr(
+        preparation.modal.Volume,
+        "from_name",
+        Mock(
+            return_value=SimpleNamespace(
+                batch_upload=lambda **kwargs: Batch(), read_file=lambda _: iter([])
+            )
+        ),
+    )
+    return uploaded
+
+
 @pytest.fixture
-def cell(sft):
+def cell(settings):
+    settings.FINETUNING_BACKEND = "modal"
     project = Project.objects.create(name="Prep", slug="prep")
-    return frozen_dataset(project, TRAIN_ROWS).active_cell
+    return frozen_dataset(project, TRAIN_ROWS, contract="train").active_cell
 
 
 def test_exact_preprocessing_reports_tokens_targets_and_incompatible_rows():
@@ -48,15 +79,6 @@ def test_exact_preprocessing_reports_tokens_targets_and_incompatible_rows():
     assert {issue["row"] for issue in report["issues"]} == {1, 2, 3}
 
 
-def test_training_materializes_exact_artifact_and_refuses_unvalidated_rows():
-    row = TRAIN_ROWS[0]
-    tokenized = {"input_ids": [1, 2], "labels": [-100, 2]}
-    tokens = {row_key(row): tokenized}
-    assert list(materialize_tokens(json.dumps(row), tokens)) == [json.dumps(tokenized) + "\n"]
-    with pytest.raises(ValueError, match="validated"):
-        list(materialize_tokens(json.dumps(TRAIN_ROWS[1]), tokens))
-
-
 def test_preparation_caches_exact_version_and_configuration(cell):
     first = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     same = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
@@ -69,8 +91,8 @@ def test_preparation_caches_exact_version_and_configuration(cell):
     assert error.value.code == "workshop_validation"
 
 
-def test_preparation_verifies_each_target_once_then_rechecks_in_worker(cell, fake_modal):
-    validation = frozen_dataset(cell.dataset.project, TRAIN_ROWS).active_cell
+def test_preparation_verifies_each_target_once_then_rechecks_in_worker(cell, monkeypatch):
+    validation = frozen_dataset(cell.dataset.project, TRAIN_ROWS, contract="train").active_cell
     with patch.object(
         preparation.row_store, "verify", wraps=preparation.row_store.verify
     ) as verify:
@@ -80,10 +102,12 @@ def test_preparation_verifies_each_target_once_then_rechecks_in_worker(cell, fak
     assert [call.args[0].id for call in verify.call_args_list] == [cell.id, validation.id]
     validation.fingerprint = "tampered-after-request"
     validation.save(update_fields=["fingerprint"])
+    lookup = Mock()
+    monkeypatch.setattr(preparation.modal.Function, "from_name", lookup)
     preparation.advance(prep.id)
     prep.refresh_from_db()
     assert prep.state == "failed" and "changed" in prep.error
-    assert fake_modal.spawns() == []
+    lookup.assert_not_called()
 
 
 @pytest.mark.parametrize("problem", ["intent", "project"])
@@ -102,29 +126,92 @@ def test_preparation_keeps_validation_dataset_boundaries(cell, problem):
 
 def test_export_format_changes_invalidate_cached_preprocessing(cell, monkeypatch):
     first = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
-    monkeypatch.setattr(preparation, "data_format_fingerprint", lambda: "new-format")
+    monkeypatch.setattr(
+        preparation.training_release,
+        "current",
+        lambda: {**first.config["runtime"], "data_format": "new-format"},
+    )
     changed = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     assert changed.id != first.id
     assert changed.config["data_format"] == "new-format"
 
 
-def test_worker_reconnects_to_existing_call_without_spawning_again(cell, fake_modal):
+def test_worker_reconnects_to_existing_call_without_spawning_again(
+    cell, monkeypatch, preparation_volume
+):
     prep = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
+    spawn = Mock(return_value=SimpleNamespace(object_id="fc-prep"))
+    monkeypatch.setattr(
+        preparation.modal.Function, "from_name", Mock(return_value=SimpleNamespace(spawn=spawn))
+    )
+    poll = Mock(side_effect=[TimeoutError(), {"ready": True, "tokens": 20}])
+    monkeypatch.setattr(
+        preparation.modal.FunctionCall, "from_id", Mock(return_value=SimpleNamespace(get=poll))
+    )
+    with patch.object(
+        preparation.TrainingPreparation.objects,
+        "select_for_update",
+        wraps=preparation.TrainingPreparation.objects.select_for_update,
+    ) as lock:
+        preparation.advance(prep.id)
+    lock.assert_called_once_with(of=("self",))
     preparation.advance(prep.id)
-    preparation.advance(prep.id)
-    fake_modal.release("prepare_")
     preparation.advance(prep.id)
     prep.refresh_from_db()
-    assert len(fake_modal.spawns()) == 1
-    assert prep.state == "ready"
-    assert prep.remote_id in fake_modal.calls
-    assert prep.report["ready"] is True
+    assert spawn.call_count == 1 and prep.state == "ready" and prep.remote_id == "fc-prep"
+    assert prep.report["tokens"] == 20
+    assert len(preparation_volume) == 1
+    request = spawn.call_args.args[1]
+    assert "rows" not in request and request["rows_sha256"]
+    assert request["rows_path"].endswith(preparation_volume[0][0])
+
+
+def test_preparation_reports_exported_rows_before_upload(cell, monkeypatch):
+    prep = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
+    observed = []
+
+    class Batch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def put_file(self, _local, _remote):
+            prep.refresh_from_db()
+            observed.append(prep.report["progress"])
+
+    monkeypatch.setattr(
+        preparation.modal.Volume,
+        "from_name",
+        Mock(return_value=SimpleNamespace(batch_upload=lambda **_: Batch())),
+    )
+    monkeypatch.setattr(
+        preparation.modal.Function,
+        "from_name",
+        Mock(
+            return_value=SimpleNamespace(
+                spawn=Mock(return_value=SimpleNamespace(object_id="fc-prep"))
+            )
+        ),
+    )
+
+    preparation.advance(prep.id)
+    prep.refresh_from_db()
+    assert observed, prep.error
+    assert observed == [
+        {
+            "stage": "uploading",
+            "completed_rows": cell.rows,
+            "total_rows": cell.rows,
+        }
+    ]
 
 
 def test_uncertain_submission_and_expired_operations_fail_closed(cell):
     prep = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     prep.__class__.objects.filter(pk=prep.pk).update(
-        state="starting", touched_at=timezone.now() - timedelta(minutes=3)
+        state="starting", touched_at=timezone.now() - timedelta(minutes=31)
     )
     preparation.advance(prep.id)
     prep.refresh_from_db()
@@ -150,12 +237,16 @@ def test_uncertain_submission_and_expired_operations_fail_closed(cell):
     ],
 )
 def test_preparation_distinguishes_worker_failures_from_incompatible_data(
-    cell, fake_modal, report, state, error
+    cell, monkeypatch, report, state, error
 ):
     prep = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     prep.state, prep.remote_id = "running", "fc-prep"
     prep.save()
-    fake_modal.adopt("fc-prep", "prepare", state="done", result=report)
+    monkeypatch.setattr(
+        preparation.modal.FunctionCall,
+        "from_id",
+        Mock(return_value=SimpleNamespace(get=Mock(return_value=report))),
+    )
     preparation.advance(prep.id)
     prep.refresh_from_db()
     assert prep.state == state and error in prep.error
@@ -167,20 +258,27 @@ def test_processor_update_does_not_reuse_failed_preparation(cell, monkeypatch):
     previous = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     previous.state, previous.report = "failed", preparation_failure("worker_out_of_date")
     previous.save()
-    monkeypatch.setattr(preparation, "processor_fingerprint", lambda: "updated-processor")
+    monkeypatch.setattr(
+        preparation.training_release,
+        "current",
+        lambda: {**previous.config["runtime"], "processor": "updated-processor"},
+    )
     current = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     assert current.id != previous.id and current.state == "queued"
     previous.refresh_from_db()
     assert previous.state == "failed"
 
 
-def test_retry_cancels_confirmed_remote_attempt_and_preserves_uncertain_failures(cell, fake_modal):
+def test_retry_cancels_confirmed_remote_attempt_and_preserves_uncertain_failures(cell, monkeypatch):
     prep = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
     prep.state, prep.remote_id, prep.report = "failed", "fc-old", {"retryable": True}
     prep.save()
-    fake_modal.adopt("fc-old", "prepare")
+    cancel = Mock()
+    monkeypatch.setattr(
+        preparation.modal.FunctionCall, "from_id", Mock(return_value=SimpleNamespace(cancel=cancel))
+    )
     preparation.retry_preparation(prep)
-    assert [call for call, _ in fake_modal.cancelled] == ["fc-old"]
+    cancel.assert_called_once()
     assert prep.state == "queued" and not prep.remote_id and not prep.report
 
 
@@ -196,7 +294,16 @@ def test_preparation_api_is_project_scoped_and_does_not_start_training(cell, mon
     body = {"dataset": str(cell.dataset_id), "model": "Qwen/Qwen3-8B", "context_length": 4096}
     response = client.post("/api/training-preparations/", body, format="json")
     assert response.status_code == 202, response.data
-    queue.assert_called_once()
+    job = FinetuningJob.objects.get(pk=response.data["training_job"])
+    assert job.status == "preprocessing" and str(job.preparation_id) == response.data["id"]
+    assert job.triggered_by == user and not job.requested_configuration
+    repeated = client.post("/api/training-preparations/", body, format="json")
+    assert repeated.data["training_job"] == str(job.pk)
+    assert FinetuningJob.objects.count() == 1
+    listed = client.get("/api/finetuning-jobs/runs/", {"project": str(cell.dataset.project_id)})
+    assert listed.status_code == 200, listed.data
+    assert listed.data["results"][0]["jobs"][0]["id"] == str(job.pk)
+    assert queue.call_count == 2
     assert client.get(f"/api/training-preparations/{response.data['id']}/").status_code == 200
     failure = preparation_failure("worker_out_of_date")
     preparation.TrainingPreparation.objects.filter(pk=response.data["id"]).update(
@@ -210,6 +317,105 @@ def test_preparation_api_is_project_scoped_and_does_not_start_training(cell, mon
     assert client.post("/api/training-preparations/", body, format="json").status_code == 404
 
 
+def test_preparation_job_waits_for_launch_and_promotes_once(cell, monkeypatch, settings):
+    settings.STRIPE_SECRET_KEY = ""
+    user = User.objects.create_user(email="setup-launch@example.test", password="test")
+    ProjectMembership.objects.create(project=cell.dataset.project, user=user)
+    client = APIClient()
+    client.force_authenticate(user)
+    submit = Mock(return_value=SimpleNamespace(id="training-task"))
+    monkeypatch.setattr(run_finetuning, "apply_async", submit)
+    prep = preparation.begin_preparation(cell, "Qwen/Qwen3-8B", 4096, user=user)
+    job = prep.training_jobs.get()
+    assert usage_count(user, "training_jobs") == 0
+    assert run_finetuning(job_id=str(job.pk)) == {"status": "preprocessing"}
+    prep.state = "ready"
+    prep.report = {"ready": True}
+    prep.save()
+    preparation.sync_setup_jobs(prep)
+    job.refresh_from_db()
+    assert job.status == "awaiting_launch"
+    assert run_finetuning(job_id=str(job.pk)) == {"status": "awaiting_launch"}
+    submit.assert_not_called()
+    launch = {
+        "project": str(cell.dataset.project_id),
+        "dataset": str(cell.dataset_id),
+        "cell": str(cell.pk),
+        "base_model": "Qwen/Qwen3-8B",
+        "hyperparameters": {"context_length": 4096},
+        "eval_model_before": False,
+        "eval_model_after": False,
+        "request_key": "setup-launch",
+    }
+    response = client.post("/api/finetuning-jobs/", launch, format="json")
+    assert response.status_code == 201, response.data
+    assert response.data["id"] == str(job.pk)
+    assert response.data["status"] == "queued"
+    repeated = client.post("/api/finetuning-jobs/", launch, format="json")
+    assert repeated.status_code == 201, repeated.data
+    assert repeated.data["id"] == str(job.pk)
+    assert FinetuningJob.objects.count() == 1
+    submit.assert_called_once()
+    preparation.sync_setup_jobs(prep)
+    job.refresh_from_db()
+    assert job.status == "queued" and job.requested_configuration
+    assert usage_count(user, "training_jobs") == 1
+    changed = {**launch, "hyperparameters": {"context_length": 8192}}
+    assert client.post("/api/finetuning-jobs/", changed, format="json").status_code == 400
+
+
+def test_failed_setup_retry_and_cancel_cannot_dispatch_training(cell, monkeypatch, settings):
+    settings.STRIPE_SECRET_KEY = ""
+    user = User.objects.create_user(email="setup-retry@example.test", password="test")
+    ProjectMembership.objects.create(project=cell.dataset.project, user=user)
+    client = APIClient()
+    client.force_authenticate(user)
+    submit, inspect = Mock(), Mock()
+    monkeypatch.setattr(run_finetuning, "apply_async", submit)
+    monkeypatch.setattr("overbae.tasks.training_preparation.inspect_preparation.delay", inspect)
+    prep = preparation.begin_preparation(cell, "Qwen/Qwen3-8B", 4096, user=user)
+    job = prep.training_jobs.get()
+    prep.state, prep.error, prep.report = "failed", "Worker unavailable", {"retryable": True}
+    prep.save()
+    preparation.sync_setup_jobs(prep)
+    job.refresh_from_db()
+    assert job.status == "failed" and job.error_message == "Worker unavailable"
+    retried = client.post(f"/api/finetuning-jobs/{job.pk}/retry/")
+    assert retried.status_code == 200, retried.data
+    assert retried.data["status"] == "preprocessing"
+    inspect.assert_called_once_with(str(prep.pk))
+    cancelled = client.post(f"/api/finetuning-jobs/{job.pk}/cancel/")
+    assert cancelled.status_code == 200, cancelled.data
+    prep.refresh_from_db()
+    preparation.sync_setup_jobs(prep)
+    job.refresh_from_db()
+    assert job.status == "cancelled"
+    submit.assert_not_called()
+
+
+@pytest.mark.parametrize("context_length", [128, 5000])
+def test_preparation_api_rejects_settings_that_would_be_changed(cell, monkeypatch, context_length):
+    user = User.objects.create_user(email="prep-context@example.test", password="test")
+    ProjectMembership.objects.create(project=cell.dataset.project, user=user)
+    client = APIClient()
+    client.force_authenticate(user)
+    queue = Mock()
+    monkeypatch.setattr("overbae.api.training_preparation.inspect_preparation.delay", queue)
+    response = client.post(
+        "/api/training-preparations/",
+        {
+            "dataset": str(cell.dataset_id),
+            "model": "Qwen/Qwen3-8B",
+            "context_length": context_length,
+        },
+        format="json",
+    )
+    assert response.status_code == 400, response.data
+    assert "context_length" in str(response.data)
+    assert not preparation.TrainingPreparation.objects.exists()
+    queue.assert_not_called()
+
+
 @pytest.fixture
 def retry_job(cell, monkeypatch, settings):
     settings.STRIPE_SECRET_KEY = ""
@@ -218,6 +424,7 @@ def retry_job(cell, monkeypatch, settings):
     )
     ProjectMembership.objects.create(project=cell.dataset.project, user=user)
     job = FinetuningJob.objects.create(
+        requested_configuration={"runtime": preparation.training_release.current()},
         project=cell.dataset.project,
         dataset=cell.dataset,
         cell=cell,
@@ -230,18 +437,23 @@ def retry_job(cell, monkeypatch, settings):
     )
     queue = Mock(return_value=SimpleNamespace(id="training-task"))
     monkeypatch.setattr("overbae.tasks.finetuning.run_finetuning.apply_async", queue)
-    FinetuningJobEval.objects.create(job=job, kind="model_before", status="failed")
+    reset_evals = Mock()
+    monkeypatch.setattr(
+        "overbae.services.finetuning_eval.reset_before_evals_for_retry", reset_evals
+    )
     client = APIClient()
     client.force_authenticate(user)
-    return job, client, queue
+    return job, client, queue, reset_evals
 
 
-def test_training_retry_recovers_cached_missing_function_failure(retry_job, fake_modal):
-    job, client, queue = retry_job
+def test_training_retry_recovers_cached_missing_function_failure(retry_job, monkeypatch):
+    job, client, queue, _ = retry_job
     prep = preparation.for_job(job)
     old_deadline = prep.deadline
-    missing = dict(fake_modal.handlers)
-    fake_modal.handlers.clear()
+    spawn = Mock(side_effect=NotFoundError("prepare_sft_u2026_8_18 not found"))
+    monkeypatch.setattr(
+        preparation.modal.Function, "from_name", Mock(return_value=SimpleNamespace(spawn=spawn))
+    )
     preparation.advance(prep.id)
     prep.refresh_from_db()
     assert prep.state == "failed" and prep.report["retryable"]
@@ -257,15 +469,17 @@ def test_training_retry_recovers_cached_missing_function_failure(retry_job, fake
     assert job.status == "queued" and not job.error_message
     queue.assert_called_once_with(kwargs={"job_id": str(job.id)})
 
-    fake_modal.handlers.update(missing)
+    spawn.side_effect = None
+    spawn.return_value = SimpleNamespace(object_id="fc-prepared")
     preparation.advance(prep.id)
     prep.refresh_from_db()
-    assert prep.state == "running" and prep.remote_id in fake_modal.calls
+    assert prep.state == "running" and prep.remote_id == "fc-prepared"
+    assert spawn.call_count == 2
 
 
 @pytest.mark.parametrize("state", ["ready", "queued", "starting", "running"])
 def test_training_retry_preserves_usable_or_inflight_preparation(retry_job, state):
-    job, client, queue = retry_job
+    job, client, queue, _ = retry_job
     prep = preparation.for_job(job)
     prep.state, prep.remote_id, prep.report = state, "fc-existing", {"tokens": 100}
     prep.save()
@@ -280,7 +494,7 @@ def test_training_retry_preserves_usable_or_inflight_preparation(retry_job, stat
 
 @pytest.mark.parametrize("state", ["failed", "incompatible"])
 def test_training_retry_does_not_requeue_unsafe_or_incompatible_preparation(retry_job, state):
-    job, client, queue = retry_job
+    job, client, queue, reset_evals = retry_job
     prep = preparation.for_job(job)
     prep.state, prep.report = state, {"retryable": False}
     prep.save()
@@ -291,22 +505,25 @@ def test_training_retry_does_not_requeue_unsafe_or_incompatible_preparation(retr
     assert prep.state == state and job.status == "failed"
     assert job.error_message == "Original preprocessing error"
     queue.assert_not_called()
-    assert job.job_evals.filter(kind="model_before", status="failed").exists()
+    reset_evals.assert_not_called()
 
 
-def test_preparation_retry_skips_a_job_whose_training_was_submitted(retry_job):
-    job, _, _ = retry_job
-    job.remote_job_id = "fc-training"
-    before = preparation.TrainingPreparation.objects.count()
-    preparation.retry_for_job(job)
-    assert preparation.TrainingPreparation.objects.count() == before
+@pytest.mark.parametrize("remote", ["fc-training", ""])
+def test_preparation_retry_skips_submitted_training_or_other_backends(retry_job, settings, remote):
+    job, _, _, _ = retry_job
+    job.remote_job_id = remote
+    if not remote:
+        settings.FINETUNING_BACKEND = "together"
+    with patch.object(preparation, "for_job") as request:
+        preparation.retry_for_job(job)
+    request.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "model", ["Qwen/Qwen3-8B", "Qwen/Qwen3.5-27B", "meta-llama/Llama-3.1-8B-Instruct"]
 )
 def test_job_preparation_sizes_pinned_rows_despite_smaller_requested_context(retry_job, model):
-    job, _, _ = retry_job
+    job, _, _, _ = retry_job
     job.base_model = model
     job.cell.stats = {**job.cell.stats, "max_token_length": 7145}
     prep = preparation.for_job(job)
@@ -317,8 +534,8 @@ def test_job_preparation_sizes_pinned_rows_despite_smaller_requested_context(ret
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_job_preparation_includes_only_enabled_validation_rows(retry_job, enabled):
-    job, _, _ = retry_job
-    validation = frozen_dataset(job.project, TRAIN_ROWS).active_cell
+    job, _, _, _ = retry_job
+    validation = frozen_dataset(job.project, TRAIN_ROWS, contract="train").active_cell
     validation.stats = {**validation.stats, "max_token_length": 10_000}
     job.validation_enabled = enabled
     job.validation_cell = validation
@@ -328,7 +545,7 @@ def test_job_preparation_includes_only_enabled_validation_rows(retry_job, enable
 
 
 def test_exact_overflow_requests_matching_larger_artifact_before_training(retry_job):
-    job, _, _ = retry_job
+    job, _, _, _ = retry_job
     first = preparation.for_job(job)
     first.state = "incompatible"
     first.report = {"max_tokens": 7190, "incompatible_rows": 3}
@@ -346,7 +563,7 @@ def test_exact_overflow_requests_matching_larger_artifact_before_training(retry_
 
 
 def test_training_retry_recovers_undersized_context_through_normal_queue(retry_job):
-    job, client, queue = retry_job
+    job, client, queue, _ = retry_job
     first = preparation.for_job(job)
     first.state, first.report = "incompatible", {"max_tokens": 7190, "incompatible_rows": 3}
     first.save()
@@ -358,28 +575,91 @@ def test_training_retry_recovers_undersized_context_through_normal_queue(retry_j
     queue.assert_called_once_with(kwargs={"job_id": str(job.id)})
 
 
-def test_training_waits_for_resized_preparation_without_submitting_gpu_work(retry_job, fake_modal):
-    job, _, queue = retry_job
+def test_training_waits_for_resized_preparation_without_submitting_gpu_work(retry_job):
+    job, _, queue, _ = retry_job
     job.status = "queued"
     job.save(update_fields=["status"])
     first = preparation.for_job(job)
     first.state, first.report = "incompatible", {"max_tokens": 7190, "incompatible_rows": 3}
     first.save()
-    with patch("overbae.tasks.finetuning.inspect_preparation.delay") as inspect:
+    with (
+        patch("overbae.services.finetuning_runner.get_runner") as runner,
+        patch("overbae.tasks.finetuning.inspect_preparation.delay") as inspect,
+    ):
         result = run_finetuning(job_id=str(job.id))
     resized = preparation.for_job(job)
     assert result["status"] == "preparing"
     inspect.assert_called_once_with(str(resized.id))
-    assert fake_modal.spawns() == []
+    queue.assert_called_once_with(kwargs={"job_id": str(job.id)}, countdown=15)
+    runner.return_value.submit.assert_not_called()
     job.refresh_from_db()
-    queue.assert_called_once_with(
-        kwargs={"job_id": str(job.id)}, countdown=15, task_id=job.celery_task_id
-    )
     assert job.status == "preparing" and not job.remote_job_id
 
 
+def test_training_reports_configuration_check_before_exact_preprocessing(retry_job):
+    job, _, _, _ = retry_job
+    job.status = "queued"
+    job.save(update_fields=["status"])
+    observed = []
+    original = preparation.for_job
+
+    def inspect_start(current):
+        current.refresh_from_db()
+        observed.append((current.status, current.progress.get("stage")))
+        return original(current)
+
+    with (
+        patch("overbae.services.finetuning_runner.get_runner"),
+        patch("overbae.tasks.finetuning.for_job", side_effect=inspect_start),
+        patch("overbae.tasks.finetuning.inspect_preparation.delay"),
+    ):
+        assert run_finetuning(job_id=str(job.id))["status"] == "preparing"
+    assert observed == [("preparing", "checking_training_configuration")]
+
+
+def test_live_training_metrics_include_preprocessing_counts(retry_job):
+    job, client, _, _ = retry_job
+    job.status = "preparing"
+    job.progress = {
+        "preparation": {
+            "state": "running",
+            "stage": "tokenizing",
+            "completed_rows": 250,
+            "total_rows": 1000,
+        }
+    }
+    job.save(update_fields=["status", "progress"])
+
+    response = client.get(f"/api/finetuning-jobs/{job.id}/loss-curves/")
+    assert response.status_code == 200
+    assert response.data["progress"]["preparation"]["completed_rows"] == 250
+
+
+def test_live_training_metrics_read_newer_preprocessing_counts(retry_job):
+    job, client, _, _ = retry_job
+    prep = preparation.for_job(job)
+    prep.state = "running"
+    prep.report = {"progress": {"stage": "tokenizing", "completed_rows": 500, "total_rows": 1000}}
+    prep.save(update_fields=["state", "report"])
+    job.status = "preparing"
+    job.progress = {
+        "preparation": {
+            "id": str(prep.id),
+            "state": "running",
+            "stage": "tokenizing",
+            "completed_rows": 250,
+            "total_rows": 1000,
+        }
+    }
+    job.save(update_fields=["status", "progress"])
+
+    response = client.get(f"/api/finetuning-jobs/{job.id}/loss-curves/")
+    assert response.status_code == 200
+    assert response.data["progress"]["preparation"]["completed_rows"] == 500
+
+
 def test_resizing_does_not_accept_other_incompatibilities(retry_job):
-    job, _, queue = retry_job
+    job, _, queue, _ = retry_job
     first = preparation.for_job(job)
     first.state, first.report = "incompatible", {"max_tokens": 7190, "incompatible_rows": 3}
     first.save()
@@ -398,7 +678,7 @@ def test_resizing_does_not_accept_other_incompatibilities(retry_job):
 
 @pytest.mark.parametrize("extra_tokens", [0, 1])
 def test_exact_sizing_respects_training_limit_without_estimate_headroom(retry_job, extra_tokens):
-    job, _, _ = retry_job
+    job, _, _, _ = retry_job
     maximum = preparation.training_context_length(
         preparation.get_model_config_any_backend(job.base_model), "lora"
     )
@@ -417,10 +697,59 @@ def test_exact_sizing_respects_training_limit_without_estimate_headroom(retry_jo
 
 
 def test_overestimated_lengths_do_not_reject_data_before_exact_preparation(retry_job):
-    job, _, _ = retry_job
+    job, _, _, _ = retry_job
     job.cell.stats = {**job.cell.stats, "max_token_length": 2_000_000}
     current = preparation.for_job(job)
     maximum = preparation.training_context_length(
         preparation.get_model_config_any_backend(job.base_model), "lora"
     )
     assert current.config["context_length"] == maximum and current.state == "queued"
+
+
+def test_preparation_timeout_exposes_committed_counters_without_restarting(cell, monkeypatch):
+    prep = preparation.request_preparation(cell, "Qwen/Qwen3-8B", 4096)
+    prep.state, prep.remote_id = "running", "fc-existing"
+    prep.save()
+    monkeypatch.setattr(
+        preparation.modal.FunctionCall,
+        "from_id",
+        Mock(return_value=SimpleNamespace(get=Mock(side_effect=TimeoutError()))),
+    )
+    monkeypatch.setattr(
+        preparation.modal.Volume,
+        "from_name",
+        Mock(
+            return_value=SimpleNamespace(
+                read_file=lambda _: iter(
+                    [
+                        json.dumps(
+                            {
+                                "stage": "tokenizing",
+                                "completed_rows": 1,
+                                "reused_rows": 1,
+                                "committed_shards": 1,
+                                "updated_at": 123,
+                            }
+                        ).encode()
+                    ]
+                )
+            )
+        ),
+    )
+    preparation.advance(prep.id)
+    prep.refresh_from_db()
+    assert prep.state == "running" and prep.remote_id == "fc-existing"
+    assert prep.report["progress"]["completed_rows"] == 1
+    assert prep.report["progress"]["total_rows"] == cell.rows
+
+
+def test_exact_preparation_never_expands_an_explicit_frozen_recipe(retry_job):
+    job, _, _, _ = retry_job
+    job.requested_configuration["configuration"] = {"hyperparameters": {"context_length": 4096}}
+    job.save(update_fields=["requested_configuration"])
+    job.cell.stats = {**job.cell.stats, "max_token_length": 7145}
+    first = preparation.for_job(job)
+    assert first.config["context_length"] == 4096
+    first.state, first.report = "incompatible", {"max_tokens": 7190, "incompatible_rows": 3}
+    first.save()
+    assert preparation.for_job(job).id == first.id

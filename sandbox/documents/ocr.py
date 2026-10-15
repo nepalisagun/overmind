@@ -5,104 +5,80 @@ import io
 import math
 import os
 import subprocess
-import tempfile
 import time
+from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from tempfile import TemporaryDirectory
 
 import pypdfium2 as pdfium
+from docling_core.types.doc import BoundingBox, DoclingDocument
 from PIL import Image, ImageDraw, ImageOps
 
-PAGE_SECONDS = 60
-DOCUMENT_SECONDS = 1200
+PAGE_TIMEOUT = 60
+DOCUMENT_TIMEOUT = 1200
 MAX_PIXELS = 16_000_000
 MAX_EDGE = 8000
 MAX_INPUT_PIXELS = 64_000_000
-LANGUAGES = ["eng"]
-
-UNAVAILABLE = (
-    "Reading text from images is not available on this server. Install Tesseract with "
-    "English and orientation data."
-)
-PAGE_TIMEOUT = "Reading text from the images took too long. Split the document into smaller files."
-DOCUMENT_TIMEOUT = "Reading text from the images took too long. Retry the import."
-FAILED = (
-    "Text could not be read from this document's images. Check the server's Tesseract "
-    "installation and language data."
-)
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 
 class OcrError(ValueError):
     pass
 
 
-def _tesseract(args: list[str], timeout: float) -> str:
+def _tesseract(arguments: list[str], *, timeout: float) -> str:
     try:
-        done = subprocess.run(
-            ["tesseract", *args],
+        return subprocess.run(
+            ["tesseract", *arguments],
             capture_output=True,
             text=True,
             encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
             check=True,
+            timeout=timeout,
             env={**os.environ, "OMP_THREAD_LIMIT": "1"},
-        )
+        ).stdout
     except FileNotFoundError as exc:
-        raise OcrError(UNAVAILABLE) from exc
+        raise OcrError(
+            "OCR is unavailable on this worker. Install Tesseract with English and orientation data. "
+            "No partial source was landed."
+        ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise OcrError(PAGE_TIMEOUT) from exc
+        raise OcrError(
+            "OCR timed out. Split the document into smaller files and retry. "
+            "No partial source was landed."
+        ) from exc
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise OcrError(FAILED) from exc
-    return done.stdout
+        raise OcrError(
+            "OCR could not process this document. Check the worker's Tesseract installation "
+            "and language data. No partial source was landed."
+        ) from exc
 
 
-def _engine() -> dict[str, Any]:
-    first = _tesseract(["--version"], 10).splitlines()[0]
-    return {
-        "engine": "tesseract",
-        "version": first.removeprefix("tesseract "),
-        "languages": LANGUAGES,
-    }
-
-
-def _scaled(width: float, height: float, ceiling: float) -> float:
-    return min(ceiling, math.sqrt(MAX_PIXELS / (width * height)), MAX_EDGE / max(width, height))
-
-
-def _lines(
-    png: Path, page: int, scale_x: float, scale_y: float, engine: dict, timeout: float
-) -> list[dict[str, Any]]:
-    tsv = _tesseract([str(png), "stdout", "-l", "+".join(LANGUAGES), "--psm", "1", "tsv"], timeout)
-    groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
+def _lines(tsv: str, *, page: int, scale_x: float, scale_y: float, engine: dict) -> list[dict]:
+    lines = defaultdict(list)
     for word in csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE):
-        if word.get("level") == "5" and (word.get("text") or "").strip():
-            groups.setdefault((word["block_num"], word["par_num"], word["line_num"]), []).append(
-                word
-            )
+        if word["level"] == "5" and word["text"].strip():
+            lines[(word["block_num"], word["par_num"], word["line_num"])].append(word)
     rows = []
-    for (block, paragraph, line), words in groups.items():
-        lefts = [int(w["left"]) for w in words]
-        tops = [int(w["top"]) for w in words]
-        rights = [int(w["left"]) + int(w["width"]) for w in words]
-        bottoms = [int(w["top"]) + int(w["height"]) for w in words]
+    for key, words in lines.items():
         bbox = {
-            "l": min(lefts) * scale_x,
-            "t": min(tops) * scale_y,
-            "r": max(rights) * scale_x,
-            "b": max(bottoms) * scale_y,
+            "l": min(int(word["left"]) for word in words) * scale_x,
+            "t": min(int(word["top"]) for word in words) * scale_y,
+            "r": max(int(word["left"]) + int(word["width"]) for word in words) * scale_x,
+            "b": max(int(word["top"]) + int(word["height"]) for word in words) * scale_y,
             "coord_origin": "TOPLEFT",
         }
         rows.append(
             {
-                "text": " ".join(w["text"].strip() for w in words),
-                "element": f"ocr:{page}:{block}:{paragraph}:{line}",
+                "text": " ".join(word["text"] for word in words),
+                "element": f"ocr:{page}:{':'.join(key)}",
                 "page": page,
                 "regions": [{"page": page, "bbox": bbox}],
                 "extraction": {
+                    **engine,
                     "method": "tesseract-ocr",
-                    "version": engine["version"],
-                    "confidence": round(sum(float(w["conf"]) for w in words) / len(words), 2),
+                    "confidence": round(sum(float(word["conf"]) for word in words) / len(words), 2),
                 },
             }
         )
@@ -110,104 +86,168 @@ def _lines(
 
 
 def extract_image(path: Path) -> tuple[list[dict], dict]:
-    try:
-        with Image.open(path) as opened:
-            if opened.format not in ("PNG", "JPEG", "WEBP"):
-                raise OcrError("Use a PNG, JPEG or WebP image.")
-            if opened.width * opened.height > MAX_INPUT_PIXELS:
-                raise OcrError("Images are capped at 64 megapixels. Resize the image and retry.")
-            if getattr(opened, "is_animated", False):
-                raise OcrError("Animated images are not supported. Upload a still image.")
-            image = ImageOps.exif_transpose(opened)
-            image.load()
-        width, height = image.size
-        factor = min(1.0, _scaled(width, height, 1.0))
-        if factor < 1:
-            image.thumbnail((int(width * factor), int(height * factor)), Image.Resampling.LANCZOS)
-        # Transparent pixels would otherwise turn black and hide dark text.
-        canvas = Image.new("RGB", image.size, "white")
-        rgba = image.convert("RGBA")
-        canvas.paste(rgba, mask=rgba.getchannel("A"))
-    except Image.DecompressionBombError as exc:
-        raise OcrError("Images are capped at 64 megapixels. Resize the image and retry.") from exc
-    except OcrError:
-        raise
-    except (OSError, ValueError, SyntaxError) as exc:
-        raise OcrError("The image could not be read. Export it again and upload it.") from exc
-    engine = _engine()
-    with tempfile.TemporaryDirectory(prefix="ocr-") as scratch:
-        png = Path(scratch) / "page.png"
-        canvas.save(png)
-        rows = _lines(png, 1, width / canvas.width, height / canvas.height, engine, PAGE_SECONDS)
+    with TemporaryDirectory(prefix="workshop-ocr-") as tmp:
+        image_path = Path(tmp) / "image.png"
+        try:
+            with Image.open(path) as original:
+                if original.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise OcrError("Use a PNG, JPEG or WebP image.")
+                if original.width * original.height > MAX_INPUT_PIXELS:
+                    raise OcrError(
+                        "Images are capped at 64 megapixels. Resize the image and retry."
+                    )
+                if getattr(original, "is_animated", False):
+                    raise OcrError("Animated images are not supported. Upload a still image.")
+                orientation = original.getexif().get(274, 1)
+                with ImageOps.exif_transpose(original) as image:
+                    width, height = image.size
+                    scale = min(
+                        1, math.sqrt(MAX_PIXELS / (width * height)), MAX_EDGE / max(width, height)
+                    )
+                    image.thumbnail(
+                        (max(1, int(width * scale)), max(1, int(height * scale))),
+                        Image.Resampling.LANCZOS,
+                    )
+                    rendered_width, rendered_height = image.size
+                    # Transparent screenshot pixels must not turn black during OCR.
+                    with (
+                        image.convert("RGBA") as rgba,
+                        Image.new("RGB", image.size, "white") as rgb,
+                    ):
+                        with rgba.getchannel("A") as alpha:
+                            rgb.paste(rgba, mask=alpha)
+                        rgb.save(image_path)
+        except OcrError:
+            raise
+        except Image.DecompressionBombError as exc:
+            raise OcrError(
+                "Images are capped at 64 megapixels. Resize the image and retry."
+            ) from exc
+        except (OSError, ValueError, SyntaxError) as exc:
+            raise OcrError(
+                "The image could not be read. Export it again and retry. No partial source was landed."
+            ) from exc
+        engine = {
+            "engine": "tesseract",
+            "version": _tesseract(["--version"], timeout=10)
+            .splitlines()[0]
+            .removeprefix("tesseract "),
+            "languages": ["eng"],
+            "image": {
+                "width": width,
+                "height": height,
+                "exif_orientation": orientation,
+                "coordinate_space": "exif-oriented-pixels",
+                "ocr_width": rendered_width,
+                "ocr_height": rendered_height,
+            },
+        }
+        tsv = _tesseract(
+            [str(image_path), "stdout", "-l", "eng", "--psm", "1", "tsv"],
+            timeout=PAGE_TIMEOUT,
+        )
+        rows = _lines(
+            tsv,
+            page=1,
+            scale_x=width / rendered_width,
+            scale_y=height / rendered_height,
+            engine=engine,
+        )
     return rows, {**engine, "pages": [1]}
 
 
-def _bottom_left_to_top(bbox: dict, height: float) -> tuple[float, float, float, float]:
-    if bbox.get("coord_origin") == "TOPLEFT":
-        return bbox["l"], bbox["t"], bbox["r"], bbox["b"]
-    return bbox["l"], height - bbox["t"], bbox["r"], height - bbox["b"]
-
-
-def extract_pdf(path: Path, document, native_rows: list[dict]) -> tuple[list[dict], dict | None]:
-    """OCR for pages with no native text and pages that hold pictures. Native text is
-    painted out first so it is not read twice."""
-    pages = {number: page.size for number, page in document.pages.items()}
-    with_text = {row["page"] for row in native_rows if row.get("page")}
-    with_pictures = {prov.page_no for picture in document.pictures for prov in picture.prov}
-    targets = sorted((set(pages) - with_text) | (with_pictures & set(pages)))
-    if not targets:
+def extract_pdf(
+    path: Path,
+    document: DoclingDocument,
+    native_rows: list[dict],
+    *,
+    on_progress: Callable[[dict], None] | None = None,
+) -> tuple[list[dict], dict | None]:
+    text_pages = {row["page"] for row in native_rows}
+    image_pages = {ref.page_no for picture in document.pictures for ref in picture.prov}
+    pages = sorted((set(document.pages) - text_pages) | image_pages)
+    if not pages:
         return [], None
-    engine = _engine()
-    deadline = time.monotonic() + DOCUMENT_SECONDS
-    masks: dict[int, list[tuple[float, float, float, float]]] = {}
+
+    def progress(completed):
+        if on_progress:
+            on_progress(
+                {
+                    "stage": "ocr",
+                    "pages_total": len(document.pages),
+                    "ocr_pages_total": len(pages),
+                    "ocr_pages_completed": completed,
+                }
+            )
+
+    progress(0)
+    engine = {
+        "engine": "tesseract",
+        "version": _tesseract(["--version"], timeout=10).splitlines()[0].removeprefix("tesseract "),
+        "languages": ["eng"],
+    }
+    native_boxes = defaultdict(list)
     for row in native_rows:
-        for region in row.get("regions") or []:
-            size = pages.get(region["page"])
-            if size is not None:
-                masks.setdefault(region["page"], []).append(
-                    _bottom_left_to_top(region["bbox"], size.height)
+        for ref in row["regions"]:
+            native_boxes[ref["page"]].append(
+                BoundingBox.model_validate(ref["bbox"]).to_top_left_origin(
+                    page_height=document.pages[ref["page"]].size.height
                 )
-    rows: list[dict] = []
-    pdf = pdfium.PdfDocument(str(path))
+            )
+    rows = []
+    deadline = time.monotonic() + DOCUMENT_TIMEOUT
     try:
-        with tempfile.TemporaryDirectory(prefix="ocr-") as scratch:
-            for number in targets:
-                if time.monotonic() > deadline:
-                    raise OcrError(DOCUMENT_TIMEOUT)
-                size = pages[number]
-                page = pdf[number - 1]
-                try:
-                    image = (
-                        page.render(scale=_scaled(size.width, size.height, 3.0))
-                        .to_pil()
-                        .convert("RGB")
-                    )
-                finally:
-                    page.close()
-                scale_x, scale_y = size.width / image.width, size.height / image.height
-                draw = ImageDraw.Draw(image)
-                for left, top, right, bottom in masks.get(number, []):
-                    draw.rectangle(
-                        [
-                            (left - 1) / scale_x,
-                            (top - 1) / scale_y,
-                            (right + 1) / scale_x,
-                            (bottom + 1) / scale_y,
-                        ],
-                        fill="white",
-                    )
-                png = Path(scratch) / f"{number}.png"
-                image.save(png)
+        # Landing runs in the prefork batch worker: PDFium must not be shared across threads.
+        with pdfium.PdfDocument(path) as pdf, TemporaryDirectory(prefix="workshop-ocr-") as tmp:
+            image_path = Path(tmp) / "page.png"
+            for completed, number in enumerate(pages, start=1):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise OcrError(DOCUMENT_TIMEOUT)
-                rows.extend(
-                    _lines(png, number, scale_x, scale_y, engine, min(PAGE_SECONDS, remaining))
+                    raise OcrError("OCR timed out. No partial source was landed.")
+                page = pdf[number - 1]
+                try:
+                    width, height = page.get_size()
+                    scale = min(
+                        3, math.sqrt(MAX_PIXELS / (width * height)), MAX_EDGE / max(width, height)
+                    )
+                    bitmap = page.render(scale=scale)
+                    try:
+                        image = bitmap.to_pil().convert("RGB")
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+                try:
+                    size = document.pages[number].size
+                    scale_x, scale_y = size.width / image.width, size.height / image.height
+                    draw = ImageDraw.Draw(image)
+                    # Mask native glyphs before recognition so OCR cannot duplicate or replace them.
+                    for box in native_boxes[number]:
+                        draw.rectangle(
+                            (
+                                (box.l - 1) / scale_x,
+                                (box.t - 1) / scale_y,
+                                (box.r + 1) / scale_x,
+                                (box.b + 1) / scale_y,
+                            ),
+                            fill="white",
+                        )
+                    image.save(image_path)
+                finally:
+                    image.close()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OcrError("OCR timed out. No partial source was landed.")
+                tsv = _tesseract(
+                    [str(image_path), "stdout", "-l", "eng", "--psm", "1", "tsv"],
+                    timeout=min(PAGE_TIMEOUT, remaining),
                 )
+                rows.extend(
+                    _lines(tsv, page=number, scale_x=scale_x, scale_y=scale_y, engine=engine)
+                )
+                progress(completed)
     except OcrError:
         raise
-    except Exception as exc:  # noqa: BLE001 — any renderer failure is one refusal
-        raise OcrError("The PDF's pages could not be read as images.") from exc
-    finally:
-        pdf.close()
-    return rows, {**engine, "pages": targets}
+    except Exception as exc:
+        raise OcrError("The PDF could not be read for OCR. No partial source was landed.") from exc
+    return rows, {**engine, "pages": pages}

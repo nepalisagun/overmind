@@ -1,4 +1,4 @@
-"""A dataset's settings, and what may be deleted."""
+"""Edits to the chain and the dataset's settings, and what may be deleted."""
 
 from __future__ import annotations
 
@@ -9,66 +9,61 @@ from django.db import transaction
 from django.utils import timezone
 
 from overbae.models import Capability, Cell, Dataset
-from overbae.services.datasets import events, measure, paths
+from overbae.services.datasets import measure, paths
 
 
 class DatasetError(ValueError):
-    """A rule the caller broke, phrased for the user. ``code`` names it for the API;
-    ``field`` names the input it concerns, when there is one."""
+    """A rule the caller broke, phrased for the user. ``code`` names it for the API."""
 
-    def __init__(self, detail: str, *, code: str = "dataset_rule", field: str = "") -> None:
+    def __init__(self, detail: str, *, code: str = "dataset_rule") -> None:
         super().__init__(detail)
         self.detail = detail
         self.code = code
-        self.field = field
 
 
-def _refuse_while_landing(dataset: Dataset) -> None:
+def _refuse_while_busy(dataset: Dataset) -> None:
+    if dataset.state == Dataset.State.RUNNING:
+        raise DatasetError("A transformation is running. Wait for it to finish.", code="running")
     if dataset.state == Dataset.State.LANDING:
         raise DatasetError("The source is still landing.", code="landing")
-
-
-def _used(dataset: Dataset) -> bool:
-    return dataset.cells.filter(used_at__isnull=False).exists()
 
 
 def _touch(dataset: Dataset, **fields: Any) -> None:
     Dataset.objects.filter(pk=dataset.pk).update(**fields, updated_at=timezone.now())
     for k, v in fields.items():
         setattr(dataset, k, v)
-    changed = {k: str(getattr(v, "pk", v)) if v is not None else None for k, v in fields.items()}
-    transaction.on_commit(
-        lambda: events.publish(
-            dataset.pk,
-            {"dataset_id": str(dataset.pk), "type": "dataset_updated", "changed": changed},
-        )
-    )
+
+
+def set_active(dataset: Dataset, cell: Cell | None) -> Dataset:
+    _refuse_while_busy(dataset)
+    if cell is not None and cell.dataset_id != dataset.id:
+        raise DatasetError("That version belongs to another dataset.", code="cell_mismatch")
+    if cell is not None and not cell.ran:
+        raise DatasetError("That version has not run.", code="not_ran")
+    _touch(dataset, active=cell)
+    return dataset
 
 
 def set_intent(dataset: Dataset, intent: str) -> Dataset:
-    _refuse_while_landing(dataset)
-    if intent not in (Dataset.Intent.TRAIN, Dataset.Intent.EVAL):
-        raise DatasetError("The intent is train or eval.", code="intent")
-    if _used(dataset):
+    _refuse_while_busy(dataset)
+    if intent not in (Dataset.Intent.TRAIN, Dataset.Intent.EVAL, Dataset.Intent.EXPLORE):
+        raise DatasetError("Choose Training, Eval, or Data exploration.", code="intent")
+    if dataset.frozen_before >= 0:
         raise DatasetError("A version was used; the intent is fixed.", code="frozen")
     if intent != dataset.intent:
         _touch(dataset, intent=intent)
         measure.capability_only(dataset)
-        if intent == Dataset.Intent.EVAL:
-            from overbae.services.eval.eval_set import maybe_enqueue_card_evaluator_sync
-
-            maybe_enqueue_card_evaluator_sync(dataset)
     return dataset
 
 
-def refuse_deleted_capability(capability: Any) -> None:
+def refuse_deleted_capability(capability):
     if capability is not None and capability.status == Capability.Status.DELETED:
         raise DatasetError("That capability was deleted.", code="capability")
 
 
 def set_capability(dataset: Dataset, capability: Any) -> Dataset:
-    _refuse_while_landing(dataset)
-    if _used(dataset):
+    _refuse_while_busy(dataset)
+    if dataset.frozen_before >= 0:
         raise DatasetError("A version was used; the capability is fixed.", code="frozen")
     if capability is not None and capability.project_id != dataset.project_id:
         raise DatasetError("That capability belongs to another project.", code="capability")
@@ -76,9 +71,6 @@ def set_capability(dataset: Dataset, capability: Any) -> Dataset:
     if getattr(capability, "id", None) != dataset.capability_id:
         _touch(dataset, capability=capability)
         measure.capability_only(dataset)
-        from overbae.services.eval.eval_set import maybe_enqueue_card_evaluator_sync
-
-        maybe_enqueue_card_evaluator_sync(dataset)
     return dataset
 
 
@@ -136,10 +128,15 @@ def usage(cell: Cell) -> dict[str, list[dict[str, Any]]]:
 
 def delete_blocked_reason(dataset: Dataset) -> str:
     if dataset.state == Dataset.State.LANDING:
-        return "The source is still landing. Wait for it to finish."
-    used = [c for c in dataset.versions if c.used_at is not None or any(usage(c).values())]
+        return "The source is still landing. Cancel it before deleting the dataset."
+    if dataset.state == Dataset.State.RUNNING:
+        return "A transformation is running. Wait for it to finish."
+    if dataset.cells.filter(pipeline_artifacts__isnull=False).exists():
+        return "A version is retained as an external transformation artifact. This dataset cannot be deleted."
+    used = [c for c in dataset.cells.all() if c.used_at is not None or any(usage(c).values())]
     if used:
-        labels = ", ".join(c.label for c in used)
+        versions = dataset.versions()
+        labels = ", ".join(versions.get(c.id, c.title) for c in used)
         return f"{labels} {'is' if len(used) == 1 else 'are'} used by runs, so this dataset cannot be deleted."
     return ""
 

@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 from conftest import EVAL_ROWS, TRAIN_ROWS, frozen_dataset
 from django.test import override_settings
+from factories import make_matrix_row
 
 from overbae.core.errors import InputValidationError
 from overbae.modal.model_registry import (
@@ -16,7 +17,7 @@ from overbae.modal.model_registry import (
     get_training_context_policy,
     min_sft_context_length,
 )
-from overbae.models import Capability, EvalSet, EvalSetMember, Evaluator
+from overbae.models import Capability, EvalSet
 from overbae.services.finetuning_runner import baseten_context_length
 from overbae.services.recommendation.analysis import build_analysis
 from overbae.services.recommendation.constraints import eligible_models
@@ -212,7 +213,7 @@ class TestJobSerializerContextValidation:
         )
         project = Project.objects.create(name="ctx", slug=f"ctx-{uuid.uuid4().hex[:8]}")
         ProjectMembership.objects.create(user=user, project=project)
-        dataset = frozen_dataset(project, TRAIN_ROWS)
+        dataset = frozen_dataset(project, TRAIN_ROWS, contract="train")
         evaluation = frozen_dataset(
             project,
             [{**row, "input": "held-out-" + row["input"]} for row in EVAL_ROWS],
@@ -220,8 +221,7 @@ class TestJobSerializerContextValidation:
         )
         capability = Capability.objects.create(project=project, name="Judge", slug="judge")
         eval_set = EvalSet.objects.create(project=project, capability=capability, name="Judges")
-        evaluator = Evaluator.objects.create(project=project, name="Accuracy", kind="llm_judge")
-        EvalSetMember.objects.create(eval_set=eval_set, evaluator=evaluator, role="generative")
+        eval_set.rows.add(make_matrix_row(eval_set.project))
         version = dataset.active_cell
         version.stats = {**version.stats, "max_token_length": max_token_length}
         version.save(update_fields=["stats"])
@@ -262,8 +262,9 @@ class TestJobSerializerContextValidation:
 
     @pytest.mark.parametrize("field", ["eval_dataset", "eval_set"])
     @pytest.mark.parametrize("omit", [True, False])
-    def test_training_requires_evaluation_inputs_without_capability(self, field, omit):
+    def test_enabled_training_evaluations_require_inputs_without_capability(self, field, omit):
         s = self._serializer(max_token_length=100, base_model="Qwen/Qwen3-8B")
+        s.initial_data["eval_model_before"] = True
         if omit:
             s.initial_data.pop(field)
         else:

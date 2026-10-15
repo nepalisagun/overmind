@@ -13,8 +13,38 @@
  */
 
 import { mapValues } from '../runtime';
+import type { DatasetAnalytics } from './DatasetAnalytics';
+import {
+    DatasetAnalyticsFromJSON,
+    DatasetAnalyticsFromJSONTyped,
+    DatasetAnalyticsToJSON,
+    DatasetAnalyticsToJSONTyped,
+} from './DatasetAnalytics';
+import type { CellTransformation } from './CellTransformation';
+import {
+    CellTransformationFromJSON,
+    CellTransformationFromJSONTyped,
+    CellTransformationToJSON,
+    CellTransformationToJSONTyped,
+} from './CellTransformation';
+import type { DatasetReadiness } from './DatasetReadiness';
+import {
+    DatasetReadinessFromJSON,
+    DatasetReadinessFromJSONTyped,
+    DatasetReadinessToJSON,
+    DatasetReadinessToJSONTyped,
+} from './DatasetReadiness';
+import type { CellStateEnum } from './CellStateEnum';
+import {
+    CellStateEnumFromJSON,
+    CellStateEnumFromJSONTyped,
+    CellStateEnumToJSON,
+    CellStateEnumToJSONTyped,
+} from './CellStateEnum';
+
 /**
- *
+ * A cell with its derived version. The view passes ``versions`` and
+ * ``frozen_before`` in the context so a chain costs no extra queries.
  * @export
  * @interface Cell
  */
@@ -27,12 +57,6 @@ export interface Cell {
     readonly id: string;
     /**
      *
-     * @type {string}
-     * @memberof Cell
-     */
-    readonly version: string;
-    /**
-     *
      * @type {number}
      * @memberof Cell
      */
@@ -42,7 +66,7 @@ export interface Cell {
      * @type {string}
      * @memberof Cell
      */
-    readonly parent: string | null;
+    readonly version: string;
     /**
      *
      * @type {string}
@@ -55,6 +79,36 @@ export interface Cell {
      * @memberof Cell
      */
     readonly script: string;
+    /**
+     *
+     * @type {CellTransformation}
+     * @memberof Cell
+     */
+    readonly transformation: CellTransformation;
+    /**
+     *
+     * @type {string}
+     * @memberof Cell
+     */
+    readonly note: string;
+    /**
+     *
+     * @type {CellStateEnum}
+     * @memberof Cell
+     */
+    readonly state: CellStateEnum;
+    /**
+     *
+     * @type {string}
+     * @memberof Cell
+     */
+    readonly error: string;
+    /**
+     *
+     * @type {boolean}
+     * @memberof Cell
+     */
+    readonly frozen: boolean;
     /**
      *
      * @type {number}
@@ -73,6 +127,12 @@ export interface Cell {
      * @memberof Cell
      */
     readonly fingerprint: string;
+    /**
+     *
+     * @type {string}
+     * @memberof Cell
+     */
+    readonly inputFingerprint: string;
     /**
      *
      * @type {any}
@@ -99,28 +159,34 @@ export interface Cell {
     readonly stats: any | null;
     /**
      *
-     * @type {any}
+     * @type {DatasetAnalytics}
      * @memberof Cell
      */
-    readonly analytics: any | null;
+    readonly analytics: DatasetAnalytics;
     /**
      *
      * @type {any}
      * @memberof Cell
      */
-    readonly attachment: any | null;
+    readonly review: any | null;
     /**
      *
      * @type {any}
      * @memberof Cell
      */
-    readonly impact: any | null;
+    readonly qualityReport: any | null;
     /**
      *
-     * @type {string}
+     * @type {{ [key: string]: any; }}
      * @memberof Cell
      */
-    readonly stdout: string;
+    readonly preparationPlan: { [key: string]: any; } | null;
+    /**
+     *
+     * @type {DatasetReadiness}
+     * @memberof Cell
+     */
+    readonly readiness: DatasetReadiness;
     /**
      *
      * @type {number}
@@ -135,43 +201,58 @@ export interface Cell {
     readonly usedAt: Date | null;
     /**
      *
-     * @type {boolean}
+     * @type {{ [key: string]: Array<{ [key: string]: any; }>; }}
      * @memberof Cell
      */
-    readonly frozen: boolean;
+    readonly usage: { [key: string]: Array<{ [key: string]: any; }>; };
     /**
      *
      * @type {Date}
      * @memberof Cell
      */
     readonly createdAt: Date;
+    /**
+     *
+     * @type {Date}
+     * @memberof Cell
+     */
+    readonly updatedAt: Date;
 }
+
+
 
 /**
  * Check if a given object implements the Cell interface.
  */
 export function instanceOfCell(value: object): value is Cell {
     if (!('id' in value) || value['id'] === undefined) return false;
-    if (!('version' in value) || value['version'] === undefined) return false;
     if (!('position' in value) || value['position'] === undefined) return false;
-    if (!('parent' in value) || value['parent'] === undefined) return false;
+    if (!('version' in value) || value['version'] === undefined) return false;
     if (!('title' in value) || value['title'] === undefined) return false;
     if (!('script' in value) || value['script'] === undefined) return false;
+    if (!('transformation' in value) || value['transformation'] === undefined) return false;
+    if (!('note' in value) || value['note'] === undefined) return false;
+    if (!('state' in value) || value['state'] === undefined) return false;
+    if (!('error' in value) || value['error'] === undefined) return false;
+    if (!('frozen' in value) || value['frozen'] === undefined) return false;
     if (!('rows' in value) || value['rows'] === undefined) return false;
     if (!('columns' in value) || value['columns'] === undefined) return false;
     if (!('fingerprint' in value) || value['fingerprint'] === undefined) return false;
+    if (!('inputFingerprint' in value) || value['inputFingerprint'] === undefined) return false;
     if (!('intentReport' in value) || value['intentReport'] === undefined) return false;
     if (!('capabilityReport' in value) || value['capabilityReport'] === undefined) return false;
     if (!('fits' in value) || value['fits'] === undefined) return false;
     if (!('stats' in value) || value['stats'] === undefined) return false;
     if (!('analytics' in value) || value['analytics'] === undefined) return false;
-    if (!('attachment' in value) || value['attachment'] === undefined) return false;
-    if (!('impact' in value) || value['impact'] === undefined) return false;
-    if (!('stdout' in value) || value['stdout'] === undefined) return false;
+    if (!('review' in value) || value['review'] === undefined) return false;
+    if (!('qualityReport' in value) || value['qualityReport'] === undefined) return false;
+    if (!('preparationPlan' in value) || value['preparationPlan'] === undefined) return false;
+    if (!('readiness' in value) || value['readiness'] === undefined) return false;
     if (!('seconds' in value) || value['seconds'] === undefined) return false;
     if (!('usedAt' in value) || value['usedAt'] === undefined) return false;
-    if (!('frozen' in value) || value['frozen'] === undefined) return false;
+    if (!('usage' in value) || value['usage'] === undefined) return false;
     if (!('createdAt' in value) || value['createdAt'] === undefined) return false;
+    if (!('updatedAt' in value) || value['updatedAt'] === undefined) return false;
     return true;
 }
 
@@ -186,26 +267,33 @@ export function CellFromJSONTyped(json: any, ignoreDiscriminator: boolean): Cell
     return {
 
         'id': json['id'],
-        'version': json['version'],
         'position': json['position'],
-        'parent': json['parent'],
+        'version': json['version'],
         'title': json['title'],
         'script': json['script'],
+        'transformation': CellTransformationFromJSON(json['transformation']),
+        'note': json['note'],
+        'state': CellStateEnumFromJSON(json['state']),
+        'error': json['error'],
+        'frozen': json['frozen'],
         'rows': json['rows'],
         'columns': json['columns'],
         'fingerprint': json['fingerprint'],
+        'inputFingerprint': json['input_fingerprint'],
         'intentReport': json['intent_report'],
         'capabilityReport': json['capability_report'],
         'fits': json['fits'],
         'stats': json['stats'],
-        'analytics': json['analytics'],
-        'attachment': json['attachment'],
-        'impact': json['impact'],
-        'stdout': json['stdout'],
+        'analytics': DatasetAnalyticsFromJSON(json['analytics']),
+        'review': json['review'],
+        'qualityReport': json['quality_report'],
+        'preparationPlan': json['preparation_plan'],
+        'readiness': DatasetReadinessFromJSON(json['readiness']),
         'seconds': json['seconds'],
         'usedAt': (json['used_at'] == null ? null : new Date(json['used_at'])),
-        'frozen': json['frozen'],
+        'usage': json['usage'],
         'createdAt': (new Date(json['created_at'])),
+        'updatedAt': (new Date(json['updated_at'])),
     };
 }
 
@@ -213,7 +301,7 @@ export function CellToJSON(json: any): Cell {
     return CellToJSONTyped(json, false);
 }
 
-export function CellToJSONTyped(value?: Omit<Cell, 'id'|'version'|'position'|'parent'|'title'|'script'|'rows'|'columns'|'fingerprint'|'intent_report'|'capability_report'|'fits'|'stats'|'analytics'|'attachment'|'impact'|'stdout'|'seconds'|'used_at'|'frozen'|'created_at'> | null, ignoreDiscriminator: boolean = false): any {
+export function CellToJSONTyped(value?: Omit<Cell, 'id'|'position'|'version'|'title'|'script'|'transformation'|'note'|'state'|'error'|'frozen'|'rows'|'columns'|'fingerprint'|'input_fingerprint'|'intent_report'|'capability_report'|'fits'|'stats'|'analytics'|'review'|'quality_report'|'preparation_plan'|'readiness'|'seconds'|'used_at'|'usage'|'created_at'|'updated_at'> | null, ignoreDiscriminator: boolean = false): any {
     if (value == null) {
         return value;
     }

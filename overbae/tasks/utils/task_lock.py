@@ -82,12 +82,16 @@ def acquire_task_lock(lock_name: str, *, timeout: int, blocking: bool = False, r
                 logger.warning("Error releasing lock for task %s: %s", lock_name, e)
 
 
-def with_task_lock(lock_name: str | None = None, blocking: bool = False, *, timeout: int):
+def with_task_lock(
+    lock_name: str | None = None, blocking: bool = False, *, timeout: int, renew: bool = False
+):
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
             task_lock_name = lock_name or func.__name__
-            with acquire_task_lock(task_lock_name, blocking=blocking, timeout=timeout) as acquired:
+            with acquire_task_lock(
+                task_lock_name, blocking=blocking, timeout=timeout, renew=renew
+            ) as acquired:
                 if not acquired:
                     return {"status": "skipped", "reason": "previous_task_still_running"}
                 return func(*args, **kwargs)

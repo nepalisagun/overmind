@@ -30,44 +30,29 @@ ErrorCode = Literal[
     "dataset_not_found",
     "dataset_busy",
     "dataset_invalid",
-    "dataset_not_ready",
-    "dataset_stopped",
-    "version_not_found",
-    "run_not_found",
-    "attachment_missing",
-    "attachment_invalid",
-    "import_not_running",
-    "import_not_blocked",
+    "pipeline_package_required",
+    "revision_conflict",
     "request_key_conflict",
-    "request_key_pending",
-    "no_traces",
-    "no_calls",
+    "source_conflict",
+    "cell_not_found",
     "query_invalid",
+    "dataset_build_not_found",
+    "dataset_build_invalid",
+    "dataset_build_conflict",
     "dataset_intent_mismatch",
     "dataset_locked",
-    "active_conflict",
-    "query_timeout",
-    "query_result_too_large",
     "eval_set_not_found",
     "eval_set_invalid",
-    "invalid_judge_model",
-    "preparation_invalid",
-    "benchmark_model_invalid",
-    "evaluator_not_found",
-    "evaluator_invalid",
+    "eval_matrix_row_not_found",
+    "eval_matrix_row_invalid",
     "evaluation_not_ready",
     "evaluation_dispatch_failed",
     "eval_run_not_found",
-    "eval_sample_not_found",
-    "annotation_not_found",
-    "annotation_invalid",
     "invalid_trace_selection",
     "no_failures_found",
     "insufficient_credits",
     "plan_limit_exceeded",
     "model_not_found",
-    "model_warming",
-    "model_unavailable",
     "finetune_not_found",
     "finetune_invalid",
     "finetune_not_ready",
@@ -89,7 +74,6 @@ ErrorCode = Literal[
     "instrumentation_plan_not_found",
     "active_model_invalid",
     "inference_failed",
-    "decision_job_not_found",
     "context_length_exceeded",
     "model_swap_prompt_not_ready",
     "insight_not_found",
@@ -111,7 +95,6 @@ class MCPErrorData(MCPModel):
     message: str
     retryable: bool = False
     fields: dict[str, str] = Field(default_factory=dict)
-    retry_after_seconds: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class MCPError(Exception):
@@ -124,14 +107,12 @@ class MCPError(Exception):
         *,
         retryable: bool = False,
         fields: dict[str, str] | None = None,
-        retry_after_seconds: int | None = None,
     ) -> None:
         self.data = MCPErrorData(
             code=code,
             message=message,
             retryable=retryable,
             fields=fields or {},
-            retry_after_seconds=retry_after_seconds,
         )
         super().__init__(message)
 
@@ -148,42 +129,53 @@ def error_payload(error: MCPError) -> dict[str, Any]:
     return error.data.model_dump(mode="json")
 
 
-DATASET_ERROR_CODES: dict[str, ErrorCode] = {
+def serializer_fields(detail) -> dict[str, str]:
+    fields = {}
+
+    def visit(value, path):
+        if len(fields) >= 20:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, f"{path}.{key}" if path else str(key))
+        elif isinstance(value, list):
+            if all(not isinstance(child, (dict, list)) for child in value):
+                fields[path or "request"] = " ".join(map(str, value))[:500]
+            else:
+                for index, child in enumerate(value):
+                    visit(child, f"{path}.{index}" if path else str(index))
+        else:
+            fields[path or "request"] = str(value)[:500]
+
+    visit(detail, "")
+    return fields
+
+
+_DATASET_ERROR_CODES: dict[str, ErrorCode] = {
+    "pipeline_package_required": "pipeline_package_required",
+    "revision_conflict": "revision_conflict",
+    "conflict": "request_key_conflict",
+    "source_conflict": "source_conflict",
     "intent": "dataset_intent_mismatch",
+    "running": "dataset_busy",
     "landing": "dataset_busy",
-    "land_stopped": "dataset_stopped",
-    "no_cell": "version_not_found",
-    "no_version": "version_not_found",
-    "cell_mismatch": "version_not_found",
-    "no_execution": "run_not_found",
-    "frozen": "dataset_locked",
-    "active_conflict": "active_conflict",
-    "attachment_missing": "attachment_missing",
-    "attachment_invalid": "attachment_invalid",
-    "import_not_running": "import_not_running",
-    "import_not_blocked": "import_not_blocked",
+    "diagnosing": "dataset_busy",
+    "no_cell": "cell_not_found",
+    "cell_mismatch": "cell_not_found",
 }
 
 
 def dataset_mcp_error(error) -> MCPError:
     """Translate ``DatasetError``; do not re-check contracts here."""
-    code = DATASET_ERROR_CODES.get(getattr(error, "code", ""), "dataset_invalid")
+    code = _DATASET_ERROR_CODES.get(getattr(error, "code", ""), "dataset_invalid")
     message = str(getattr(error, "detail", None) or error)
-    field = getattr(error, "field", "")
-    fields = {field: message[:300]} if field else None
     if code == "dataset_busy":
         return MCPError(
             code,
-            f"{message} Poll get_job with kind dataset_import until it is idle.",
+            f"{message} Read inspect_dataset.next_actions for the exact operation to poll.",
             retryable=True,
-            fields=fields,
         )
-    if code == "dataset_locked":
-        message += (
-            " To change it, land the version as a new dataset with create_dataset "
-            "(source kind version)."
-        )
-    return MCPError(code, message, fields=fields, retryable=code == "attachment_missing")
+    return MCPError(code, message)
 
 
 _DATASET_URI = "overmind://datasets/"
@@ -195,7 +187,11 @@ def mcp_dataset(context, reference: str):
     from overbae.models import Dataset
 
     value = str(reference).strip().removeprefix(_DATASET_URI)
-    query = Dataset.objects.filter(project=context.project).select_related("capability", "active")
+    query = (
+        Dataset.objects.filter(project=context.project)
+        .select_related("capability", "active")
+        .prefetch_related("cells")
+    )
     try:
         dataset = query.filter(id=uuid.UUID(value)).first()
     except ValueError:
@@ -210,29 +206,31 @@ def mcp_dataset(context, reference: str):
     return dataset
 
 
-def mcp_version(dataset, ref: str | None, *, field: str = "version"):
-    """Optional version; blank means the caller should use the active one."""
+def mcp_cell(dataset, ref: str | None):
+    """Optional cell/version; blank means the caller should use the active cell."""
+    from overbae.services.datasets.lifecycle import DatasetError
     from overbae.services.datasets.versions import resolve_cell
 
     if not ref:
         return None
     try:
-        return resolve_cell(dataset, ref, field=field)
+        return resolve_cell(dataset, ref, ran_only=True)
     except DatasetError as exc:
         raise dataset_mcp_error(exc) from exc
 
 
-def mcp_check(dataset, intent: str, ref: str | None = None, *, field: str = "version"):
+def mcp_check(dataset, intent: str, ref: str | None = None):
     from overbae.services.datasets import use
+    from overbae.services.datasets.lifecycle import DatasetError
 
     try:
-        return use.check(dataset, intent, cell=mcp_version(dataset, ref, field=field))
+        return use.check(dataset, intent, cell=mcp_cell(dataset, ref))
     except DatasetError as exc:
         raise dataset_mcp_error(exc) from exc
 
 
-def version_contract(dataset, cell, intent: str):
-    from overbae.services.mcp.contracts.common import DatasetVersionContract
+def mcp_cell_contract(dataset, cell, intent: str):
+    from overbae.services.mcp.contracts.common import DatasetCellContract
 
     if cell is None:
         return None
@@ -242,9 +240,9 @@ def version_contract(dataset, cell, intent: str):
             dataset_use.check(dataset, intent, cell=cell)
         except DatasetError as exc:
             fits, reason = False, exc.detail
-    return DatasetVersionContract(
+    return DatasetCellContract(
         id=str(cell.id),
-        version=cell.label,
+        version=dataset.versions().get(cell.id, ""),
         title=cell.title,
         rows=int(cell.rows or 0),
         fingerprint=cell.fingerprint or "",
@@ -252,31 +250,3 @@ def version_contract(dataset, cell, intent: str):
         reason="" if fits else str(reason)[:500],
         warnings=review.warnings(dataset, cell),
     )
-
-
-def pinned_version(cell):
-    """A version a job or run read, as every launch output and resource names it."""
-    from overbae.services.mcp.contracts.common import PinnedVersion
-
-    if cell is None:
-        return None
-    return PinnedVersion(
-        dataset=str(cell.dataset_id),
-        version=cell.label,
-        id=str(cell.id),
-        fingerprint=cell.fingerprint or "",
-    )
-
-
-def pinned_versions(*, train=None, validation=None, eval=None):
-    from overbae.services.mcp.contracts.common import PinnedVersions
-
-    return PinnedVersions(
-        train=pinned_version(train),
-        validation=pinned_version(validation),
-        eval=pinned_version(eval),
-    )
-
-
-def finetune_versions(job):
-    return pinned_versions(train=job.cell, validation=job.validation_cell, eval=job.eval_cell)

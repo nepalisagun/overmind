@@ -1,15 +1,11 @@
-import { useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 
-import {
-  type Analytics,
-  AnalyticsDetails,
-  AnalyticsSummary,
-  hasAnalytics,
-} from "@/components/datasets/notebook/analytics";
-import { PreparePromptDialog } from "@/components/datasets/notebook/prepare-prompt";
+import { Handle, Position, useNodeConnections } from "@xyflow/react";
+
+import { AnalyticsAlerts, AnalyticsDetails } from "@/components/datasets/notebook/cell-analytics";
+import { CellScript } from "@/components/datasets/notebook/cell-script";
 import { RowsGrid } from "@/components/datasets/notebook/rows-grid";
-import { ScriptCode } from "@/components/datasets/notebook/script-code";
-import { SourceDetails } from "@/components/datasets/notebook/source";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -22,24 +18,19 @@ import {
 } from "@/components/ui/dialog";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Icon, type IconName } from "@/components/ui/icons";
-import { columnsOf, downloadAttachment, fitOf } from "@/hooks/use-datasets";
-import { notify } from "@/lib/notify";
+import { Spinner } from "@/components/ui/spinner";
+import { type CellState, columnsOf, fitOf } from "@/hooks/use-datasets";
 import { cn } from "@/lib/utils";
 import type { Cell } from "@/openapi";
 
-const count = (n: number) => n.toLocaleString();
-const plural = (n: number, noun: string) => `${count(n)} ${n === 1 ? noun : `${noun}s`}`;
-
 /** `train_eval`: the eval dataset that scores a training job. */
-export type UsePurpose = "train" | "train_eval" | "optimise" | "decision";
+export type UsePurpose = "train" | "train_eval" | "optimise";
 
-interface VersionActions {
-  onActivate: () => void;
+export interface CellActions {
   onUse: (purpose: UsePurpose) => void;
   onExport: (fmt: "jsonl" | "csv") => void;
   onIntent: (intent: "train" | "eval") => void;
   onCapability: (id: string | null) => void;
-  onNewDataset: () => void;
 }
 
 interface Suggestion {
@@ -48,6 +39,7 @@ interface Suggestion {
   title: string;
   hint: string;
   run: () => void;
+  primary?: boolean;
 }
 
 export interface CapabilityChoice {
@@ -78,7 +70,7 @@ function ExportDialog({
       <DialogTrigger asChild>
         <Button
           aria-label={`Export ${title}`}
-          className="h-full rounded-none"
+          className="nodrag h-full rounded-none"
           onClick={(e) => e.stopPropagation()}
           size="icon-xs"
           type="button"
@@ -91,7 +83,7 @@ function ExportDialog({
         <DialogHeader>
           <DialogTitle>Export {title}</DialogTitle>
           <DialogDescription>
-            {plural(rows, "row")} × {plural(columns, "column")}
+            {rows.toLocaleString()} rows × {columns} columns, as stored. An export is not a use.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
@@ -111,19 +103,21 @@ function ExportDialog({
 
 function SectionHeader({
   label,
+  alerts,
   meta,
   open,
   onToggle,
 }: {
   label: string;
-  meta?: React.ReactNode;
+  alerts?: ReactNode;
+  meta?: string;
   open: boolean;
   onToggle: () => void;
 }) {
   return (
     <button
       aria-expanded={open}
-      className="flex h-8 w-full items-center gap-1.5 px-2.5 text-xs text-muted-foreground hover:bg-wash-raised hover:text-foreground"
+      className="flex min-h-8 w-full flex-wrap items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground hover:bg-wash-raised hover:text-foreground focus-visible:outline focus-visible:outline-ring"
       onClick={(e) => {
         e.stopPropagation();
         onToggle();
@@ -134,11 +128,19 @@ function SectionHeader({
         className={cn("size-3 transition-transform duration-150", open && "rotate-90")}
       />
       <span className="pixel-label whitespace-nowrap">{label}</span>
+      {alerts}
       <span className="flex-1" />
       {meta && <span className="truncate font-mono tabular-nums">{meta}</span>}
     </button>
   );
 }
+
+const STATE_LABEL: Record<CellState, string> = {
+  failed: "failed",
+  ok: "",
+  queued: "queued",
+  running: "running",
+};
 
 type Report = {
   ok?: boolean;
@@ -147,6 +149,7 @@ type Report = {
   rows_ok?: number;
   /** false when no cell holds text, so no cell could shape the table. */
   fixable?: boolean;
+  format?: string;
 };
 
 interface Check {
@@ -164,107 +167,100 @@ interface Check {
   fixable?: boolean;
 }
 
-const PURPOSE: Record<string, string> = { eval: "evaluation", train: "training" };
-
-const sentence = (text: string) => (text ? text[0].toUpperCase() + text.slice(1) : text);
-
-function intentCheck(intent: string, shape: Report): Check {
+function intentCheck(intent: string, shape: Report, ran: boolean): Check {
   if (intent !== "train" && intent !== "eval") {
     return {
       columns: [],
-      fix: "Ask your coding agent to shape the rows for training or evaluation and set the purpose.",
-      found: "Not set",
-      label: "Purpose",
+      fix: "Select train or eval.",
+      found: "train or eval not chosen",
+      label: "Intent",
       ok: false,
-      requires: "Training or evaluation",
+      requires: "an intent, so the table has a shape to hold",
     };
   }
-  const purpose = PURPOSE[intent];
-  const label = `${sentence(purpose)} format`;
+  const label = intent === "eval" ? "Eval table" : "Train table";
   const requires =
     intent === "eval"
-      ? "An input on every row, and an expected_output wherever a reference answer exists"
-      : "A messages column holding the conversation on every row";
-  const columns = intent === "eval" ? ["input", "expected_output"] : ["messages"];
-  if (shape.ok) return { columns, found: "Every row", label, ok: true, requires };
-  const reason = shape.reason ?? "";
-  if (shape.fixable === false)
+      ? "an input column with a value on every row; expected_output when a reference exists"
+      : shape.format === "decision"
+        ? "a decision column with valid options and targets on every row"
+        : "a messages column: a list of role and content turns on every row";
+  const columns =
+    intent === "eval"
+      ? ["input", "expected_output"]
+      : shape.format === "decision"
+        ? ["decision"]
+        : ["messages"];
+  if (!ran)
     return {
       columns,
-      fix: "Start from a source with text. These rows hold only numbers and IDs.",
-      fixable: false,
-      found: "No text in any column",
+      fix: "Run the cell.",
+      found: "the cell has not run",
       label,
       ok: false,
       requires,
     };
-  let fix = `Ask your coding agent to reshape the rows for ${purpose}.`;
+  if (shape.ok) return { columns, found: "every row holds the shape", label, ok: true, requires };
+  const reason = shape.reason ?? "";
+  if (shape.fixable === false)
+    return {
+      columns,
+      fix: "None. The rows hold numbers and ids only; a different source is needed.",
+      fixable: false,
+      found: "no text in any column",
+      label,
+      ok: false,
+      requires,
+    };
+  let fix = "Ask the agent to shape the table.";
   if (reason.startsWith("no input column"))
     fix = "Add an input column: rename the prompt column or build it from messages.";
   else if (reason.startsWith("no messages column"))
-    fix = "Add a messages column built from the prompt and answer columns.";
+    fix = "Add a messages column: build it from the prompt and answer columns.";
   else if (reason.startsWith("no expected_output"))
-    fix = "Add an expected_output column with the reference answers.";
+    fix = "Add an expected_output column with the reference answer.";
   else if (reason.includes("empty input")) fix = "Drop the rows whose input is empty.";
-  else if (reason.includes("cut at landing")) fix = "Drop the rows that were cut short on import.";
-  else if (reason.includes("no assistant turn"))
-    fix = "Drop the rows with no assistant reply, or add the reply.";
+  else if (reason.includes("cut at landing"))
+    fix = "Drop the rows that landing cut: part of each transcript is missing.";
   else if (reason.includes("no usable messages") || reason.includes(" rows: "))
     fix = "Drop the rows whose messages are empty or not a list.";
-  else if (reason === "no rows") fix = "The version has no rows.";
-  return {
-    columns,
-    fix,
-    found:
-      sentence(
-        reason
-          .replace(/^(\d+) rows: /, "$1 rows have ")
-          .replace("no assistant turn to train on", "no assistant reply")
-      ) || "The format does not hold",
-    label,
-    ok: false,
-    requires,
-  };
+  else if (reason === "no rows") fix = "The table is empty. Land more rows or loosen a filter.";
+  return { columns, fix, found: reason || "the shape does not hold", label, ok: false, requires };
 }
 
 function capabilityCheck(name: string, report: Report, intent: string): Check {
-  const label = `Matches ${name}`;
+  const label = `${name} rows`;
   const requires =
     intent === "eval"
-      ? `Every input carries the fields ${name} reads`
-      : `Every conversation opens with ${name}'s system prompt and calls only its tools`;
+      ? `every input to carry the keys ${name} requires`
+      : `every transcript to be ${name}'s own: its system prompt first, only its tools called`;
   const columns = intent === "eval" ? ["input"] : ["messages"];
   if (report.ok !== false) {
     return {
       columns,
       found:
         report.rows != null
-          ? `${(report.rows_ok ?? report.rows).toLocaleString()} of ${report.rows.toLocaleString()} rows`
-          : `Nothing to check: ${name} records no prompt, tools or inputs`,
+          ? `${report.rows_ok ?? report.rows} of ${report.rows} rows`
+          : "no contract to check",
       label,
       ok: true,
       requires,
     };
   }
   const reason = report.reason ?? "";
-  let fix = `Ask your coding agent to align the rows with ${name}.`;
+  let fix = `Ask the agent to align the rows with ${name}.`;
   if (reason.startsWith("system turn differs"))
     fix = `Set the first message of every row to ${name}'s system prompt.`;
   else if (reason.startsWith("undeclared tool calls"))
     fix = `Keep only rows whose tool calls use ${name}'s tools, or drop those calls.`;
   else if (reason.startsWith("missing "))
-    fix = `Fill the input fields ${name} reads, or drop the rows that lack them.`;
+    fix = `Fill the input keys ${name} requires, or drop the rows that lack them.`;
   else if (reason.startsWith("no input column"))
-    fix = `Add an input column that carries ${name}'s input fields.`;
+    fix = `Add an input column that carries ${name}'s input keys.`;
   else if (reason.startsWith("no messages column"))
-    fix = "Add a messages column holding the conversation on every row.";
-  const detail = reason
-    .replace("system turn differs from the capability's", "a different system prompt")
-    .replace("undeclared tool calls", `tools ${name} does not have`);
+    fix = "Add a messages column: a list of role and content turns per row.";
   const found =
-    report.rows != null
-      ? `${(report.rows_ok ?? 0).toLocaleString()} of ${report.rows.toLocaleString()} rows; ${detail}`
-      : sentence(detail);
+    report.rows != null ? `${report.rows_ok ?? 0} of ${report.rows} rows pass; ${reason}` : reason;
   return { columns, fix, found, label, ok: false, requires };
 }
 
@@ -276,9 +272,9 @@ function CheckRow({ check, present }: { check: Check; present: Set<string> }) {
       ) : (
         <Icon.warning className="mt-0.5 size-3 shrink-0 text-warning" />
       )}
-      <div className="grid min-w-0 flex-1 grid-cols-[4rem_1fr] gap-x-2 gap-y-1">
+      <div className="grid min-w-0 flex-1 grid-cols-[3.5rem_1fr] gap-x-2 gap-y-1">
         <span className="col-span-2 text-foreground">{check.label}</span>
-        <span className="pixel-label text-muted-foreground">Expects</span>
+        <span className="pixel-label text-muted-foreground">Needs</span>
         <span className="text-muted-foreground">{check.requires}</span>
         {check.columns.length > 0 && (
           <>
@@ -304,7 +300,7 @@ function CheckRow({ check, present }: { check: Check; present: Set<string> }) {
         <span className={check.ok ? "text-muted-foreground" : "text-warning"}>{check.found}</span>
         {check.fix && (
           <>
-            <span className="pixel-label text-muted-foreground">To fix</span>
+            <span className="pixel-label text-muted-foreground">Fix</span>
             <span className="text-foreground">{check.fix}</span>
           </>
         )}
@@ -313,84 +309,9 @@ function CheckRow({ check, present }: { check: Check; present: Set<string> }) {
   );
 }
 
-/** Decision rows: present when the version's rows look like decision requests. */
-function decisionReport(cell: Cell): Report | null {
-  const report = ((cell.intentReport ?? {}) as Record<string, Report>).decision;
-  return report && report.reason !== "no decision rows" ? report : null;
-}
-
-function DecisionChip({
-  report,
-  intent,
-  present,
-  onIntent,
-}: {
-  report: Report;
-  intent: string;
-  present: Set<string>;
-  onIntent?: (intent: "train" | "eval") => void;
-}) {
-  const pending = intent !== "train" && intent !== "eval";
-  const ok = !!report.ok && !pending;
-  const headline = !report.ok
-    ? "Not valid decision rows"
-    : pending
-      ? "Purpose not set"
-      : intent === "eval"
-        ? "Ready for decision evaluation"
-        : "Ready for decision training";
-  const check: Check = {
-    columns: ["input", "expected_output"],
-    found: report.ok ? plural(report.rows ?? 0, "row") : sentence(report.reason ?? ""),
-    label: "Decision format",
-    ok: !!report.ok,
-    requires: "A state and questions in input, and an answer for every question in expected_output",
-    ...(report.ok ? {} : { fix: "Ask your coding agent to fix the rows named above." }),
-  };
-  return (
-    <HoverCard openDelay={250}>
-      <HoverCardTrigger asChild>
-        <button
-          className={cn(
-            "nodrag inline-flex h-6 min-w-0 max-w-96 cursor-default items-center gap-1 whitespace-nowrap rounded-sm border px-1.5 text-xs",
-            ok
-              ? "border-success/40 bg-success/10 text-success"
-              : "border-warning/40 bg-warning/10 text-warning"
-          )}
-          type="button"
-        >
-          {ok ? (
-            <Icon.success className="size-3 shrink-0" />
-          ) : (
-            <Icon.warning className="size-3 shrink-0" />
-          )}
-          <span className="truncate">{headline}</span>
-        </button>
-      </HoverCardTrigger>
-      <HoverCardContent align="start" className="w-[28rem] p-2.5">
-        <ul className="flex flex-col gap-3">
-          <CheckRow check={check} present={present} />
-        </ul>
-        {report.ok && pending && onIntent && (
-          <div className="mt-3 flex flex-col gap-1 border-t border-border/70 pt-2">
-            {(["train", "eval"] as const).map((choice) => (
-              <button
-                className="flex w-full items-start gap-2 rounded-sm border border-border/70 px-2 py-1.5 text-left hover:bg-accent/50"
-                key={choice}
-                onClick={() => onIntent(choice)}
-                type="button"
-              >
-                <Icon.target className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                <span className="text-xs text-foreground">Use for {PURPOSE[choice]}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </HoverCardContent>
-    </HoverCard>
-  );
-}
-
+/** Both contracts on the frame: the chip names the first failure, the hover
+ *  card says what each needs, which columns are there, what was found and
+ *  what makes it pass. */
 function FitChip({
   cell,
   intent,
@@ -402,121 +323,156 @@ function FitChip({
   intent: string;
   capabilityName: string;
   capabilities: CapabilityChoice[];
-  actions?: Pick<VersionActions, "onIntent" | "onCapability">;
+  /** Absent while the dataset is busy or frozen: the card then only reports. */
+  actions?: Pick<CellActions, "onIntent" | "onCapability">;
 }) {
+  if (intent === "explore")
+    return (
+      <Badge size="chip" variant="neutral">
+        Data exploration
+      </Badge>
+    );
   const reports = (cell.intentReport as Record<string, Report> | null) ?? {};
   const shape = (reports[intent] ?? {}) as Report;
+  const ran = cell.state === "ok" && !!cell.fingerprint;
   const other: "train" | "eval" | null =
     intent === "train" ? "eval" : intent === "eval" ? "train" : null;
-  const checks = [intentCheck(intent, shape)];
+  const otherFits = other ? !!(reports[other] as Report | undefined)?.ok : false;
+  const checks = [intentCheck(intent, shape, ran)];
+
+  /** Only the moves that would actually change the verdict, most likely first. */
+  function suggest(
+    failing: Check,
+    acts: Pick<CellActions, "onIntent" | "onCapability">
+  ): Suggestion[] {
+    const out: Suggestion[] = [];
+    const capabilityFails = failing.label.endsWith(" rows");
+    if (failing.label === "Intent") {
+      for (const choice of ["train", "eval"] as const) {
+        if ((reports[choice] as Report | undefined)?.ok) {
+          out.push({
+            hint: `The ${choice} shape already holds on this version.`,
+            icon: "target",
+            key: `intent-${choice}`,
+            run: () => acts.onIntent(choice),
+            title: `Use it for ${choice}`,
+          });
+        }
+      }
+      return out;
+    }
+    if (failing.fixable === false) return out;
+    if (other && otherFits) {
+      out.push({
+        hint: `The ${other} shape already holds on this version.`,
+        icon: "target",
+        key: "intent",
+        run: () => acts.onIntent(other),
+        title: `Use it for ${other} instead`,
+      });
+    }
+    if (capabilityFails) {
+      const current = capabilities.find((c) => c.name === capabilityName)?.score ?? 0;
+      const better = capabilities
+        .filter((c) => c.name !== capabilityName && (c.score ?? 0) > current)
+        .slice(0, 2);
+      for (const c of better) {
+        out.push({
+          hint: `${Math.round((c.score ?? 0) * 100)}% of rows match it, against ${Math.round(current * 100)}% for ${capabilityName}.`,
+          icon: "capability",
+          key: `cap-${c.id}`,
+          run: () => acts.onCapability(c.id),
+          title: `Switch to ${c.name}`,
+        });
+      }
+      if (better.length === 0) {
+        out.push({
+          hint: `No capability matches these rows better. Only the ${intent} shape is checked then.`,
+          icon: "close",
+          key: "detach",
+          run: () => acts.onCapability(null),
+          title: "Remove the capability",
+        });
+      }
+    }
+    return out;
+  }
   if (capabilityName) {
     checks.push(capabilityCheck(capabilityName, (cell.capabilityReport ?? {}) as Report, intent));
   }
   const present = new Set(columnsOf(cell).map((c) => c.name));
   const failing = checks.find((c) => !c.ok);
-  const capabilityFails = !!failing?.label.startsWith("Matches ");
-
-  const suggestions: Suggestion[] = [];
-  if (failing && actions) {
-    const holds = (choice: "train" | "eval") => !!(reports[choice] as Report | undefined)?.ok;
-    if (failing.label === "Purpose") {
-      for (const choice of ["train", "eval"] as const) {
-        if (holds(choice))
-          suggestions.push({
-            hint: `This version is already in the ${PURPOSE[choice]} format.`,
-            icon: "target",
-            key: `intent-${choice}`,
-            run: () => actions.onIntent(choice),
-            title: `Use for ${PURPOSE[choice]}`,
-          });
-      }
-    } else {
-      if (other && holds(other))
-        suggestions.push({
-          hint: `This version is already in the ${PURPOSE[other]} format.`,
-          icon: "target",
-          key: "intent",
-          run: () => actions.onIntent(other),
-          title: `Use for ${PURPOSE[other]} instead`,
-        });
-      if (capabilityFails) {
-        const current = capabilities.find((c) => c.name === capabilityName)?.score ?? 0;
-        const better = capabilities
-          .filter((c) => c.name !== capabilityName && (c.score ?? 0) > current)
-          .slice(0, 2);
-        for (const c of better)
-          suggestions.push({
-            hint: `${Math.round((c.score ?? 0) * 100)}% of rows match it; ${Math.round(current * 100)}% match ${capabilityName}.`,
-            icon: "capability",
-            key: `cap-${c.id}`,
-            run: () => actions.onCapability(c.id),
-            title: `Switch to ${c.name}`,
-          });
-        if (!better.length)
-          suggestions.push({
-            hint: `No other capability fits better. Without one, only the ${PURPOSE[intent]} format is checked.`,
-            icon: "close",
-            key: "detach",
-            run: () => actions.onCapability(null),
-            title: "Remove the capability",
-          });
-      }
-    }
-  }
-
   const headline = !failing
-    ? `Ready for ${PURPOSE[intent]}`
-    : failing.label === "Purpose"
-      ? "Purpose not set"
-      : capabilityFails
+    ? "Format valid"
+    : failing.label === "Intent"
+      ? "Intent pending"
+      : failing.label.endsWith(" rows")
         ? `Does not match ${capabilityName}`
-        : `Not in the ${PURPOSE[intent]} format`;
+        : `Not a ${intent} table`;
+  const detail = failing && failing.found.length <= 48 ? failing.found : null;
+  const suggestions = failing && actions ? suggest(failing, actions) : [];
   return (
     <HoverCard openDelay={250}>
       <HoverCardTrigger asChild>
-        <button
+        <span
           className={cn(
-            "nodrag inline-flex h-6 min-w-0 max-w-96 cursor-default items-center gap-1 whitespace-nowrap rounded-sm border px-1.5 text-xs",
+            "inline-flex h-6 min-w-0 max-w-96 cursor-default items-center gap-1 whitespace-nowrap rounded-sm border px-1.5 text-xs",
             failing
               ? "border-warning/40 bg-warning/10 text-warning"
               : "border-success/40 bg-success/10 text-success"
           )}
-          type="button"
         >
           {failing ? (
             <Icon.warning className="size-3 shrink-0" />
           ) : (
             <Icon.success className="size-3 shrink-0" />
           )}
-          <span className="truncate">{headline}</span>
-        </button>
+          <span className="truncate">
+            {headline}
+            {detail && <span className="text-warning/80"> · {detail}</span>}
+          </span>
+        </span>
       </HoverCardTrigger>
       <HoverCardContent align="start" className="w-[28rem] p-2.5">
         <ul className="flex flex-col gap-3">
           {checks.map((check) => (
             <CheckRow check={check} key={check.label} present={present} />
           ))}
-          {!capabilityName && PURPOSE[intent] && (
+          {!capabilityName && (
             <li className="flex items-start gap-2 text-xs text-muted-foreground">
               <Icon.info className="mt-0.5 size-3 shrink-0" />
-              <span>No capability attached. Only the {PURPOSE[intent]} format is checked.</span>
+              <span>No capability is attached, so only the {intent} shape is checked.</span>
             </li>
           )}
         </ul>
-        {suggestions.length > 0 && (
-          <div className="mt-3 flex flex-col gap-1 border-t border-border/70 pt-2">
+        {failing && actions && suggestions.length > 0 && (
+          <div className="-mx-2.5 mt-3 flex flex-col gap-1 border-t border-border/70 px-2.5 pt-2">
             {suggestions.map((item) => {
               const Glyph = Icon[item.icon];
               return (
                 <button
-                  className="flex w-full items-start gap-2 rounded-sm border border-border/70 px-2 py-1.5 text-left hover:bg-accent/50"
+                  className={cn(
+                    "flex w-full items-start gap-2 rounded-sm border px-2 py-1.5 text-left",
+                    item.primary
+                      ? "border-primary/40 bg-primary/10 hover:bg-primary/20"
+                      : "border-border/70 hover:bg-accent/50"
+                  )}
                   key={item.key}
                   onClick={item.run}
                   type="button"
                 >
-                  <Glyph className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                  <Glyph
+                    className={cn(
+                      "mt-0.5 size-3.5 shrink-0",
+                      item.primary ? "text-primary" : "text-muted-foreground"
+                    )}
+                  />
                   <span className="flex min-w-0 flex-col">
-                    <span className="text-xs text-foreground">{item.title}</span>
+                    <span
+                      className={cn("text-xs", item.primary ? "text-primary" : "text-foreground")}
+                    >
+                      {item.title}
+                    </span>
                     <span className="text-xs text-muted-foreground">{item.hint}</span>
                   </span>
                 </button>
@@ -529,362 +485,273 @@ function FitChip({
   );
 }
 
-interface Impact {
-  rows_before?: number | null;
-  rows_after?: number | null;
-  rows_removed?: number | null;
-  rows_added?: number | null;
-  identity_preserved?: boolean;
-  input_evidence_removed?: number | null;
-  instruction_changes?: number | null;
-}
-
-function Changes({ impact }: { impact: Impact }) {
-  const { rows_before: before, rows_after: after } = impact;
-  const lines: Array<{ key: string; parts: string[]; warning?: boolean }> = [];
-  const counts = [
-    before != null && after != null && before !== after
-      ? `${count(before)} → ${plural(after, "row")}`
-      : "",
-    impact.rows_removed ? `${count(impact.rows_removed)} removed` : "",
-    impact.rows_added ? `${count(impact.rows_added)} added` : "",
-  ].filter(Boolean);
-  if (counts.length) lines.push({ key: "rows", parts: counts });
-  if (impact.identity_preserved === false)
-    lines.push({
-      key: "identity",
-      parts: ["Rows were renumbered, so they cannot be matched to the parent"],
-      warning: true,
-    });
-  if (impact.input_evidence_removed)
-    lines.push({
-      key: "evidence",
-      parts: [`Context removed from ${plural(impact.input_evidence_removed, "input")}`],
-      warning: true,
-    });
-  if (impact.instruction_changes)
-    lines.push({
-      key: "instructions",
-      parts: [`Instructions changed in ${plural(impact.instruction_changes, "row")}`],
-      warning: true,
-    });
-  if (!lines.length) return null;
-  return (
-    <ul aria-label="Changes" className="flex flex-col gap-0.5 px-3 pb-2.5">
-      {lines.map((line) => (
-        <li
-          className={cn(
-            "flex items-center gap-1.5 text-xs",
-            line.warning ? "text-warning" : "text-muted-foreground"
-          )}
-          key={line.key}
-        >
-          {line.warning && <Icon.warning className="size-3 shrink-0" />}
-          {line.parts.map((part, index) => (
-            <span className="tabular-nums" key={part}>
-              {index > 0 && <span aria-hidden> · </span>}
-              <span>{part}</span>
-            </span>
-          ))}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-interface AttachmentInfo {
-  filename: string;
-  rows?: number | null;
-}
-
-const CONSUMER_BUTTON = "border-primary/40 bg-primary/10 text-primary hover:bg-primary/20";
-
-export function VersionCard({
+export function NotebookCell({
   datasetId,
-  projectId,
   cell,
   intent,
   capabilityName,
   capabilities,
-  sourceSpec,
-  analyticsChanged,
   active,
   editable,
   selected,
   onSelect,
   actions,
+  sourceDetails,
 }: {
   datasetId: string;
-  projectId: string;
   cell: Cell;
   intent: string;
   capabilityName: string;
   capabilities: CapabilityChoice[];
-  sourceSpec: unknown;
-  /** The analytics differ from the parent version's. */
-  analyticsChanged: boolean;
   active: boolean;
   editable: boolean;
   selected: boolean;
   onSelect: () => void;
-  actions: VersionActions;
+  actions: CellActions;
+  sourceDetails?: ReactNode;
 }) {
-  const source = cell.parent == null;
-  const title = source ? "Source" : cell.title;
-  const [scriptOpen, setScriptOpen] = useState(true);
-  const [outputOpen, setOutputOpen] = useState(false);
-  const [tableOpen, setTableOpen] = useState(active);
-  const analytics = (cell.analytics ?? {}) as Analytics;
-  const [analyticsOpen, setAnalyticsOpen] = useState(source || analyticsChanged);
+  const source = cell.position === 0;
+  const attachment = (cell.review as { kind?: string } | undefined)?.kind === "attachment";
+  const hasScript = !source && !attachment && !!cell.script;
+  const ran = cell.state === "ok" && !!cell.fingerprint;
+  const frozen = !!cell.frozen;
+  const incoming = useNodeConnections({ handleType: "target" });
+  const outgoing = useNodeConnections({ handleType: "source" });
+  const [scriptOpen, setScriptOpen] = useState(!ran);
+  const [tableOpen, setTableOpen] = useState(true);
+  const [metricsOpen, setMetricsOpen] = useState(false);
+  const terminal = outgoing.length === 0 || active;
+  useEffect(() => {
+    if (cell.state === "failed" || cell.state === "queued") setScriptOpen(true);
+  }, [cell.state]);
   const fit = fitOf(cell);
-  const decision = decisionReport(cell);
   const columns = columnsOf(cell).length;
-  const changes = (cell.impact ?? {}) as Impact;
-  const attachment = (cell.attachment ?? {}) as Partial<AttachmentInfo>;
+
+  const version = cell.version;
+  const frameBorderWidth = active && cell.state !== "failed" && cell.state !== "running" ? 1.5 : 1;
+  const stateTone =
+    cell.state === "failed"
+      ? "border-destructive/60"
+      : cell.state === "running"
+        ? "border-info/60"
+        : active
+          ? "border-success/60"
+          : selected
+            ? "border-primary/60"
+            : "border-border";
 
   return (
     <article
       aria-current={selected ? "true" : undefined}
-      aria-label={`${cell.version} ${title}`}
-      className="relative pt-3"
-      onClickCapture={onSelect}
+      aria-label={cell.title}
+      className="group/cell relative px-3 py-3 outline-none focus-visible:bg-wash-raised"
+      id={`cell-${cell.id}`}
+      onClick={onSelect}
+      onFocus={onSelect}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && e.target === e.currentTarget) onSelect();
+      }}
     >
-      <div className="version-drag-handle absolute top-0 left-3 z-10 flex cursor-grab items-center gap-1 bg-card px-1 active:cursor-grabbing">
-        <span
-          className={cn(
-            "inline-flex h-6 items-center overflow-hidden rounded-sm bg-card text-xs",
-            active ? "border-[1.5px] border-success/60" : "border border-border",
-            selected || source ? "text-foreground" : "text-muted-foreground"
-          )}
-        >
-          <span className="inline-flex items-center gap-1.5 pr-1.5 pl-2">
-            {active && <span className="size-1.5 rounded-xs bg-success" />}
-            <span className={cn("font-mono", active && "font-semibold text-foreground")}>
-              {cell.version}
-            </span>
-            <span className="max-w-72 truncate" title={title}>
-              {title}
-            </span>
-          </span>
-          <span className="nodrag flex h-full items-center border-l border-border/70">
-            <PreparePromptDialog cellId={cell.id} datasetId={datasetId} version={cell.version} />
-            <Button
-              aria-label={`New dataset from ${cell.version}`}
-              className="h-full rounded-none"
-              disabled={!editable}
-              onClick={(e) => {
-                e.stopPropagation();
-                actions.onNewDataset();
-              }}
-              size="icon-xs"
-              title="New dataset from this version"
-              type="button"
-              variant="ghost"
-            >
-              <Icon.datasetAdd />
-            </Button>
-            <ExportDialog
-              columns={columns}
-              onExport={actions.onExport}
-              rows={cell.rows}
-              title={`${cell.version} ${title}`}
-            />
-          </span>
-        </span>
-        {cell.frozen && (
+      {/* The chip sticks to the top of the scroll while its cell is in view; the frame
+          starts half a chip lower so the border runs through the chip's middle. */}
+      <div className="pointer-events-none sticky top-1 z-20 flex items-center pl-2.5">
+        <div className="pointer-events-auto flex items-center gap-1 bg-card">
           <span
-            className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-            title="A training job, evaluation or optimiser run read this version."
+            className={cn(
+              "inline-flex h-6 items-center overflow-hidden rounded-sm bg-card text-xs",
+              active ? "border-[1.5px] border-success/60" : "border border-border",
+              selected || source ? "text-foreground" : "text-muted-foreground"
+            )}
           >
-            <Icon.lock className="size-3" />
-            Used
+            <span className="inline-flex items-center gap-1.5 pr-1.5 pl-2">
+              {active && <span className="size-1.5 rounded-xs bg-success" />}
+              <button
+                aria-label={`Focus version ${version}`}
+                className={cn(
+                  "nodrag font-mono hover:underline",
+                  active && "font-semibold text-foreground"
+                )}
+                onClick={onSelect}
+                type="button"
+              >
+                {version}
+              </button>
+              {source ? <span>Source</span> : <span>{cell.title}</span>}
+            </span>
+            <span
+              aria-label={`${cell.title} cell`}
+              className="flex h-full items-center divide-x divide-border/70 border-l border-border/70"
+              role="toolbar"
+            >
+              {ran && (
+                <ExportDialog
+                  columns={columns}
+                  onExport={actions.onExport}
+                  rows={cell.rows}
+                  title={`${version} ${cell.title}`}
+                />
+              )}
+            </span>
           </span>
-        )}
+          {cell.state === "running" ? (
+            <Spinner className="size-3" />
+          ) : STATE_LABEL[cell.state as CellState] ? (
+            <span
+              className={cn(
+                "pixel-label text-xs",
+                cell.state === "failed" ? "text-destructive" : "text-muted-foreground"
+              )}
+            >
+              {STATE_LABEL[cell.state as CellState]}
+            </span>
+          ) : null}
+          {frozen && !source && (
+            <Icon.lock
+              aria-label="Used by a run; frozen"
+              className="size-3 text-muted-foreground"
+            />
+          )}
+        </div>
       </div>
       <div
         className={cn(
-          "w-full min-w-0 rounded-md border bg-card pt-2.5 transition-colors duration-200",
-          active
-            ? "border-[1.5px] border-success/60"
-            : selected
-              ? "border-primary/60"
-              : "border-border"
+          "relative -mt-3 w-full min-w-0 rounded-md border bg-card pt-3 transition-colors duration-200 motion-reduce:transition-none",
+          stateTone
         )}
         data-cell-frame
+        style={{ borderWidth: frameBorderWidth }}
       >
-        <div className="nodrag flex min-h-9 flex-wrap items-center gap-1 border-b border-border/70 px-2.5 pt-1 pb-1.5">
-          {active ? (
-            <>
-              <span className="inline-flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-sm border border-success/40 bg-success/10 px-1.5 text-xs text-success">
-                <Icon.success className="size-3" />
-                Active
-              </span>
-              {decision ? (
-                <DecisionChip
-                  intent={intent}
-                  onIntent={editable ? actions.onIntent : undefined}
-                  present={new Set(columnsOf(cell).map((c) => c.name))}
-                  report={decision}
+        <Handle
+          className={cn("!size-2 !border-border !bg-card", !incoming.length && "invisible")}
+          position={Position.Top}
+          style={{ top: -frameBorderWidth / 2 }}
+          type="target"
+        />
+        <Handle
+          className={cn("!size-2 !border-border !bg-card", !outgoing.length && "invisible")}
+          position={Position.Bottom}
+          style={{ bottom: -frameBorderWidth / 2 }}
+          type="source"
+        />
+        {hasScript && (
+          <SectionHeader
+            label={
+              cell.transformation.execution === "platform_operations" ? "Operations" : "Script"
+            }
+            meta={
+              cell.transformation.execution === "isolated_container" ||
+              cell.transformation.execution === "platform_operations"
+                ? "Executed by Overmind"
+                : "Execution not recorded"
+            }
+            onToggle={() => setScriptOpen((o) => !o)}
+            open={scriptOpen}
+          />
+        )}
+        {hasScript && scriptOpen && <CellScript cell={cell} key={cell.id} />}
+        {cell.transformation.execution === "external_import" && (
+          <p
+            className="px-3 pt-1 pb-2 text-xs text-muted-foreground"
+            title={cell.transformation.provenance}
+          >
+            External import · execution not verified by Overmind
+          </p>
+        )}
+        {attachment && <p className="px-3 pt-1 pb-2 text-xs text-muted-foreground">{cell.note}</p>}
+        {source && sourceDetails}
+        {cell.state === "failed" && cell.error && (
+          <div className="mx-3 mb-2.5 flex flex-col gap-1">
+            <span className="pixel-label flex items-center gap-1 text-xs text-destructive">
+              <Icon.warning className="size-3" />
+              Error
+            </span>
+            <pre className="whitespace-pre-wrap break-words rounded-sm border border-destructive/40 bg-destructive/10 px-2 py-1 font-mono text-xs text-destructive">
+              {cell.error}
+            </pre>
+          </div>
+        )}
+
+        {ran ? (
+          <div className={cn(!source && (hasScript || attachment) && "border-t border-border/70")}>
+            <SectionHeader
+              alerts={
+                terminal && !metricsOpen ? <AnalyticsAlerts report={cell.analytics} /> : undefined
+              }
+              label="Data"
+              meta={`${cell.rows.toLocaleString()} rows × ${columns}`}
+              onToggle={() => setTableOpen((o) => !o)}
+              open={tableOpen}
+            />
+            {tableOpen && (
+              <RowsGrid cellId={cell.id} datasetId={datasetId} diff={!source} pageSize={10} />
+            )}
+            {terminal && (
+              <div className="border-t border-border/70">
+                <SectionHeader
+                  label="Metrics"
+                  meta={
+                    cell.analytics?.status === "completed" ? "Measured by Overmind" : "Not measured"
+                  }
+                  onToggle={() => setMetricsOpen((open) => !open)}
+                  open={metricsOpen}
                 />
-              ) : (
+                {metricsOpen && <AnalyticsDetails report={cell.analytics} />}
+              </div>
+            )}
+            {active && (
+              <footer className="flex min-h-8 flex-wrap items-center gap-1 border-t border-border/70 px-2.5 py-1 [&>*]:shrink-0">
+                <span className="inline-flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-sm border border-success/40 bg-success/10 px-1.5 text-xs text-success">
+                  <Icon.success className="size-3" />
+                  Active
+                </span>
                 <FitChip
-                  actions={editable ? actions : undefined}
+                  actions={editable && !frozen ? actions : undefined}
                   capabilities={capabilities}
                   capabilityName={capabilityName}
                   cell={cell}
                   intent={intent}
                 />
-              )}
-              <span className="flex-1" />
-              {decision && intent === "train" && (
-                <Button
-                  className={CONSUMER_BUTTON}
-                  disabled={!decision.ok}
-                  onClick={() => actions.onUse("decision")}
-                  size="xs"
-                  variant="outline"
-                >
-                  <Icon.training />
-                  Train a decision model
-                </Button>
-              )}
-              {!decision && intent === "train" && (
-                <Button
-                  className={CONSUMER_BUTTON}
-                  disabled={!fit.ok}
-                  onClick={() => actions.onUse("train")}
-                  size="xs"
-                  variant="outline"
-                >
-                  <Icon.training />
-                  Train a model
-                </Button>
-              )}
-              {!decision && intent === "eval" && (
-                <>
+                <span className="flex-1" />
+                {intent === "train" && (
                   <Button
-                    className={CONSUMER_BUTTON}
+                    className="border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
                     disabled={!fit.ok}
-                    onClick={() => actions.onUse("optimise")}
-                    size="xs"
-                    variant="outline"
-                  >
-                    <Icon.optimiser />
-                    Run the optimiser
-                  </Button>
-                  <Button
-                    className={CONSUMER_BUTTON}
-                    disabled={!fit.ok}
-                    onClick={() => actions.onUse("train_eval")}
+                    onClick={() => actions.onUse("train")}
                     size="xs"
                     variant="outline"
                   >
                     <Icon.training />
-                    Score a training job
+                    Train a model
                   </Button>
-                </>
-              )}
-            </>
-          ) : (
-            <Button
-              className="ml-auto"
-              disabled={!editable}
-              onClick={actions.onActivate}
-              size="xs"
-              variant="outline"
-            >
-              <Icon.pin />
-              Set active
-            </Button>
-          )}
-        </div>
-        {source ? (
-          <SourceDetails projectId={projectId} spec={sourceSpec} />
-        ) : (
-          <>
-            {cell.script ? (
-              <SectionHeader
-                label="Script"
-                meta={cell.seconds ? `${cell.seconds.toFixed(1)}s` : undefined}
-                onToggle={() => setScriptOpen((open) => !open)}
-                open={scriptOpen}
-              />
-            ) : (
-              <p className="flex items-center gap-1.5 px-2.5 pt-2 pb-1 text-xs text-muted-foreground">
-                <Icon.ai className="size-3 shrink-0" />
-                Rows written by your coding agent
-              </p>
-            )}
-            {cell.script && scriptOpen && (
-              <div className="px-3 pt-1 pb-2.5">
-                <ScriptCode aria-label={`Script of ${cell.version}`} source={cell.script} />
-              </div>
-            )}
-            {attachment.filename && (
-              <p className="flex items-center gap-1.5 px-2.5 pb-2.5 text-xs text-muted-foreground">
-                <Icon.file className="size-3 shrink-0" />
-                <span className="shrink-0">Attached file</span>
-                <span aria-hidden>·</span>
-                <button
-                  className="min-w-0 truncate text-foreground hover:underline"
-                  onClick={() =>
-                    void downloadAttachment(datasetId, cell.id, attachment.filename!).catch((e) =>
-                      notify.error(e, "Download failed")
-                    )
-                  }
-                  type="button"
-                >
-                  {attachment.filename}
-                </button>
-                {attachment.rows != null && (
+                )}
+                {intent === "eval" && (
                   <>
-                    <span aria-hidden>·</span>
-                    <span className="shrink-0 tabular-nums">{plural(attachment.rows, "row")}</span>
+                    <Button
+                      className="border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
+                      disabled={!fit.ok}
+                      onClick={() => actions.onUse("optimise")}
+                      size="xs"
+                      variant="outline"
+                    >
+                      <Icon.optimiser />
+                      Run the optimiser
+                    </Button>
+                    <Button
+                      className="border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
+                      disabled={!fit.ok}
+                      onClick={() => actions.onUse("train_eval")}
+                      size="xs"
+                      variant="outline"
+                    >
+                      <Icon.training />
+                      Use in a training job
+                    </Button>
                   </>
                 )}
-              </p>
+              </footer>
             )}
-            {cell.stdout && (
-              <>
-                <SectionHeader
-                  label="Output"
-                  onToggle={() => setOutputOpen((open) => !open)}
-                  open={outputOpen}
-                />
-                {outputOpen && (
-                  <pre className="nodrag nowheel mx-3 mb-2.5 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-sm border border-border/70 px-2 py-1 font-mono text-xs text-muted-foreground">
-                    {cell.stdout}
-                  </pre>
-                )}
-              </>
-            )}
-            <Changes impact={changes} />
-          </>
-        )}
-        <div className="border-t border-border/70">
-          <SectionHeader
-            label="Data"
-            meta={`${plural(cell.rows, "row")} × ${plural(columns, "column")}`}
-            onToggle={() => setTableOpen((open) => !open)}
-            open={tableOpen}
-          />
-          {tableOpen && (
-            <div className="nodrag">
-              <RowsGrid cellId={cell.id} datasetId={datasetId} diff={!source} />
-            </div>
-          )}
-        </div>
-        {hasAnalytics(analytics) && (
-          <div className="border-t border-border/70">
-            <SectionHeader
-              label="Analytics"
-              meta={<AnalyticsSummary analytics={analytics} />}
-              onToggle={() => setAnalyticsOpen((open) => !open)}
-              open={analyticsOpen}
-            />
-            {analyticsOpen && <AnalyticsDetails analytics={analytics} />}
           </div>
-        )}
+        ) : null}
       </div>
     </article>
   );

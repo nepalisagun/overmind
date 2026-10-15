@@ -25,12 +25,6 @@ export interface InspectUploadRequest {
      * @memberof InspectUploadRequest
      */
     size: number;
-    /**
-     *
-     * @type {string}
-     * @memberof InspectUploadRequest
-     */
-    jsonRowsField?: string;
 }
 
 /**
@@ -52,7 +46,6 @@ export function InspectUploadRequestFromJSONTyped(json: any, ignoreDiscriminator
     return {
 
         'size': json['size'],
-        'jsonRowsField': json['json_rows_field'] == null ? undefined : json['json_rows_field'],
     };
 }
 
@@ -68,6 +61,5 @@ export function InspectUploadRequestToJSONTyped(value?: InspectUploadRequest | n
     return {
 
         'size': value['size'],
-        'json_rows_field': value['jsonRowsField'],
     };
 }

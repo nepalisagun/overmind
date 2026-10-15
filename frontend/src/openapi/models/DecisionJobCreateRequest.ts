@@ -13,6 +13,14 @@
  */
 
 import { mapValues } from '../runtime';
+import type { SplitMethod3daEnum } from './SplitMethod3daEnum';
+import {
+    SplitMethod3daEnumFromJSON,
+    SplitMethod3daEnumFromJSONTyped,
+    SplitMethod3daEnumToJSON,
+    SplitMethod3daEnumToJSONTyped,
+} from './SplitMethod3daEnum';
+
 /**
  *
  * @export
@@ -48,6 +56,36 @@ export interface DecisionJobCreateRequest {
      * @type {string}
      * @memberof DecisionJobCreateRequest
      */
+    validationDataset?: string | null;
+    /**
+     *
+     * @type {string}
+     * @memberof DecisionJobCreateRequest
+     */
+    validationVersion?: string;
+    /**
+     *
+     * @type {boolean}
+     * @memberof DecisionJobCreateRequest
+     */
+    validationEnabled?: boolean;
+    /**
+     *
+     * @type {number}
+     * @memberof DecisionJobCreateRequest
+     */
+    validationSplitRatio?: number;
+    /**
+     *
+     * @type {SplitMethod3daEnum}
+     * @memberof DecisionJobCreateRequest
+     */
+    splitMethod?: SplitMethod3daEnum;
+    /**
+     *
+     * @type {string}
+     * @memberof DecisionJobCreateRequest
+     */
     evalDataset?: string | null;
     /**
      *
@@ -55,7 +93,39 @@ export interface DecisionJobCreateRequest {
      * @memberof DecisionJobCreateRequest
      */
     evalVersion?: string;
+    /**
+     *
+     * @type {any}
+     * @memberof DecisionJobCreateRequest
+     */
+    hyperparameters?: any | null;
+    /**
+     *
+     * @type {string}
+     * @memberof DecisionJobCreateRequest
+     */
+    name?: string;
+    /**
+     *
+     * @type {string}
+     * @memberof DecisionJobCreateRequest
+     */
+    useCase?: string;
+    /**
+     *
+     * @type {Array<string>}
+     * @memberof DecisionJobCreateRequest
+     */
+    acceptedFindings?: Array<string>;
+    /**
+     *
+     * @type {string}
+     * @memberof DecisionJobCreateRequest
+     */
+    requestKey: string;
 }
+
+
 
 /**
  * Check if a given object implements the DecisionJobCreateRequest interface.
@@ -64,6 +134,7 @@ export function instanceOfDecisionJobCreateRequest(value: object): value is Deci
     if (!('project' in value) || value['project'] === undefined) return false;
     if (!('model' in value) || value['model'] === undefined) return false;
     if (!('dataset' in value) || value['dataset'] === undefined) return false;
+    if (!('requestKey' in value) || value['requestKey'] === undefined) return false;
     return true;
 }
 
@@ -81,8 +152,18 @@ export function DecisionJobCreateRequestFromJSONTyped(json: any, ignoreDiscrimin
         'model': json['model'],
         'dataset': json['dataset'],
         'version': json['version'] == null ? undefined : json['version'],
+        'validationDataset': json['validation_dataset'] == null ? undefined : json['validation_dataset'],
+        'validationVersion': json['validation_version'] == null ? undefined : json['validation_version'],
+        'validationEnabled': json['validation_enabled'] == null ? undefined : json['validation_enabled'],
+        'validationSplitRatio': json['validation_split_ratio'] == null ? undefined : json['validation_split_ratio'],
+        'splitMethod': json['split_method'] == null ? undefined : SplitMethod3daEnumFromJSON(json['split_method']),
         'evalDataset': json['eval_dataset'] == null ? undefined : json['eval_dataset'],
         'evalVersion': json['eval_version'] == null ? undefined : json['eval_version'],
+        'hyperparameters': json['hyperparameters'] == null ? undefined : json['hyperparameters'],
+        'name': json['name'] == null ? undefined : json['name'],
+        'useCase': json['use_case'] == null ? undefined : json['use_case'],
+        'acceptedFindings': json['accepted_findings'] == null ? undefined : json['accepted_findings'],
+        'requestKey': json['request_key'],
     };
 }
 
@@ -101,7 +182,17 @@ export function DecisionJobCreateRequestToJSONTyped(value?: DecisionJobCreateReq
         'model': value['model'],
         'dataset': value['dataset'],
         'version': value['version'],
+        'validation_dataset': value['validationDataset'],
+        'validation_version': value['validationVersion'],
+        'validation_enabled': value['validationEnabled'],
+        'validation_split_ratio': value['validationSplitRatio'],
+        'split_method': SplitMethod3daEnumToJSON(value['splitMethod']),
         'eval_dataset': value['evalDataset'],
         'eval_version': value['evalVersion'],
+        'hyperparameters': value['hyperparameters'],
+        'name': value['name'],
+        'use_case': value['useCase'],
+        'accepted_findings': value['acceptedFindings'],
+        'request_key': value['requestKey'],
     };
 }

@@ -18,5 +18,9 @@ def cell_path(dataset_id: Any, cell_id: Any) -> Path:
     return dataset_dir(dataset_id) / "cells" / f"{cell_id}.parquet"
 
 
-def attachment_path(dataset_id: Any, sha256: str) -> Path:
-    return dataset_dir(dataset_id) / "attachments" / sha256
+def source_path(dataset_id: Any, artifact_id: str) -> Path:
+    return dataset_dir(dataset_id) / "sources" / artifact_id
+
+
+def attachment_path(dataset_id: Any, cell_id: Any) -> Path:
+    return dataset_dir(dataset_id) / "attachments" / f"{cell_id}.parquet"

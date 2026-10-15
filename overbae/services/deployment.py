@@ -10,15 +10,20 @@ from datetime import timedelta
 import modal
 from asgiref.sync import async_to_sync
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from modal.call_graph import InputStatus
 
+from modal_shared.decision_artifact import verify_report
+from modal_shared.decisions import DECISION_OBJECTIVES
 from overbae.core.errors import InputValidationError
 from overbae.modal.gpu_selector import gpu_vram_gb, select_gpu
 from overbae.modal.model_registry import get_hf_base, get_model_config_any_backend
 from overbae.models import DeployedModel, FinetuningJob, FinetuningJobEval
+from overbae.services import operational_progress, provider_progress
+from overbae.services.decision_serving import current_runtime
 from overbae.services.finetuning_runner import MAX_ACTIVITY_LINES
 from overbae.services.model_catalog import resolve_training_openrouter_slug
 from overbae.services.plan_limits import PlanLimitExceeded, require_plan_quota
@@ -54,6 +59,8 @@ def model_slug(job: FinetuningJob) -> str:
 
 
 def serves_as_adapter(job: FinetuningJob) -> bool:
+    if (job.hyperparameters or {}).get("objective") in DECISION_OBJECTIVES:
+        return False
     training_type = (job.hyperparameters or {}).get("training_type")
     kind = training_type.get("type") if isinstance(training_type, dict) else "Lora"
     if job.provider != "modal" or (kind or "Lora") != "Lora":
@@ -88,6 +95,8 @@ def serving_gpu(deployed: DeployedModel) -> str:
     A row saved before the floor was measured keeps booting a worker that cannot hold the model.
     """
     stored = deployed.gpu_type or ""
+    if deployed.inference_contract == "decision":
+        return stored
     cfg = get_model_config_any_backend(deployed.base_model_id) or {}
     minimum = (cfg.get("inference") or {}).get("min_vram_gb") or 0
     if not stored or not minimum or not deployed.max_model_len:
@@ -149,9 +158,28 @@ def ensure_training_deployment(job_id: str) -> DeployedModel | None:
                 )
                 return None
         cfg = get_model_config_any_backend(job.base_model) or {}
-        context = job_serving_plan(job)["max_model_len"]
-        adapter = serves_as_adapter(job)
-        gpu, _ = select_gpu({**cfg, "fp8_supported": False} if adapter else cfg, context)
+        native = (job.hyperparameters or {}).get("objective") in DECISION_OBJECTIVES
+        if native:
+            try:
+                verify_report(job.result.get("reload_verification") or {})
+                context = int(job.effective_configuration["parameters"]["MAX_LENGTH"])
+                gpu = job.effective_configuration["gpu_type"]
+                if (
+                    not job.result.get("artifact_identity")
+                    or job.effective_configuration["gpu_count"] != 1
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InputValidationError(
+                    "Decision deployment requires a verified checkpoint and recorded single-GPU runtime."
+                ) from exc
+            runtime = current_runtime()
+            adapter = False
+        else:
+            context = job_serving_plan(job)["max_model_len"]
+            adapter = serves_as_adapter(job)
+            gpu, _ = select_gpu({**cfg, "fp8_supported": False} if adapter else cfg, context)
+            runtime = {}
         deployed = DeployedModel.objects.create(
             finetuning_job=job,
             project=job.project,
@@ -160,6 +188,10 @@ def ensure_training_deployment(job_id: str) -> DeployedModel | None:
             gpu_type=gpu,
             max_model_len=context,
             is_lora=adapter,
+            inference_contract="decision" if native else "chat",
+            serving_runtime=runtime,
+            checkpoint_hash=job.result.get("artifact_identity", "") if native else "",
+            quantization="bf16" if native else "fp8",
         )
         _reset(deployed)
         FinetuningJob.objects.filter(pk=job.pk).update(status="deploying", error_message="")
@@ -277,7 +309,11 @@ def retry_deployment(deployment_id) -> DeployedModel:
 
 
 def _remote_operation(deployed: DeployedModel):
-    env = modal_environment()
+    env = (
+        deployed.serving_runtime["environment"]
+        if deployed.inference_contract == "decision"
+        else modal_environment()
+    )
     base = get_hf_base(deployed.base_model_id)
     job = deployed.finetuning_job
     cfg = get_model_config_any_backend(deployed.base_model_id) or {}
@@ -296,6 +332,11 @@ def _remote_operation(deployed: DeployedModel):
             "job_result": job.result if isinstance(job.result, dict) else {},
         }
     if stage == "weights":
+        if deployed.inference_contract == "decision":
+            runtime = deployed.serving_runtime
+            return modal.Function.from_name(
+                runtime["app"], "publish", environment_name=runtime["environment"]
+            ), {"remote_id": job.remote_job_id, "artifact_identity": deployed.checkpoint_hash}
         if job and serves_as_adapter(job):
             return modal.Function.from_name(
                 "overmind-register", "publish_adapter", environment_name=env
@@ -344,6 +385,16 @@ def _remote_operation(deployed: DeployedModel):
 
 
 def verification_operation(deployed: DeployedModel):
+    if deployed.inference_contract == "decision":
+        runtime = deployed.serving_runtime
+        return modal.Function.from_name(
+            runtime["app"], "pre_warm", environment_name=runtime["environment"]
+        ), {
+            "weights_path": deployed.weights_path,
+            "artifact_identity": deployed.checkpoint_hash,
+            "max_model_len": deployed.max_model_len,
+            "gpu_type": deployed.gpu_type,
+        }
     return modal.Function.from_name(
         "overmind-inference", "pre_warm", environment_name=modal_environment()
     ), {
@@ -383,6 +434,26 @@ def poll_operation(call_id: str) -> tuple[str, object]:
         # A transport failure is not proof the remote operation failed. Reconnect to
         # this handle until the provider confirms a terminal result or the deadline.
         graph = _bounded(call.get_call_graph.aio)
+        nodes = list(_call_tree(graph))
+        cache.set(
+            "operation-graph:" + call_id,
+            {
+                "observed_at": timezone.now().isoformat(),
+                "total": len(nodes),
+                "truncated": len(nodes) > 200,
+                "calls": [
+                    {
+                        "provider_call_id": node.function_call_id,
+                        "provider_input_id": getattr(node, "input_id", None),
+                        "worker_id": getattr(node, "task_id", None),
+                        "status": node.status.name,
+                        "function": getattr(node, "function_name", None),
+                    }
+                    for node in nodes[:200]
+                ],
+            },
+            timeout=60,
+        )
         terminal = {
             InputStatus.FAILURE,
             InputStatus.INIT_FAILURE,
@@ -501,6 +572,16 @@ def _finish(deployed: DeployedModel, *, error: str = "") -> None:
 
 
 def _publish_progress(deployed: DeployedModel) -> None:
+    operation = operational_progress.deployment(deployed)
+    if deployed.deployment_call_id:
+        provider_progress.collect(
+            operation,
+            environment=deployed.serving_runtime["environment"]
+            if deployed.inference_contract == "decision"
+            else modal_environment(),
+            call_id=deployed.deployment_call_id,
+            deployed=deployed,
+        )
     job_ids = (
         [deployed.finetuning_job_id]
         if deployed.finetuning_job_id
@@ -615,6 +696,18 @@ def _complete_stage(deployed: DeployedModel, result) -> None:
     elif stage == "archive":
         values["deployment_stage"] = "weights"
     elif stage == "weights":
+        if deployed.inference_contract == "decision":
+            if result["artifact_identity"] != deployed.checkpoint_hash:
+                raise ValueError("Serving artifact identity differs")
+            values.update(
+                weights_path=result["weights_path"],
+                inference_url=f"/api/deployed-models/{deployed.pk}/inference/",
+                deployment_stage="warm",
+                status="warming",
+                status_changed_at=timezone.now(),
+            )
+            _save(deployed, **values)
+            return
         if deployed.finetuning_job and serves_as_adapter(deployed.finetuning_job):
             values.update(
                 weights_path="/weights/" + result["base_path"].removeprefix("/weights/"),
@@ -644,6 +737,12 @@ def _complete_stage(deployed: DeployedModel, result) -> None:
             status_changed_at=timezone.now(),
         )
     elif stage == "warm":
+        if deployed.inference_contract == "decision" and (
+            not isinstance(result, dict)
+            or result.get("verified") is not True
+            or result.get("artifact_identity") != deployed.checkpoint_hash
+        ):
+            raise ValueError("Decision serving verification is missing")
         # pre_warm completes only after a successful inference request, including the adapter.
         if _save(deployed, **values):
             deployed.deployment_call_id = ""
@@ -694,6 +793,15 @@ def advance_deployment(deployment_id) -> None:
             _finish(deployed, error="Deployment deadline exceeded. Checkpoint preserved.")
             return
         if deployed.deployment_call_id:
+            operation = operational_progress.deployment(deployed)
+            provider_progress.collect(
+                operation,
+                environment=deployed.serving_runtime["environment"]
+                if deployed.inference_contract == "decision"
+                else modal_environment(),
+                call_id=deployed.deployment_call_id,
+                deployed=deployed,
+            )
             state, result = poll_operation(deployed.deployment_call_id)
             if state == "complete":
                 try:

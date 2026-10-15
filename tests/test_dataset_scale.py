@@ -1,5 +1,5 @@
-"""A 20,000-row table moves through landing, a sandboxed version, paging and the diff
-inside budgets a per-row Python loop or a quadratic join would miss by a wide margin."""
+"""A 20,000-row table moves through landing, a cell, paging and the diff inside
+budgets a per-row Python loop or a quadratic join would miss by a wide margin."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import uuid
 
 import pytest
 
-from overbae.models import Dataset, Execution, Project
-from overbae.services.datasets import diff, executions, land, paths, store
+from overbae.models import Dataset, Project
+from overbae.services.datasets import diff, land, paths, store
 
 pytestmark = pytest.mark.django_db
 ROWS = 20_000
@@ -35,24 +35,19 @@ def test_twenty_thousand_transcripts_land_run_page_and_diff_within_budget():
         for i in range(ROWS)
     ]
     project = Project.objects.create(name="P", slug=f"p-{uuid.uuid4().hex[:8]}")
-    dataset = Dataset.objects.create(project=project, name="big", intent="pending")
+    dataset = Dataset.objects.create(project=project, name="big", intent="train")
     _timed(20, lambda: land.land_rows(dataset, rows))
     dataset.refresh_from_db()
     assert dataset.intent == "train" and dataset.source.fits("train") == (True, "")
 
-    done = _timed(
-        30,
-        lambda: executions.run_now(
-            dataset,
-            mode=Execution.Mode.CELL,
-            parent=dataset.source,
-            script="df = df[df.tag != 3]\n",
-            title="Drop a tag",
-        ),
-    )
-    cell = done.cell
-    assert cell is not None, done.run.error
-    assert cell.rows == ROWS - len(range(3, ROWS, 7))
+    from conftest import import_version
+
+    selected = [
+        r for r in store.iter_rows(paths.cell_path(dataset.pk, dataset.source.pk)) if r["tag"] != 3
+    ]
+    cell = _timed(30, lambda: import_version(dataset, selected, name="Drop a tag"))
+    cell.refresh_from_db()
+    assert cell.state == "ok" and cell.rows == ROWS - len(range(3, ROWS, 7))
 
     before = paths.cell_path(dataset.id, dataset.source.id)
     after = paths.cell_path(dataset.id, cell.id)

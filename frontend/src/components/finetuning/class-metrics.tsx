@@ -5,19 +5,14 @@ import { useMemo, useState } from "react";
 
 import { type MetricSeries, MultiSeriesChart } from "@/components/finetuning/loss-chart";
 import { Chip } from "@/components/ui/chip";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { SortableHeader } from "@/components/ui/sortable-header";
+import { Table, TableBody, TableCell, TableHeader, TableRow } from "@/components/ui/table";
 import type {
   ClassMetrics,
   ConfusionMatrixData,
   FinetuningJudgeEvalRow,
 } from "@/hooks/use-finetuning";
+import { useTableSort } from "@/hooks/use-table-sort";
 import { seriesColor } from "@/lib/colors";
 import { PROSE } from "@/lib/typography";
 import { cn } from "@/lib/utils";
@@ -83,50 +78,37 @@ export function buildMacroSeries(rows: FinetuningJudgeEvalRow[]): MetricSeries[]
   }));
 }
 
-type SortKey = "support" | "f1";
+type SortKey = "label" | "precision" | "recall" | "support" | "f1";
 
 const fmt = (v: number | undefined) => (v != null ? v.toFixed(3) : "—");
 
 export function ClassMetricsTable({ metrics }: { metrics: ClassMetrics }) {
-  const [sortKey, setSortKey] = useState<SortKey>("support");
-  const rows = useMemo(
-    () => [...metrics.classes].sort((a, b) => b[sortKey] - a[sortKey]),
-    [metrics.classes, sortKey]
-  );
+  const { sort, onSort, sortRows } = useTableSort<SortKey>({ dir: "desc", key: "support" });
+  const rows = sortRows(metrics.classes, (row, key) => row[key]);
   const agg = metrics.aggregates;
-
-  const sortHeader = (key: SortKey, label: string) => (
-    <button
-      aria-label={`Sort by ${label}`}
-      aria-pressed={sortKey === key}
-      className={cn(
-        // Leading spacer mirrors the sort marker so the label stays centred.
-        "inline-flex items-center gap-1 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        sortKey === key ? "text-foreground" : "hover:text-foreground"
-      )}
-      onClick={() => setSortKey(key)}
-      type="button"
-    >
-      <span aria-hidden className="w-2 shrink-0" />
-      {label}
-      {sortKey === key ? (
-        <span aria-hidden="true">↓</span>
-      ) : (
-        <span aria-hidden className="w-2 shrink-0" />
-      )}
-    </button>
-  );
 
   return (
     <div className="max-h-80 overflow-y-auto">
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Class</TableHead>
-            <TableHead className="text-center">Precision</TableHead>
-            <TableHead className="text-center">Recall</TableHead>
-            <TableHead className="text-center">{sortHeader("f1", "F1")}</TableHead>
-            <TableHead className="text-center">{sortHeader("support", "Support")}</TableHead>
+            <SortableHeader label="Class" onSort={onSort} sort={sort} sortKey="label" />
+            <SortableHeader
+              centered
+              label="Precision"
+              onSort={onSort}
+              sort={sort}
+              sortKey="precision"
+            />
+            <SortableHeader centered label="Recall" onSort={onSort} sort={sort} sortKey="recall" />
+            <SortableHeader centered label="F1" onSort={onSort} sort={sort} sortKey="f1" />
+            <SortableHeader
+              centered
+              label="Support"
+              onSort={onSort}
+              sort={sort}
+              sortKey="support"
+            />
           </TableRow>
         </TableHeader>
         <TableBody>

@@ -2,12 +2,14 @@
 
 Usage: python scripts/check_migrations.py [BASE_REF]   (default: origin/main)
 
-Django's own `makemigrations --check` catches a forked graph; this catches the
-symptoms that survive a merge migration: a reused number or a `_merge_` file.
+Django checks the migration graph. New migrations must have fresh numbers;
+only the checksum-pinned applied histories retain their original identities.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -27,6 +29,11 @@ def number(name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def applied_histories():
+    # These exact histories were applied before integration; renumbering would replay them.
+    return json.loads(Path(__file__).with_name("applied-migration-history.json").read_text())
+
+
 def main(base: str) -> int:
     added = [
         Path(path).name
@@ -42,11 +49,18 @@ def main(base: str) -> int:
     base_names = [Path(p).name for p in git("ls-tree", "--name-only", base, f"{MIGRATIONS}/")]
     base_max = max((number(n) or 0 for n in base_names), default=0)
     on_disk = [p.name for p in MIGRATIONS.glob("*.py")]
+    historical = applied_histories()
 
     errors: list[str] = []
     for name in sorted(added):
         n = number(name)
         assert n is not None
+        if name in historical:
+            if hashlib.sha256((MIGRATIONS / name).read_bytes()).hexdigest() not in historical[name]:
+                errors.append(
+                    f"{name}: applied migration differs from its pinned historical checksum"
+                )
+            continue
         if "_merge_" in name:
             errors.append(f"{name}: merge migration — rebase on {base} and renumber instead")
         if n <= base_max:
@@ -58,7 +72,9 @@ def main(base: str) -> int:
     if errors:
         print("\n".join(errors))
         return 1
-    print(f"{len(added)} migration(s) added after {base_max:04d}: {', '.join(sorted(added))}")
+    print(
+        f"Checked {len(added)} migrations; retained {len(set(added) & historical.keys())} checksum-pinned applied identities."
+    )
     return 0
 
 

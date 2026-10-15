@@ -1,124 +1,174 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Icon } from "@/components/ui/icons";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Progress } from "@/components/ui/progress";
 import { Spinner } from "@/components/ui/spinner";
 import type { DatasetUpload } from "@/hooks/use-uploads";
-import { formatBytes } from "@/lib/formatters";
 import { cn } from "@/lib/utils";
 
-const IMAGE = /\.(png|jpe?g|webp)$/i;
-
-const fileType = (name: string) =>
-  name.toLowerCase().replace(/\.gz$/, "").split(".").at(-1)?.toUpperCase() || "FILE";
-
-function statusText(entry: DatasetUpload): string {
-  if (entry.status === "error") return entry.error ?? "Upload failed";
-  if (entry.status === "queued") return "Queued";
-  if (entry.status === "uploading") return `Uploading ${entry.percent}%`;
-  if (entry.status === "counting") return "Counting rows…";
-  if (entry.rows == null) return "Ready";
-  return `${entry.rows.toLocaleString()} ${entry.rows === 1 ? "row" : "rows"}`;
-}
-
-function ImagePreview({ file }: { file: File }) {
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => {
-    const next = URL.createObjectURL(file);
-    setUrl(next);
-    return () => URL.revokeObjectURL(next);
-  }, [file]);
-  return url ? (
-    <img alt="" className="max-h-48 w-full rounded-sm object-contain" src={url} />
-  ) : null;
+function fileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
 export function Attachment({
   entry,
   disabled,
-  onRetry,
   onRemove,
+  onRetry,
+  detailed = false,
 }: {
   entry: DatasetUpload;
   disabled: boolean;
-  onRetry: () => void;
   onRemove: () => void;
+  onRetry: () => void;
+  detailed?: boolean;
 }) {
-  const name = entry.file.name;
-  const image = IMAGE.test(name);
-  const working = entry.status !== "ready" && entry.status !== "error";
+  const statusId = useId();
+  const isImage = /\.(png|jpe?g|webp)$/i.test(entry.file.name);
+  const [preview, setPreview] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isImage) return;
+    const url = URL.createObjectURL(entry.file);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [entry.file, isImage]);
+  const working = entry.status === "uploading" || entry.status === "counting";
+  const status = {
+    counting: "Checking file…",
+    error: "Upload failed",
+    queued: "Queued",
+    ready: isImage ? "Ready for OCR" : "Ready",
+    uploading: `Uploading ${entry.percent}%`,
+  }[entry.status];
+  const type = entry.file.name.replace(/\.gz$/i, "").split(".").at(-1)?.toUpperCase();
   return (
-    <li className="flex items-center gap-3 rounded-sm border border-border bg-muted px-3 py-2">
-      <HoverCard openDelay={200}>
-        <HoverCardTrigger asChild>
-          <span className="flex min-w-0 flex-1 items-center gap-3">
-            <Icon.file className="size-4 shrink-0 text-muted-foreground" />
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm" title={name}>
-                {name}
-              </span>
-              <span
-                className={cn(
-                  "block text-xs",
-                  entry.status === "error" ? "text-destructive" : "text-muted-foreground"
-                )}
-              >
-                {statusText(entry)}
-              </span>
-            </span>
+    <li
+      className={cn(
+        "flex h-8 min-w-0 max-w-full items-center rounded-sm bg-control pr-1 sm:max-w-72",
+        detailed && "h-auto w-full gap-2 border border-border bg-muted py-1.5 sm:max-w-none",
+        entry.status === "error" && "text-destructive"
+      )}
+    >
+      <Popover>
+        <PopoverTrigger
+          aria-describedby={statusId}
+          aria-label={`View ${entry.file.name}`}
+          className={cn(
+            "flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-sm px-2 text-left text-sm outline-none transition-colors hover:bg-control-hover focus-visible:ring-2 focus-visible:ring-ring/60",
+            detailed && "h-auto gap-2.5"
+          )}
+          title={`${entry.file.name} · ${fileSize(entry.file.size)} · ${status}`}
+          type="button"
+        >
+          {preview && (
+            <img
+              alt=""
+              className="size-6 shrink-0 rounded-sm bg-background object-cover"
+              onError={() => setPreview(null)}
+              src={preview}
+            />
+          )}
+          <span className="shrink-0">
+            {working ? (
+              <Spinner className="size-3.5" />
+            ) : entry.status === "error" ? (
+              <Icon.warning className="size-3.5 text-destructive" />
+            ) : entry.status === "queued" ? (
+              <Icon.job className="size-3.5" />
+            ) : !preview ? (
+              <Icon.file className="size-3.5" />
+            ) : null}
           </span>
-        </HoverCardTrigger>
-        <HoverCardContent align="start" aria-label={`File details: ${name}`} className="w-72 p-2.5">
-          <div className="flex flex-col gap-2 text-xs">
-            {image && <ImagePreview file={entry.file} />}
-            <p className="truncate text-foreground">{name}</p>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate">{entry.file.name}</span>
+            {detailed && (
+              <span className="block truncate text-xs text-muted-foreground">
+                {entry.error ||
+                  (entry.rows != null ? `${entry.rows.toLocaleString()} rows` : status)}
+              </span>
+            )}
+          </span>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          aria-label={`File details: ${entry.file.name}`}
+          className="w-64 max-w-(--radix-popover-content-available-width) space-y-2 p-3 text-xs"
+          side="top"
+        >
+          {preview && (
+            <img
+              alt={`Preview of ${entry.file.name}`}
+              className="max-h-48 w-full rounded-sm bg-background object-contain"
+              src={preview}
+            />
+          )}
+          <p className="break-words font-medium">{entry.file.name}</p>
+          <p className="text-muted-foreground">
+            {type} · {fileSize(entry.file.size)}
+          </p>
+          <p
+            className={cn("text-muted-foreground", entry.status === "error" && "text-destructive")}
+          >
+            {entry.error || status}
+          </p>
+          {isImage && entry.status === "ready" && (
+            <p className="text-muted-foreground">Text extraction starts when sent.</p>
+          )}
+          {entry.rows != null && (
             <p className="text-muted-foreground">
-              {fileType(name)} · {formatBytes(entry.file.size)}
+              {entry.rows.toLocaleString()} {entry.rows === 1 ? "row" : "rows"}
             </p>
-            <p className={entry.status === "error" ? "text-destructive" : "text-muted-foreground"}>
-              {statusText(entry)}
-            </p>
-            {entry.status === "ready" && entry.rows == null && (
-              <p className="text-muted-foreground">
-                Text is extracted after the dataset is created.
-              </p>
-            )}
-            {entry.status === "uploading" && (
-              <Progress label={`Uploading ${name}`} percent={entry.percent} />
-            )}
-          </div>
-        </HoverCardContent>
-      </HoverCard>
-      <span className="shrink-0 rounded-sm border border-border px-1.5 py-0.5 text-xs text-muted-foreground">
-        {fileType(name)}
-      </span>
-      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-        {formatBytes(entry.file.size)}
+          )}
+          {working && (
+            <Progress
+              label={`Uploading ${entry.file.name}`}
+              percent={entry.status === "counting" ? null : entry.percent}
+            />
+          )}
+        </PopoverContent>
+      </Popover>
+      {detailed && (
+        <>
+          <span className="shrink-0 rounded-sm border border-border px-1.5 py-0.5 text-xs text-muted-foreground">
+            {type}
+          </span>
+          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+            {fileSize(entry.file.size)}
+          </span>
+        </>
+      )}
+      <span className="sr-only" id={statusId} role="status">
+        {status}
       </span>
       {entry.status === "error" && (
         <Button
-          aria-label={`Retry ${name}`}
+          aria-label={`Retry ${entry.file.name}`}
           disabled={disabled}
           onClick={onRetry}
-          size="sm"
+          size="icon-xs"
           title="Retry upload"
-          variant="secondary"
+          type="button"
+          variant="ghost"
         >
-          Retry
+          <Icon.refresh />
         </Button>
       )}
-      {working && <Spinner className="size-3.5" />}
       <Button
-        aria-label={`Remove ${name}`}
+        aria-label={`Remove ${entry.file.name}`}
+        className="text-muted-foreground"
         disabled={disabled}
         onClick={onRemove}
-        size="icon-sm"
+        size="icon-xs"
+        title="Remove attachment"
         type="button"
         variant="ghost"
       >
-        <Icon.close className="size-4" />
+        <Icon.close />
       </Button>
     </li>
   );

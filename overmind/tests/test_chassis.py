@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from overmind.__main__ import app
 from overmind.chassis import (
     chassis_digest,
+    declared_expectations,
     extract_chassis,
     reachable_names,
     verify_trajectory_claims,
@@ -135,6 +136,40 @@ def test_convert_json_to_toml_stamps_verified(tmp_path):
     assert paths["fabricated"]["verified"] is False
 
 
+DECORATED_SRC = textwrap.dedent(
+    """
+    import overmind
+
+    class Agent:
+        @overmind.entry_point(capability_id="cap-1", expectations=["Cites the order id"])
+        def run(self, text):
+            return summarize(lookup(text))
+
+    @overmind.workflow(expectations=["Lists the refund steps"])
+    def summarize(rows):
+        return rows
+
+    @overmind.tool(expectations=["Returns one order"])
+    def lookup(text):
+        return text
+
+    @overmind.observe(lambda text: text, expectations=["Named per call"])
+    def unreached(text):
+        return text
+    """
+)
+
+
+def test_declared_expectations_follow_the_entry_points_call_graph(tmp_path):
+    (tmp_path / "agent.py").write_text(DECORATED_SRC, encoding="utf-8")
+    assert declared_expectations(tmp_path) == {
+        "cap-1": [
+            {"expectation": "Cites the order id", "span_name": "Agent.run"},
+            {"expectation": "Lists the refund steps", "span_name": "summarize"},
+        ]
+    }
+
+
 def test_chassis_cli_prints_digest(tmp_path, monkeypatch):
     _repo(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -142,3 +177,23 @@ def test_chassis_cli_prints_digest(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "app.agent.run_turn" in result.output
     assert "5 functions across 1 files" in result.output
+
+
+def test_declarations_keep_the_entrypoint_module_when_class_names_repeat(tmp_path):
+    for name in ("browser", "helper"):
+        (tmp_path / f"{name}.py").write_text(
+            textwrap.dedent(f'''
+            import overmind
+            class Agent:
+                @overmind.entry_point(capability_id="{name}")
+                def run(self):
+                    return self.{name}_result()
+                @overmind.observe(expectations=["{name} result is accurate"])
+                def {name}_result(self):
+                    return "result"
+        ''')
+        )
+    assert declared_expectations(tmp_path) == {
+        name: [{"expectation": f"{name} result is accurate", "span_name": f"Agent.{name}_result"}]
+        for name in ("browser", "helper")
+    }

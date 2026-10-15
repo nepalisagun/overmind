@@ -17,8 +17,10 @@ import * as runtime from '../runtime';
 import type {
   DeployedModel,
   InferenceActivity,
+  InferenceInputRequest,
   InferenceLiveStats,
   InferenceMetrics,
+  InferenceReceipt,
   ModelCheckpoints,
   PaginatedDeployedModelList,
 } from '../models/index';
@@ -27,10 +29,14 @@ import {
     DeployedModelToJSON,
     InferenceActivityFromJSON,
     InferenceActivityToJSON,
+    InferenceInputRequestFromJSON,
+    InferenceInputRequestToJSON,
     InferenceLiveStatsFromJSON,
     InferenceLiveStatsToJSON,
     InferenceMetricsFromJSON,
     InferenceMetricsToJSON,
+    InferenceReceiptFromJSON,
+    InferenceReceiptToJSON,
     ModelCheckpointsFromJSON,
     ModelCheckpointsToJSON,
     PaginatedDeployedModelListFromJSON,
@@ -54,6 +60,11 @@ export interface DeployedModelsDeployCreateRequest {
 
 export interface DeployedModelsDestroyRequest {
     id: string;
+}
+
+export interface DeployedModelsInferenceCreateRequest {
+    deploymentId: string;
+    inferenceInputRequest: InferenceInputRequest;
 }
 
 export interface DeployedModelsListRequest {
@@ -335,7 +346,71 @@ export class DeployedModelsApi extends runtime.BaseAPI {
     }
 
     /**
-     * Overlay robust (median) latency/throughput onto each row.  The queryset annotates SQL means for these two, but a few slow-client or very-long-generation outliers skew a mean badly; the median is computed per model in Python here so the table stays comparable across models with very different baselines.
+     */
+    async deployedModelsInferenceCreateRaw(requestParameters: DeployedModelsInferenceCreateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InferenceReceipt>> {
+        if (requestParameters['deploymentId'] == null) {
+            throw new runtime.RequiredError(
+                'deploymentId',
+                'Required parameter "deploymentId" was null or undefined when calling deployedModelsInferenceCreate().'
+            );
+        }
+
+        if (requestParameters['inferenceInputRequest'] == null) {
+            throw new runtime.RequiredError(
+                'inferenceInputRequest',
+                'Required parameter "inferenceInputRequest" was null or undefined when calling deployedModelsInferenceCreate().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("ClerkBearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        if (this.configuration && this.configuration.apiKey) {
+            headerParameters["X-Api-Key"] = await this.configuration.apiKey("X-Api-Key"); // ApiKeyAuth authentication
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("BearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/deployed-models/{deployment_id}/inference/`;
+        urlPath = urlPath.replace(`{${"deployment_id"}}`, encodeURIComponent(String(requestParameters['deploymentId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: InferenceInputRequestToJSON(requestParameters['inferenceInputRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InferenceReceiptFromJSON(jsonValue));
+    }
+
+    /**
+     */
+    async deployedModelsInferenceCreate(requestParameters: DeployedModelsInferenceCreateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InferenceReceipt> {
+        const response = await this.deployedModelsInferenceCreateRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
      * List deployed models for the current project
      */
     async deployedModelsListRaw(requestParameters: DeployedModelsListRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PaginatedDeployedModelList>> {
@@ -405,7 +480,6 @@ export class DeployedModelsApi extends runtime.BaseAPI {
     }
 
     /**
-     * Overlay robust (median) latency/throughput onto each row.  The queryset annotates SQL means for these two, but a few slow-client or very-long-generation outliers skew a mean badly; the median is computed per model in Python here so the table stays comparable across models with very different baselines.
      * List deployed models for the current project
      */
     async deployedModelsList(requestParameters: DeployedModelsListRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PaginatedDeployedModelList> {

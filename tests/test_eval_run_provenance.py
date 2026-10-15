@@ -19,14 +19,14 @@ def project() -> Project:
 
 
 def test_version_info_names_the_pinned_version(project):
-    dataset = frozen_dataset(project, EVAL_ROWS, name="graded set")
+    dataset = frozen_dataset(project, EVAL_ROWS, name="graded set", contract="eval")
     version = dataset.active_cell
     run = EvalRun.objects.create(project=project, name="e", dataset=dataset, cell=version)
     data = EvalRunSerializer(run).data
     assert data["dataset_name"] == "graded set"
     assert data["cell_info"] == {
         "id": str(version.id),
-        "version": "v0",
+        "version": "1.0",
         "title": "Source",
         "rows": 2,
         "fingerprint": version.fingerprint,
@@ -35,7 +35,7 @@ def test_version_info_names_the_pinned_version(project):
 
 
 def test_version_info_null_without_a_pin(project):
-    dataset = frozen_dataset(project, EVAL_ROWS)
+    dataset = frozen_dataset(project, EVAL_ROWS, contract="eval")
     run = EvalRun.objects.create(project=project, name="e", dataset=dataset)
     assert EvalRunSerializer(run).data["cell_info"] is None
     bare = EvalRun.objects.create(project=project, name="e2", dataset=None)

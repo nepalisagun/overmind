@@ -5,6 +5,9 @@ description: Select models, prepare exact training inputs, estimate costs, launc
 
 # Overmind Training
 
+For a request spanning source transformation through training launch and comparison,
+start with the `model-training-engineering` skill, then use this skill for Training.
+
 Start with `list_projects` and choose the intended accessible project. For an
 account connection, pass its `project_id` on every project tool and resource
 URI query; follow returned links. Project API keys retain their narrower access.
@@ -15,16 +18,31 @@ contract. Use the chosen MCP project. For an existing job, start with
 
 ## Prepare the training contract
 
+For data-first development, use `save_training_plan` and the evidence-linked
+procedure in [model workflows](../overmind/references/model-workflows.md).
+Retain task/source, Workshop output and partition identities and attributed
+audit/baseline/sanity evidence. Use stage=full directly for requested full training;
+no pilot job or measured pilot selection is required. Use stage=pilot only when
+the user requests a bounded quality experiment. Any optional pilot selection must
+reference matching task/data evidence, never an unrelated existing run.
+Hardware profiles and formatting success are not quality evidence.
+
 Prefer the native `finetune-capability` prompt with the selected dataset and
 optional capability. Resolve datasets with `list_datasets`; inspect and query
-the exact train and held-out eval versions. Inspect whole-frame task families and
-fit findings rather than assuming a sample describes the whole corpus.
+the exact train and held-out eval cells. Inspect whole-frame task families and
+workshop findings rather than assuming a sample describes the whole corpus.
 
 Use `get_model_catalog` for initial model discovery, then
-`check_finetune_readiness` for the selected dataset. A capability is optional;
-held-out evaluation data and an applicable eval set are required. Use the
-returned requirements to identify technical blockers. Capability mismatch and
-train/eval overlap remain visible advisory warnings.
+`check_finetune_readiness` for the selected dataset. A capability is optional. Ordinary held-out evaluation data and an applicable eval set are required only when those chat evaluations are selected. Native decision training has a separate native suite plan. Use the
+returned requirements to identify technical blockers. Quality findings,
+overlap and incomplete semantic reviews remain visible advisory warnings.
+
+For typed decision training, call `list_decision_training_models` to see the explicit Clef, D3 and D1 families and their current launch availability. D3 and D1 are discoverable but unavailable until exact preparation and verified probability serving are qualified. Use `start_decision_job` for an available family and a stable `request_key`; it returns a separate `decision_job` ID and the underlying training run. Both IDs refer to the same preparation, monitoring, cancellation, billing and recovery lifecycle. `prepare_training_data` also returns the DecisionJob ID for an applicable setup run. Inspect it with `get_job(kind="decision_job")` or the linked resource, and pass either ID to `inspect_training_progress` and `cancel_finetune`.
+
+The model catalogue returns `openrouter_id` and `openrouter_status` for base
+benchmarks. Only `available` establishes a catalogue match; null IDs, `not_listed`
+and `catalog_unavailable` do not. Never substitute a different model size or variant.
+Overmind resolves the exact route; trained checkpoints retain their own hosting.
 
 Read `benchmark_model` on the capability when comparing with an incumbent.
 `set_benchmark_model` changes future benchmark selection, not live serving or
@@ -35,10 +53,10 @@ benchmark selection and readable dataset versions.
 
 For Modal training, call `prepare_training_data` for the chosen model, context
 length and cell, then poll the returned `training_preparation` job. Inspect
-exact token counts, supervised content and incompatible rows. Fix concrete
-source rows with a new dataset version (`add_dataset_version`); keep
-model-specific preprocessing in Training. Reprepare a changed version rather
-than reusing a stale report.
+exact token counts, supervised content and incompatible rows. Send concrete
+source-row repairs through native-agent-authored pipelines or lineage-bound
+`import_dataset_version` results; keep model-specific preprocessing
+in Training. Reprepare a changed cell rather than reusing a stale report.
 
 Use `estimate_finetune` and evaluation readiness to present training plus
 before/after evaluation spend. Each selected evaluation uses the full pinned
@@ -46,13 +64,64 @@ eval dataset. Context warnings do not automatically block launch or change
 model selection. An approved preview's `judge_model` becomes
 `eval_judge_model` on `start_finetune`; omission preserves the set's judges.
 
+For Modal/Baseten, `batch_size` means the effective optimizer batch. The runtime
+derives micro-batching and accumulation; `gradient_accumulation_steps` and
+`per_device_train_batch_size` are rejected. Native decision readiness supplies
+eligible models, not a chat-benchmark ranking or an unmeasured price promise.
+
 ## Launch and verify
 
+Freeze `hyperparameters.monitoring` with the rest of the recipe. Modal and Baseten
+support loss monitoring with adaptive/steps/epoch/off schedules; discover current
+provider capabilities from the model catalogue. Modal also accepts explicit
+classification labels, exact matching, JSON Schema and `json_fields` generation probes. The
+agent supplies task semantics; the platform never invents labels or a success
+rubric. Metered judges, challenge suites and declared-strata sampling are not
+available in this monitoring contract. Native decisions use their typed metrics.
+
+For extraction checks, declare `generation={kind:"json_fields", fields:["/risk", "/case/id"]}`.
+Fields are 1–64 distinct JSON Pointers (empty string means the whole document);
+escape `/` as `~1` and `~` as `~0`. Nested objects and ordered arrays compare
+exactly; undeclared fields are ignored. This is separate from schema validity,
+not a schema/field hybrid. Missing or invalid references are unscorable, while
+missing/wrong predictions fail. Inspect per-field coverage and complete-example
+pass rates separately. The scorer never infers fields or executes tools.
+
+Default monitoring uses initial, fixed-sample periodic and full final development
+checks. Samples freeze during Modal transfer before GPU dispatch, not during
+token preparation. Adaptive scheduling changes timing only; the overhead target
+is not a spend cap. Set `selection=development_loss` or `early_stopping` only when
+the user authorises that decision rule. Required checks fail closed. For a bounded
+Modal call, `runtime_limit_seconds` sets a hard provider timeout without changing
+optimizer steps; CPU preparation, storage and other costs remain separate.
+
+Use `inspect_training_progress(job=..., check=..., offset=..., limit=...)` for
+retained examples or `probe=development|training_reference|generation` for sample
+identities. With neither selector, it pages checks and reports checkpoints and
+current schedule. Reads never invoke the provider. Missing/failed measurements,
+unrepresented labels and generation truncation are not zero-quality scores.
+Paired intervals describe development evidence, not final generalisation.
+The compact `get_job` summary retains `latest_generation_check` separately from
+newer loss-only checks. Classification `facts.assessment` records comparisons
+with the majority-label baseline on the same scored examples and represented
+labels with no predictions. Inspect coverage, receipt identity and observation
+time: these are sample facts, not a diagnosis, population estimate or stop rule.
+Invalid or incomplete counts produce an inconclusive assessment, not a quality claim.
+`cancel_finetune` records cancellation before requesting provider termination;
+already retained evidence remains readable. Adapter reload verification does not
+establish full optimizer resume. Intermediate checkpoint byte export remains
+unavailable; the existing download handoff covers archived final deployments.
+
 Launch only the authorized model/configuration with `start_finetune`. Keep the
-selected data, benchmark, evaluator choices and expected spend in the receipt.
+selected data, benchmark, judge choice and expected spend in the receipt.
 Poll `get_job(kind=finetune_job, id=...)`, then inspect the linked deployment
 separately. Training completion, evaluation completion and serving readiness
 are distinct outcomes.
+
+Native `initial_validation` is presented as **Pre-training baseline evaluation**.
+It measures the starting model on the development set before training begins;
+it is separate from data preparation and the held-out final benchmark.
+MCP progress includes `stage_label` and `stage_description` for this stage. Set `hyperparameters.pre_training_baseline=false` on a native launch or saved experiment variant to skip this pass. It defaults to true and does not disable development validation, checkpoint selection or separately scheduled final benchmarks. The choice is frozen in the recipe; skipped work is recorded as `not_requested`.
 
 Report measured before/after results with trust flags and any unresolved
 preparation findings. A successful training job does not authorize activation
@@ -62,28 +131,16 @@ or a repository model swap. For requested checkpoint export, use
 Open `training` under the project's Console base with its `projectId` for the
 visual job dashboard. Retain the exact job and deployment IDs in the report.
 
-## Decision models
+## Durable experiment receipts
 
-Use a decision model when the task has a closed set of answers: classification,
-routing or scoring over fixed options, asked as questions about a `state`. Use
-chat fine-tuning for generated text. Decision rows are shaped as in
-overmind-datasets and train only decision models.
+Pass the same explicit train/validation/evaluation cell IDs and evaluation choices to readiness, estimate and launch. Supply one stable `request_key` per intended experiment and reuse it after an uncertain client response. A changed recipe needs a new deliberate experiment; do not work around a conflict by generating another key automatically. Inspect the job's requested/effective settings and run record. Unresolved provider submission must be reconciled, never relaunched.
 
-1. Call `check_decision_readiness` on the train dataset. It reports readiness,
-   up to three unranked `picks` and the excluded models. Among the models whose
-   context and limits fit, `strongest` has the highest published
-   `decision_index`, `smaller` the highest index at most half the strongest's
-   size, and `smallest` the fewest params. Offer the picks as trade-offs and let
-   the user choose.
-1. Call `start_decision_job` with `model` and `dataset`, plus optional
-   `eval_dataset`, `version` and `eval_version`.
-1. Poll `get_job` with `kind=decision_job` until the job finishes, then read
-   `evaluation_status`:
-   - `complete`: every answer was scored.
-   - `partial`: some answers were unanswered; `unanswered` gives the counts by
-     reason.
-   - `failed`: no rows were scored.
+For a native decision checkpoint, use `schedule_native_evaluation` with separate frozen calibration and final decision cells. This authorizes paid paired unchanged-base/candidate evaluation after verified checkpoint completion. Poll `get_job(kind=native_evaluation)` and follow its links. References stay local; known incompatible inputs remain visible in coverage. Calibration is frozen before final results. Report raw and calibrated metrics, source slices, paired confidence intervals and regressions separately from training loss.
 
-Compare the trained metrics with the base model's metrics on the same eval rows
-before reporting a result. A finished job does not make the model live; predict
-with `run_decision_model` (overmind-inference).
+An unknown native forecast is not a zero-dollar quote. GPU ledger spend excludes unreported preparation, CPU/memory, evaluation and storage. Compare measured work and forecast ranges without describing them as a spending cap. Native checkpoints are probability artifacts and do not enter chat deployment or activation.
+
+## Data-first model workflows
+
+For saved partitions, standalone decision comparisons, explicit training candidates or reproducible performance workloads, use `develop-model-from-data` and [the model workflow reference](../overmind/references/model-workflows.md). The native coding agent interprets targets from evidence before consumers enforce their declared meaning. These workflows do not require a repository or activate a model.
+
+Read `overmind://interface/current` for connected lifecycle version and [model workflows](../overmind/references/model-workflows.md) for explicit source derivation, draft/prepare/launch, bounded profiles, prediction reuse and recovery. Creation is not paid launch; saved scope and receipts control continuation.

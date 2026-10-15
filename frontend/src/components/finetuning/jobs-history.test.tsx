@@ -179,8 +179,11 @@ describe("JobsHistory filters", () => {
     // Every select's options, in render order: status, then dataset, then model.
     expect(optionValues()).toEqual([
       "all",
+      "preprocessing",
+      "awaiting_launch",
       "queued",
       "preparing",
+      "submission_unknown",
       "running",
       "deploying",
       "succeeded",

@@ -33,9 +33,15 @@ function IoBlock({ caption, text, failed }: { caption: string; text: string; fai
   );
 }
 
-export function toolDetail(step: { ok?: boolean; input?: unknown; output?: unknown }) {
-  const inn = formatPayload(step.input);
-  const out = formatPayload(step.output);
+export function toolDetail(step: {
+  summary?: string;
+  preview?: string;
+  ok?: boolean;
+  input?: unknown;
+  output?: unknown;
+}) {
+  const inn = formatPayload(step.input) || formatPayload(step.summary);
+  const out = formatPayload(step.output) || formatPayload(step.preview);
   if (!inn && !out) return undefined;
   return (
     <div className="space-y-1.5">

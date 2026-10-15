@@ -1,7 +1,7 @@
 import logging
 
 from django.shortcuts import get_object_or_404
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, extend_schema_field
 from rest_framework import mixins, serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -9,9 +9,9 @@ from rest_framework.response import Response
 
 from overbae.api.scoping import project_ids_for
 from overbae.core.errors import InputValidationError
-from overbae.models import Dataset, TrainingPreparation
+from overbae.models import Dataset, DecisionJob, TrainingPreparation
 from overbae.services.datasets.lifecycle import DatasetError
-from overbae.services.training_preparation import request_preparation, retry_preparation
+from overbae.services.training_preparation import begin_preparation, retry_preparation
 from overbae.tasks.training_preparation import inspect_preparation
 
 logger = logging.getLogger(__name__)
@@ -21,16 +21,37 @@ class TrainingPreparationRequestSerializer(serializers.Serializer):
     dataset = serializers.UUIDField()
     cell = serializers.UUIDField(required=False)
     validation_dataset = serializers.UUIDField(required=False, allow_null=True)
+    validation_cell = serializers.UUIDField(required=False, allow_null=True)
     model = serializers.CharField(max_length=255)
     context_length = serializers.IntegerField(min_value=128, max_value=2_000_000)
     training_type = serializers.ChoiceField(choices=["lora", "full"], default="lora")
 
 
 class TrainingPreparationSerializer(serializers.ModelSerializer):
+    training_job = serializers.SerializerMethodField()
+    decision_job = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_training_job(self, obj):
+        job_id = obj.training_jobs.order_by("created_at").values_list("id", flat=True).first()
+        return str(job_id) if job_id else None
+
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_decision_job(self, obj):
+        job_id = (
+            DecisionJob.objects.filter(finetuning_job__preparation=obj)
+            .order_by("finetuning_job__created_at")
+            .values_list("id", flat=True)
+            .first()
+        )
+        return str(job_id) if job_id else None
+
     class Meta:
         model = TrainingPreparation
         fields = [
             "id",
+            "training_job",
+            "decision_job",
             "cell",
             "validation_cell",
             "state",
@@ -85,16 +106,21 @@ class TrainingPreparationViewSet(mixins.RetrieveModelMixin, viewsets.GenericView
             validation = get_object_or_404(
                 datasets, pk=data["validation_dataset"], project_id=dataset.project_id
             )
-            validation_cell = validation.active_cell
+            validation_cell = (
+                get_object_or_404(validation.cells, pk=data["validation_cell"])
+                if data.get("validation_cell")
+                else validation.active_cell
+            )
             if validation_cell is None:
                 raise ValidationError("Validation dataset has no completed version.")
         if cell is None:
             raise ValidationError("Training dataset has no completed version.")
         try:
-            preparation = request_preparation(
+            preparation = begin_preparation(
                 cell,
                 data["model"],
                 data["context_length"],
+                user=request.user,
                 validation_cell=validation_cell,
                 training_type=data["training_type"],
             )

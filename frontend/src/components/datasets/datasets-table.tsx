@@ -1,9 +1,9 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { useNavigate } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 
-import { IntentBadge, StateBadge, sourceKindLabel } from "@/components/datasets/badges";
+import { IntentBadge, SOURCE_KIND_LABEL } from "@/components/datasets/badges";
 import { EntityRef } from "@/components/entity-ref";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -20,10 +20,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { datasetDisplayName, importEnded, useDeleteDatasetMutation } from "@/hooks/use-datasets";
+import { datasetDisplayName, useDeleteDatasetMutation } from "@/hooks/use-datasets";
 import { useGuestGate } from "@/hooks/use-guest-gate";
 import { parseDrfOrdering } from "@/lib/drf-ordering";
-import { formatNumber } from "@/lib/formatters";
 import { cn } from "@/lib/utils";
 import type { Dataset } from "@/openapi";
 
@@ -46,7 +45,7 @@ const filterDatasets = (
       datasetDisplayName(ds).toLowerCase().includes(q) ||
       ds.id.toLowerCase().startsWith(q) ||
       (ds.capabilityName ?? "").toLowerCase().includes(q) ||
-      sourceKindLabel(ds.sourceKind).toLowerCase().includes(q)
+      (SOURCE_KIND_LABEL[ds.sourceKind] ?? "").toLowerCase().includes(q)
     );
   });
 };
@@ -90,13 +89,14 @@ export function DatasetsToolbar({
         <>
           <Select onValueChange={setIntentFilter} value={intentFilter}>
             <SelectTrigger aria-label="Filter by intent" className="w-[140px]" size="default">
-              <SelectValue placeholder="All purposes" />
+              <SelectValue placeholder="All intents" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All purposes</SelectItem>
-              <SelectItem value="train">Training</SelectItem>
-              <SelectItem value="eval">Evaluation</SelectItem>
-              <SelectItem value="pending">Not set</SelectItem>
+              <SelectItem value="all">All intents</SelectItem>
+              <SelectItem value="train">Train</SelectItem>
+              <SelectItem value="eval">Eval</SelectItem>
+              <SelectItem value="pending">Pending</SelectItem>
+              <SelectItem value="explore">Data exploration</SelectItem>
             </SelectContent>
           </Select>
           {setCapabilityFilter && (
@@ -136,10 +136,12 @@ export function DatasetsToolbar({
   );
 }
 
-type SortKey = "name" | "intent" | "rows" | "version" | "capability" | "updated";
+type SortKey = "source" | "name" | "intent" | "rows" | "version" | "capability" | "updated";
 
 const sortValue = (ds: Dataset, key: SortKey): string | number => {
   switch (key) {
+    case "source":
+      return SOURCE_KIND_LABEL[ds.sourceKind] ?? ds.sourceKind;
     case "name":
       return datasetDisplayName(ds).toLowerCase();
     case "intent":
@@ -147,7 +149,7 @@ const sortValue = (ds: Dataset, key: SortKey): string | number => {
     case "rows":
       return ds.rows ?? 0;
     case "version":
-      return Number(ds.activeVersion?.slice(1) || -1);
+      return ds.activeVersion ?? "";
     case "capability":
       return (ds.capabilityName ?? "").toLowerCase();
     case "updated":
@@ -182,20 +184,12 @@ function getColumns(opts: {
     },
     {
       accessorFn: (row) => row.intent ?? "",
-      cell: ({ row }) => (
-        <span className="flex items-center gap-1.5">
-          {importEnded(row.original) ? (
-            <StateBadge dataset={row.original} />
-          ) : (
-            <IntentBadge intent={row.original.intent} />
-          )}
-        </span>
-      ),
-      header: "Purpose",
+      cell: ({ row }) => <IntentBadge intent={row.original.intent} />,
+      header: "Intent",
       id: "intent",
-      meta: { label: "Purpose", noTruncate: true, orderingField: "intent" },
+      meta: { label: "Intent", noTruncate: true, orderingField: "intent" },
       minSize: 110,
-      size: 150,
+      size: 130,
     },
     {
       accessorFn: (row) => row.activeVersion ?? "",
@@ -214,11 +208,7 @@ function getColumns(opts: {
       accessorFn: (row) => row.rows ?? 0,
       cell: ({ row }) => (
         <span className="tabular-nums text-sm text-foreground">
-          {importEnded(row.original) ? (
-            <span className="text-muted-foreground">—</span>
-          ) : (
-            formatNumber(row.original.rows ?? 0)
-          )}
+          {(row.original.rows ?? 0).toLocaleString()}
         </span>
       ),
       header: "Rows",
@@ -230,11 +220,13 @@ function getColumns(opts: {
     {
       accessorKey: "sourceKind",
       cell: ({ row }) => (
-        <span className="text-sm text-foreground">{sourceKindLabel(row.original.sourceKind)}</span>
+        <span className="text-sm text-foreground">
+          {SOURCE_KIND_LABEL[row.original.sourceKind] ?? row.original.sourceKind}
+        </span>
       ),
       header: "Source",
       id: "source",
-      meta: { label: "Source" },
+      meta: { label: "Source", orderingField: "source" },
       minSize: 80,
       size: 100,
     },
@@ -287,7 +279,7 @@ function getColumns(opts: {
             <span onClick={(e) => e.stopPropagation()}>
               <ConfirmDialog
                 confirmLabel="Delete"
-                description={`${datasetDisplayName(ds)} and all its versions will be deleted. A dataset that a training job, evaluation or optimiser run used cannot be deleted.`}
+                description={`${datasetDisplayName(ds)} and every version of it will be removed. Runs that used a version keep this dataset in place.`}
                 destructive
                 isPending={opts.deletePendingId === ds.id}
                 onConfirm={() => opts.onDelete(ds)}
@@ -329,16 +321,12 @@ export function DatasetsBrowser({
   isLoading,
   error,
   hideCapabilityColumn,
-  emptyAction,
-  emptyDescription = "Upload files or select data from traces.",
   fill = true,
   rowSearch,
 }: DatasetsFilterProps & {
   isLoading: boolean;
   error?: unknown;
   hideCapabilityColumn?: boolean;
-  emptyAction?: ReactNode;
-  emptyDescription?: string;
   fill?: boolean;
   rowSearch?: Record<string, string>;
 }) {
@@ -366,7 +354,8 @@ export function DatasetsBrowser({
       return 0;
     });
   }, [filtered, ordering]);
-  const pageRows = sorted.slice((page - 1) * pageSize, page * pageSize);
+  const currentPage = Math.min(page, Math.max(1, Math.ceil(sorted.length / pageSize)));
+  const pageRows = sorted.slice((currentPage - 1) * pageSize, currentPage * pageSize);
   const hasActiveFilters = intentFilter !== "all" || capabilityFilter !== "all" || !!search;
 
   const columns = useMemo(
@@ -386,14 +375,7 @@ export function DatasetsBrowser({
       columns={columns}
       data={{ count: sorted.length, results: pageRows }}
       emptyState={
-        <EmptyState
-          action={emptyAction}
-          className="flex-1"
-          description={emptyDescription}
-          icon={Icon.dataset}
-          size="section"
-          title="No datasets yet"
-        />
+        <EmptyState className="flex-1" icon={Icon.dataset} size="section" title="No datasets yet" />
       }
       error={error}
       getRowId={(row) => row.id}
@@ -421,7 +403,7 @@ export function DatasetsBrowser({
         })
       }
       ordering={ordering}
-      page={page}
+      page={currentPage}
       pageSize={pageSize}
       storageKey="datasets-table"
     />

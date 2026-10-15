@@ -5,13 +5,18 @@ import json
 import math
 import random
 from collections import Counter, defaultdict
-from collections.abc import Iterable
 from contextlib import suppress
 
-from sandbox.examples import input_objects
+from overbae.services.datasets.examples import field_value, input_objects, native_decision
+
+GROUP_ALIASES = {
+    "source_trace_id": "trace_id",
+    "_overmind_document_id": "document_id",
+    # A declared content column must not share the input-fingerprint namespace.
+    "content": "group:content",
+}
 
 _IDENTITY = {"source_row", "trace_id", "source_trace_id", "conversation_id", "_overmind_provenance"}
-_OUTPUT = {"output", "expected_output", "answer", "response", "completion", "label", "score"}
 
 
 def _canonical(value) -> str:
@@ -47,16 +52,19 @@ def content_key(row: dict, *, include_output: bool = False) -> str:
             turns[0].get("content") if len(turns) == 1 and turns[0].get("role") == "user" else turns
         )
     else:
-        value = next(
-            (
-                row[k]
-                for k in ("input", "question", "prompt", "instruction")
-                if row.get(k) is not None
-            ),
-            None,
+        value = source
+        decision = (
+            native_decision(row)
+            if source is None or (isinstance(source, dict) and set(source) == {"decision"})
+            else None
         )
+        if isinstance(decision, dict):
+            value = {key: decision.get(key) for key in ("state", "question", "kind", "options")}
         if value is None:
-            value = {k: v for k, v in row.items() if k not in _IDENTITY | _OUTPUT}
+            # Raw column names do not declare input/target semantics. Keep record
+            # identity separate from equivalence of explicitly structured inputs.
+            value = {k: v for k, v in row.items() if k not in _IDENTITY}
+            return "record:v1:" + hashlib.sha256(_canonical(value).encode()).hexdigest()
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
 
 
@@ -68,10 +76,22 @@ def present(value) -> bool:
 
 def contamination_keys(row: dict, group_by=()) -> set[tuple[str, str]]:
     keys = {("content", content_key(row))}
-    for column in {"trace_id", "source_trace_id", "conversation_id", *group_by}:
-        if present(row.get(column)):
-            kind = "trace_id" if column == "source_trace_id" else column
-            keys.add((kind, _canonical(row[column])))
+    for column in {
+        "trace_id",
+        "source_trace_id",
+        "conversation_id",
+        "group_id",
+        "document_id",
+        "_overmind_document_id",
+        *group_by,
+    }:
+        try:
+            value = field_value(row, column)
+        except ValueError:
+            continue
+        if present(value):
+            kind = GROUP_ALIASES.get(column, column)
+            keys.add((kind, _canonical(value)))
     for value in input_objects(row):
         for column in ("packet_id", "onboarding_packet_id", "case_id", "example_id"):
             if present(value.get(column)) and isinstance(value[column], (str, int)):
@@ -90,12 +110,12 @@ def contamination_keys(row: dict, group_by=()) -> set[tuple[str, str]]:
     return keys
 
 
-def preserve_lineage(row: dict) -> dict:
+def preserve_lineage(row: dict, *, group_by=()) -> dict:
     provenance = row.get("_overmind_provenance")
     if isinstance(provenance, str):
         with suppress(ValueError):
             provenance = json.loads(provenance)
-    keys = contamination_keys(row)
+    keys = contamination_keys(row, group_by)
     return {
         **(provenance if isinstance(provenance, dict) else {}),
         "source_content_keys": sorted(value for kind, value in keys if kind == "content"),
@@ -103,41 +123,30 @@ def preserve_lineage(row: dict) -> dict:
     }
 
 
-def split_positions(
-    rows: Iterable[dict],
+def split_rows(
+    rows: list[dict],
     *,
     eval_percent: int,
     position: str,
     group_by=(),
     stratify_by=None,
     deduplicate=True,
-) -> tuple[set[int], set[int], dict]:
+):
+    columns = set().union(*(row.keys() for row in rows)) if rows else set()
+    requested = set(group_by) | ({stratify_by} if stratify_by else set())
+    if requested - columns:
+        raise ValueError("Unknown split columns: " + ", ".join(sorted(requested - columns)))
     if not 1 <= eval_percent <= 99 or position not in {"head", "tail", "random"}:
         raise ValueError("Choose a 1–99% split and head, tail or random position.")
-    candidates = {*group_by, "conversation_id", "trace_id"}
-    columns: set = set()
-    positions: list[int] = []
-    keys: list[set] = []
-    strata: list[str] = []
-    contents: list[str] = []
+    unique = []
     seen = set()
-    total = 0
-    for offset, row in enumerate(rows):
-        total += 1
-        columns.update(row)
+    for row in rows:
         key = content_key(row, include_output=True)
         if deduplicate and key in seen:
             continue
         seen.add(key)
-        positions.append(offset)
-        keys.append(contamination_keys(row, candidates))
-        contents.append(content_key(row))
-        if stratify_by:
-            strata.append(_canonical(row.get(stratify_by)))
-    requested = set(group_by) | ({stratify_by} if stratify_by else set())
-    if requested - columns:
-        raise ValueError("Unknown split columns: " + ", ".join(sorted(requested - columns)))
-    n = len(positions)
+        unique.append(row)
+    n = len(unique)
     if n < 2:
         raise ValueError("Two rows with distinct content are needed to split.")
     parents = list(range(n))
@@ -149,9 +158,10 @@ def split_positions(
         return index
 
     owners = {}
-    groups = set(group_by) | ({"conversation_id"} & columns) | ({"trace_id"} & columns)
-    for index, found in enumerate(keys):
-        for key in found:
+    groups = set(group_by) | ({"conversation_id", "trace_id", "group_id"} & columns)
+    for index, row in enumerate(unique):
+        keys = contamination_keys(row, groups)
+        for key in keys:
             if key in owners:
                 parents[root(index)] = root(owners[key])
             else:
@@ -162,21 +172,26 @@ def split_positions(
     ordered = list(components.values())
     if len(ordered) < 2:
         raise ValueError(
-            "All rows are one group (the same content, conversation, trace, document, "
-            "group column or synthetic seed). A split needs two."
+            "All rows belong to one content/group cluster; an independent holdout cannot be created."
         )
     if position == "tail":
         ordered.reverse()
     elif position == "random":
         random.Random(42).shuffle(ordered)
     target = min(max((n * eval_percent + 50) // 100, 1), n - 1)
-    totals = Counter(strata)
+    totals = (
+        Counter(_canonical(row.get(stratify_by)) for row in unique) if stratify_by else Counter()
+    )
     held = set()
     labels = Counter()
     for component in ordered:
         if len(held) + len(component) >= n:
             continue
-        counts = Counter(strata[i] for i in component) if stratify_by else Counter()
+        counts = (
+            Counter(_canonical(unique[i].get(stratify_by)) for i in component)
+            if stratify_by
+            else Counter()
+        )
         size_before = abs(len(held) - target) / n
         size_after = abs(len(held) + len(component) - target) / n
         if stratify_by:
@@ -190,12 +205,12 @@ def split_positions(
         if size_after < size_before or not held:
             held.update(component)
             labels.update(counts)
-    train = {positions[i] for i in range(n) if i not in held}
-    evaluation = {positions[i] for i in held}
-    overlap = {contents[i] for i in range(n) if i not in held} & {contents[i] for i in held}
+    train = [row for i, row in enumerate(unique) if i not in held]
+    evaluation = [row for i, row in enumerate(unique) if i in held]
+    overlap = {content_key(r) for r in train} & {content_key(r) for r in evaluation}
     report = {
-        "source_rows": total,
-        "duplicates_removed": total - n,
+        "source_rows": len(rows),
+        "duplicates_removed": len(rows) - n,
         "train_rows": len(train),
         "eval_rows": len(evaluation),
         "target_eval_rows": target,
@@ -211,12 +226,3 @@ def split_positions(
         },
     }
     return train, evaluation, report
-
-
-def split_rows(rows: list[dict], **options) -> tuple[list[dict], list[dict], dict]:
-    train, evaluation, report = split_positions(rows, **options)
-    return (
-        [row for i, row in enumerate(rows) if i in train],
-        [row for i, row in enumerate(rows) if i in evaluation],
-        report,
-    )

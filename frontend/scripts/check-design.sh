@@ -54,9 +54,7 @@ report "alpha wash (use bg-wash-subtle / bg-wash-raised)" \
 # browser silently discards the whole declaration.
 report "hsl() wrapping a hex token (drops the declaration)" \
   'hsl\(var\(--'
-# An opaque bg-white/bg-black sits outside the palette. The lib/colors.ts
-# exemption covers NATIVE_DATE_TRIGGER, pinned light to match the native
-# datetime picker's popup.
+# Named exceptions such as native date-picker chrome belong in lib/colors.ts.
 report "opaque bg-white/bg-black (use bg-foreground / bg-background)" \
   '\bbg-(white|black)[^/a-zA-Z0-9-]' \
   'lib/colors.ts'
@@ -65,9 +63,9 @@ report "opaque bg-white/bg-black (use bg-foreground / bg-background)" \
 report "arbitrary text-[Npx/rem/em] (use scale tokens)" \
   'text-\[[0-9.]+(px|rem|em)\]' \
   'routes/login.tsx'
-# Three faces, three jobs: PP Mondwest = titles, Geist Pixel = everything else
-# (the default, needs no class), NeueBit = sidebar nav and breadcrumb only. A
-# title picks a step from lib/typography.ts rather than spelling the face.
+# Three faces, three jobs: PP Mondwest = main page title, Geist Pixel = other content
+# (the default), NeueBit = sidebar nav and breadcrumb only. A
+# heading picks a step from lib/typography.ts rather than spelling the face.
 report "font-display / page-title (use TITLE.* from lib/typography)" \
   '\bfont-display\b|"page-title|page-title ' \
   'lib/typography\.ts|styles\.css'
@@ -78,8 +76,8 @@ report "title class + explicit text size (size comes from the step)" \
 report "prose-body literal (use PROSE from lib/typography)" \
   'prose-body' \
   'lib/typography\.ts|styles\.css'
-# Mondwest ships a Regular master only — a weight utility synthesizes bold.
-report "title + weight utility (Mondwest has one master)" \
+# The role owns weight; call sites must not override it.
+report "title + weight utility (use the role weight)" \
   '(title-hero|page-title|title-section|title-card)[^"'"'"']*font-(medium|semibold|bold)|font-(medium|semibold|bold)[^"'"'"']*(title-hero|page-title|title-section|title-card)' \
   'lib/typography\.ts|styles\.css'
 # NeueBit's bold master is reserved for its accent surfaces (active sidebar row,
@@ -102,8 +100,8 @@ report "font-sidebar outside the nav surfaces (NeueBit is an accent)" \
 report "arbitrary tracking (use tracking-cell, one Geist Pixel grid cell)" \
   'tracking-\[' \
   'routes/login\.tsx'
-# Dead shadow utilities (all --shadow-* resolve to none).
-report "shadow-* utilities (shadows are off)" \
+# Standard shadows are disabled; confirmations use the named shadow-confirmation token.
+report "standard shadow utilities (use flat surfaces or the confirmation token)" \
   '\bshadow-(2xs|xs|sm|md|lg|xl|2xl)\b'
 # The ramp is three steps and nothing above them:
 #   rounded-xs (1px)  things under ~8px — status dots, progress bars, switch

@@ -15,23 +15,12 @@
 
 import * as runtime from '../runtime';
 import type {
-  DecisionModel,
-  DecisionModelRequestRequest,
-  DecisionResponse,
+  DecisionTrainingModelOption,
 } from '../models/index';
 import {
-    DecisionModelFromJSON,
-    DecisionModelToJSON,
-    DecisionModelRequestRequestFromJSON,
-    DecisionModelRequestRequestToJSON,
-    DecisionResponseFromJSON,
-    DecisionResponseToJSON,
+    DecisionTrainingModelOptionFromJSON,
+    DecisionTrainingModelOptionToJSON,
 } from '../models/index';
-
-export interface DecisionModelsSystemoneCreateRequest {
-    modelId: string;
-    decisionModelRequestRequest: DecisionModelRequestRequest;
-}
 
 /**
  *
@@ -40,7 +29,7 @@ export class DecisionModelsApi extends runtime.BaseAPI {
 
     /**
      */
-    async decisionModelsListRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Array<DecisionModel>>> {
+    async decisionModelsListRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Array<DecisionTrainingModelOption>>> {
         const queryParameters: any = {};
 
         const headerParameters: runtime.HTTPHeaders = {};
@@ -75,80 +64,13 @@ export class DecisionModelsApi extends runtime.BaseAPI {
             query: queryParameters,
         }, initOverrides);
 
-        return new runtime.JSONApiResponse(response, (jsonValue) => jsonValue.map(DecisionModelFromJSON));
+        return new runtime.JSONApiResponse(response, (jsonValue) => jsonValue.map(DecisionTrainingModelOptionFromJSON));
     }
 
     /**
      */
-    async decisionModelsList(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<DecisionModel>> {
+    async decisionModelsList(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<DecisionTrainingModelOption>> {
         const response = await this.decisionModelsListRaw(initOverrides);
-        return await response.value();
-    }
-
-    /**
-     * Answer a System One request with a catalog decision model
-     */
-    async decisionModelsSystemoneCreateRaw(requestParameters: DecisionModelsSystemoneCreateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<DecisionResponse>> {
-        if (requestParameters['modelId'] == null) {
-            throw new runtime.RequiredError(
-                'modelId',
-                'Required parameter "modelId" was null or undefined when calling decisionModelsSystemoneCreate().'
-            );
-        }
-
-        if (requestParameters['decisionModelRequestRequest'] == null) {
-            throw new runtime.RequiredError(
-                'decisionModelRequestRequest',
-                'Required parameter "decisionModelRequestRequest" was null or undefined when calling decisionModelsSystemoneCreate().'
-            );
-        }
-
-        const queryParameters: any = {};
-
-        const headerParameters: runtime.HTTPHeaders = {};
-
-        headerParameters['Content-Type'] = 'application/json';
-
-        if (this.configuration && this.configuration.accessToken) {
-            const token = this.configuration.accessToken;
-            const tokenString = await token("ClerkBearerAuth", []);
-
-            if (tokenString) {
-                headerParameters["Authorization"] = `Bearer ${tokenString}`;
-            }
-        }
-        if (this.configuration && this.configuration.apiKey) {
-            headerParameters["X-Api-Key"] = await this.configuration.apiKey("X-Api-Key"); // ApiKeyAuth authentication
-        }
-
-        if (this.configuration && this.configuration.accessToken) {
-            const token = this.configuration.accessToken;
-            const tokenString = await token("BearerAuth", []);
-
-            if (tokenString) {
-                headerParameters["Authorization"] = `Bearer ${tokenString}`;
-            }
-        }
-
-        let urlPath = `/api/decision-models/{model_id}/systemone`;
-        urlPath = urlPath.replace(`{${"model_id"}}`, encodeURIComponent(String(requestParameters['modelId'])));
-
-        const response = await this.request({
-            path: urlPath,
-            method: 'POST',
-            headers: headerParameters,
-            query: queryParameters,
-            body: DecisionModelRequestRequestToJSON(requestParameters['decisionModelRequestRequest']),
-        }, initOverrides);
-
-        return new runtime.JSONApiResponse(response, (jsonValue) => DecisionResponseFromJSON(jsonValue));
-    }
-
-    /**
-     * Answer a System One request with a catalog decision model
-     */
-    async decisionModelsSystemoneCreate(requestParameters: DecisionModelsSystemoneCreateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DecisionResponse> {
-        const response = await this.decisionModelsSystemoneCreateRaw(requestParameters, initOverrides);
         return await response.value();
     }
 

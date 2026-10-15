@@ -8,10 +8,9 @@ from typing import Any, Literal
 from pydantic import Field
 
 from overbae.services.mcp.contracts.common import (
-    DatasetVersionContract,
+    DatasetCellContract,
     MCPModel,
     ResourceLinkContract,
-    version_field,
 )
 
 OptimizerMode = Literal["optimize", "model_comparison", "hybrid"]
@@ -21,7 +20,7 @@ class OptimizerDatasetReadiness(MCPModel):
     id: str
     name: str
     intent: str | None
-    version: DatasetVersionContract | None = None
+    cell: DatasetCellContract | None = None
     usable: bool
     issue: str | None = Field(default=None, max_length=500)
 
@@ -31,7 +30,7 @@ class OptimizerEvalSetReadiness(MCPModel):
     name: str
     capability: str
     active: bool
-    member_count: int = Field(ge=0)
+    row_count: int = Field(ge=0)
 
 
 class OptimizerExecutionerState(MCPModel):
@@ -71,7 +70,8 @@ class CheckOptimizerReadinessInput(MCPModel):
     capability: str = Field(min_length=1, max_length=255)
     dataset: str | None = Field(default=None, max_length=255)
     eval_set: str | None = Field(default=None, max_length=255)
-    version: str | None = version_field()
+    cell: str | None = Field(default=None, max_length=255)
+    version: str | None = Field(default=None, max_length=32)
     mode: OptimizerMode = "optimize"
     model_ids: list[str] = Field(default_factory=list, max_length=5)
 
@@ -95,7 +95,8 @@ class StartOptimizerInput(MCPModel):
     capability: str = Field(min_length=1, max_length=255)
     dataset: str = Field(min_length=1, max_length=255)
     eval_set: str | None = Field(default=None, max_length=255)
-    version: str | None = version_field()
+    cell: str | None = Field(default=None, max_length=255)
+    version: str | None = Field(default=None, max_length=32)
     mode: OptimizerMode = "optimize"
     model_ids: list[str] = Field(default_factory=list, max_length=5)
     entrypoint: str = Field(default="", max_length=512)
@@ -110,7 +111,7 @@ class OptimizerExperimentReference(MCPModel):
     status: str
     mode: OptimizerMode
     capability: ResourceLinkContract
-    version: DatasetVersionContract | None = None
+    cell: DatasetCellContract | None = None
     resource: ResourceLinkContract
 
 
@@ -147,8 +148,6 @@ class OptimizerCandidateResult(MCPModel):
     coverage_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     graded_rows: int | None = Field(default=None, ge=0)
     total_rows: int | None = Field(default=None, ge=0)
-    suite_incomplete: bool = False
-    uncovered_card_claims: list[str] = Field(default_factory=list, max_length=50)
     scores: dict[str, Any] = Field(default_factory=dict, max_length=100)
     patch: str | None = Field(default=None, max_length=4_000)
     patch_truncated: bool = False
@@ -177,7 +176,7 @@ class OptimizerResultSummary(MCPModel):
     status: str
     mode: OptimizerMode
     capability: ResourceLinkContract
-    version: DatasetVersionContract | None = None
+    cell: DatasetCellContract | None = None
     current_iteration: int = Field(ge=0)
     num_iterations: int = Field(ge=0)
     scores: dict[str, Any] = Field(default_factory=dict, max_length=100)

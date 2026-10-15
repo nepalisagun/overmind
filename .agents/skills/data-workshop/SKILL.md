@@ -1,69 +1,324 @@
 ---
 name: data-workshop
-description: Data Workshop internals — Dataset and Cell as an immutable version tree, landing and documents, script runs (Execution, project slots, the sandbox service), MCP authoring tools, the use gate, shared splitting and export. Use when changing datasets, versions, runs, the sandbox, landing, alignment, diff, or dataset export.
+description: Data Workshop internals — source landing, immutable dataset pipelines and runs, lineage-bound external imports, version inspection and consumer pinning. Use when changing these services, Console screens or MCP contracts.
 ---
 
 # Data Workshop
 
-A dataset is a landed source and an immutable tree of versions. Every frame is Parquet. Overmind has no agent: MCP callers write scripts, the `sandbox` service runs them, and the worker measures and stores the result. The Console and REST change only the name, intent, capability and active version; they also land a version as a new dataset and cancel imports and runs.
+The native coding agent owns intelligence. The platform stores evidence and runs
+explicit operations. Source landing does not diagnose, start a chat turn, generate
+examples or resume a platform agent. Chat, mutable-cell and replay endpoints are removed, together with their Console callers. Historical Cell scripts, reviews and frames remain readable. Old conversations, generation records and provider receipts are archived in DatasetHistory before their runtime tables are dropped.
 
-## Model
+## Active path
 
-- `Dataset`: name, source kind/spec, `capability` and `intent` (`train` | `eval` | `pending`, proposed at landing by `alignment.rank` / `contract.propose_intent`), `capability_rank`, `active` (FK `Cell`, set to `v0` at landing), `state` (`landing` | `idle` | `error` | `stopped`; `error` means only a failed landing, `stopped` an import someone stopped).
-- `Cell` is one version: `parent` (FK `Cell`, RESTRICT; null only for the source), `position` (label `v{position}`, `versions.label`), `title`, `script`, `script_sha256` (unique per parent: the same script under the same parent is the same version), `rows`, `columns`, `fingerprint`, `input_fingerprint`, `intent_report`, `capability_report`, `stats`, `analytics`, `attachment`, `impact`, `stdout`, `seconds`, `used_at`. A version never changes after it exists.
-- Frames live at `MEDIA_ROOT/datasets/<id>/cells/<cell>.parquet`. Every frame carries `source_row`: row identity, not data. `review.finalize` rebuilds it after a script and carries `_overmind_provenance` lineage by `source_row`; `diff.py` joins on it for row and value diffs (the grid diffs a version against its parent); `review.impact` counts rows before/after, removed/added, identity, input evidence removed and instruction changes. The Console hides `source_row` and every `_overmind_*` column (provenance, document id) from columns; the export keeps them.
-- `versions.resolve_cell` accepts `v3`, `3`, a UUID, or blank for the active version. `versions.activate(dataset, cell, expected_active=)` fails with `active_conflict` when the active version moved.
-- `use.check(dataset, intent, cell=)` checks intent, a readable frame and technical format without changing anything; validators, readiness tools and estimates call it. `use.use` / `use.freeze` set `used_at` only in the transaction creating the consumer's row, so a refused launch never marks a version. The FK PROTECTs the cell. A training job pins `cell`, `validation_cell` and `eval_cell`. Fit findings beyond readability (`review.warnings`) are advisory and never block use.
-- `lifecycle.py` holds the dataset edits shared by REST, MCP and the Console: `rename`, `set_intent`, `set_capability`, `delete_dataset` (refused while a version is used).
-- Dataset names are not unique; every tool result carries the id. Training warns about train/eval or train/validation overlap by normalized input content, trace/conversation identity, configured groups or synthetic seed lineage. It never silently removes those rows.
+- `services/datasets/dispatch.py`: create, split and attach sources.
+- `tasks/datasets.py`: landing and deterministic pipeline execution on the batch
+  prefork worker; the reaper fails expired runs without replaying them.
+- `services/datasets/workbench.py`: shared REST/MCP pipeline, import and publication
+  lifecycle. `api/workbench.py` and `mcp/tools_workbench.py` adapt it.
+- `models/dataset_pipeline.py`: immutable DatasetPipeline recipes and durable
+  DatasetPipelineRun receipts, source/output/artifact FKs and fingerprints.
+- `pipeline_packages.py`, `pipeline_runner.py`, `pipeline_bindings.py`: retained
+  script packages, dedicated container execution and explicitly enabled source bindings.
+- `services/datasets/versions.py`: version/UUID resolution without importing an agent.
+- The Console landing page is a project dataset table. Rows open the existing
+  cells on a grid-snapped flow canvas; the folder button reveals compact,
+  project-scoped navigation. Chat and funding controls are removed. Corrections replace the
+  displayed process, with no repair-history or restore view. Exact consumer-pinned
+  inputs remain immutable internally.
+  Connections follow recorded parents. Moving cells never changes dependencies.
 
-## Landing and documents
+New revisions require a retained Python package with native-agent-authored stages.
+Package-free historical revisions stay readable, but validation, new execution and
+bindings reject them with pipeline_package_required. REST and MCP reject inline
+operation definitions; the in-process declarative executor is removed. Project-owned families have immutable numbered
+revisions; `derived_from` creates a separate attributed family. Reuse the exact
+revision across compatible sources in the same project. Packages execute only in
+the isolated sandbox service through interactive workers: pinned source/lockfile
+identities, separate UIDs, no network egress, app credentials, media mounts or Docker
+socket, measured resource admission and retained logs.
+Registration and static validation never execute code. The sandbox records process exit
+status; script-authored status files do not establish completion. Dependencies are
+locked in the shared application image. Setup and package protocol: `docs/workshop-pipelines.md`.
+External semantic/provider work remains native-agent-owned and imported with lineage.
 
-Console creation offers the purpose **Decide later** (intent `pending`), **Training**, **Evaluation** or **Split into training and evaluation**; capability offers **Detect from the rows**, **None**, or a project capability. REST and MCP distinguish an omitted `capability` (infer at landing) from explicit `null`. New datasets from traces start on the Observability page.
+A run request key is unique per dataset; revision keys are project-scoped. Identical retries recover the same record;
+changed content conflicts. Pipeline creation does not execute. Runs bind immutable
+source cell IDs and checksums; all output is measured before atomic publication.
+Workbench inspection pages recipes and receipts independently with pipeline_offset,
+run_offset, binding_offset and limit (20 by default, at most 100), returning total and next_cursor.
+Each successful run publishes all step cells atomically. Preview retains samples
+and checks but publishes no cells. Absolute min_rows/max_rows checks are deferred in previews and enforced
+on publication; preservation, schemas and lineage are checked in both modes.
+Step check_results retain passed/failed/deferred checks with expected/actual counts
+on failure. Static validation warns about undeclared output lineage without claiming
+runtime failure. Run receipts expose queue age, a polling interval and terminal time.
+Runner availability heartbeats continue during validation and publication; they
+do not advance measured progress or certify a stage has completed.
+Bindings start paused, pin a revision and
+parameters, and rebuild full source snapshots, including late trace changes and
+removed matches. Checkpoint and cells commit together. Failed attempts pause on
+the next inspection; re-enable or revise explicitly to authorize another attempt.
+Scheduled/ingestion bindings are checked by a bounded batch task;
+trace snapshots are capped at 10,000 selected traces and reject overflow.
 
-`services/datasets/land.py` writes `v0` (files, pasted rows, traces with the `TRACE_MANIFEST` columns, or `llm_calls` with `span_id`/`origin_trace_id`), measures it (`measure.frame`: intent and capability contracts, stats, fingerprint), proposes `capability_rank` and the intent, and publishes it as the active version. A trace source enters through `selection.TraceSource`: explicit `trace_ids` or a traces-list selection, unknown filter keys refused, and `count()` before the dataset row exists. The source's `capability` filter, else the dataset's capability, scopes each trace row to that capability's outermost invocation and its subtree (I/O, transcript, usage and score); a trace with several invocations fails the landing, and one without it lands whole. A row names a capability only when it is the selected one or the only one in the row's spans. Input and output come from wrapper spans only, never an LLM or tool span. Files land unaltered: `files.py` rejects rows wider than their header, repeated columns and non-UTF-8 input; CSV columns become numeric only when every value spells a number exactly. A column mixing scalar types, an integer outside int64, or integers a float column would round are stored as `json`, so every value keeps its type. `json_rows_field` selects the top-level array of a JSON object and is recorded in `source_spec`.
+Trace landing pins `preferred_capability_id` in the source recipe. A source capability
+filter takes precedence over the destination capability; otherwise the destination
+is preferred when it appears in a trace. Each row uses the unique outer matching
+invocation and its descendants for I/O, transcript, usage and score. Repeated outer
+invocations fail before publication. Without a match, whole-trace evidence remains;
+mixed traces are not attributed to their first capability. Missing wrapper I/O
+stays missing instead of borrowing tool arguments. Bindings use the same extraction.
+Pipeline receipts expose the current measured stage, pinned source row count and
+output row count once written. A running stage is not a percentage or an ETA.
+Landing claims also bind attachment-request identities, so a cancelled delivery
+cannot consume a later attachment. Paired source claims are atomic; a cancelled
+or replaced member releases its unclaimed partner with a retryable source error.
+A failed or cancelled run leaves the selected and consumed versions untouched.
+Cancellation prevents publication; it does not claim to kill an in-flight calculation.
+Worker deadlines and leases bound execution. Unresolved work is never blindly replayed.
 
-Documents (`files.DOCUMENT_SUFFIXES`: PDF, DOCX, Markdown, text, PNG, JPEG, WebP; 100 MiB each, no gzip) are extracted in the sandbox (`sandbox/documents/`: docling for native text, pdfium recovery for pages docling missed, English Tesseract OCR for pages still without text and for images). Each landed row is one text element: `text`, `page`, `source_name`, `_overmind_document_id` (the file's sha256) and `_overmind_provenance` (evidence with page regions, extraction method). `source_spec.files[]` carries name, bytes, sha256, rows and the file's extraction metadata; `source_spec.extraction.limitations` merges what extraction could not guarantee. A batch never mixes tables and documents (`files.MIXED`). The upload is deleted after landing. Landing waits out a busy sandbox for 15 minutes and an unreachable one for three retries before it blocks.
+For deployment, stop old Workshop agent workers before the API cutover. A 3.0
+deployment does not acknowledge cancellation of a model request submitted by an
+older worker. Preserve historical receipts and reconcile unknown provider outcomes.
 
-Imports persist a `DatasetImport` receipt and source manifest before broker publication. The receipt separates queue age from execution leases and fences publication by attempt owner. A running import holds a 5-minute lease that a heartbeat thread renews every 30 seconds, never past the absolute execution limit. An expired lease requeues the import with its exact source while attempts remain; only the last lost attempt blocks it as `worker_timeout`. Sources for queued, running or blocked imports are retained; duplicate delivery cannot publish a second source. Broker retries use bounded I/O, stable task IDs and publication ownership. A blocked import resumes through `dispatch.resume_import` (Console **Retry import**, `POST /resume-import/`, MCP `resume_dataset_import`); the original split and capability choices are preserved. A busy, unreachable or refusing sandbox during extraction blocks the import as `sandbox_busy` / `sandbox_unavailable` / `sandbox_refused`, all resumable. A source that cannot land (`imports.SOURCE_FAILURES`: an unreadable file, mixed tables and documents, a missing or changed upload) blocks with no retry. The import reconciler runs every 30 seconds on control. `imports.cancel` (Console **Stop import**, `POST /cancel-import/`, MCP `cancel_dataset_job`) moves a queued, running or blocked receipt to `cancelled` with a conditional update, sets its datasets to `stopped` (no error; the Console shows **Import stopped** in neutral and **Start again**), publishes `land_cancelled` and releases the upload. A running attempt sees the state within a second (`heartbeat.watch`), closes its sandbox request and publishes nothing; publication is fenced by the receipt state anyway. A cancelled import does not resume.
+Initial source imports use a durable `DatasetImport` receipt on the dedicated
+`landing` queue. Publication and execution have separate fenced ownership; the
+control reconciler recovers lost broker acknowledgements and records expired
+attempts. `resume_dataset_import` and REST `resume-import` explicitly retry a
+blocked import within its attempt budget. Cancellation fences both split members.
+Landing retains evidence and returns to idle; it does not start preparation.
+Pipeline queue demand contributes to interactive capacity through `DatasetPipelineRun`.
 
-A version of another dataset in the project is a source kind (`Dataset.SourceKind.VERSION`; `source.version = {dataset_id, cell_id}`): `land.read_version` copies its rows with their column types, renumbers `source_row` and records `copied_from {cell_id, source_row}` in each row's provenance; `source_spec` names the dataset, version and fingerprint. It keeps the source dataset's intent and capability unless they are given. The same split options apply (a frame with `_overmind_document_id` splits by document). Surfaces: MCP `create_dataset` with `source.kind = version`, REST `POST /api/datasets/` or `/split/` with `source.version = {dataset, version}`, Console **New dataset from this version** on a version card.
+## Sources, identities and versions
 
-## Runs and the sandbox
+Datasets retain a written brief and explicit train/eval/explore/pending purpose.
+A missing purpose stays pending. Capability inference remains a bounded landing
+hint, not a substitute for user intent. A capability is optional for data-first work.
+Name, purpose, capability and default-version changes use lifecycle services.
 
-- Every script run is an `Execution` row (`executions.py`): `mode` (`try` | `probe` | `cell` | `synthetic`), `key` (mode, dataset, parent, script and attachment sha256), `state` (`queued` | `running` | `ok` | `failed` | `cancelled`), `attachment`, `transient`, error, stdout tail, `result`, `cell`, and queue/transfer/run clocks. `submit` takes the dataset row lock, returns an existing version for a known parent+script, reuses a live or recent run (an hour; a transient failure runs again), and enqueues `tasks.datasets.execute` on `interactive` after commit. MCP waits up to 25 s, then returns `queued`/`running`; the caller repeats the identical call.
-- `perform` takes a per-project Redis slot (`WORKSHOP_PROJECT_CONCURRENCY`; granted without Redis), moves `queued → running`, streams the parent frame to the sandbox and stores the answer. Slot and memory waits share one 15-minute clock from submission; an unreachable sandbox retries 2/4/8 s. Any unexpected worker error fails the run at once. `sweep_executions` fails running runs older than 11 minutes and queued runs older than 20 minutes as transient, and deletes runs older than 30 days. `executions.run_now` runs inline (seed data, tests).
-- `add_version` finalizes the output against the parent, measures it, and creates the child under the dataset row lock; the frame is moved into place in the same transaction and removed if it rolls back.
-- `sandbox/` is a separate service (`python -m sandbox`, Starlette): `POST /v1/run` with a 4-byte length, a JSON header and raw bytes (`protocol.py`); modes `cell`, `inspect` and `extract`. The header's `input_bytes` lets it reserve memory (`max(1 GiB, 5.5 × uncompressed + 256 MiB)` for scripts, `max(2 GiB, 4 × file)` for documents) against a root-only (0600) ledger before it stores the upload; no memory for 120 s is a 503 `busy`. The reservation holds until the reply is sent; an upload idle for 60 s is refused. Each run gets its own uid (20000–20999, least recently used, never one with live processes) and a 0700 scratch dir under a root-owned `/tmp/sandbox`. Rlimits bound CPU, file size, open files and processes; a watchdog stops the run past 300 s, past 50,000 files, or past 1.5 × its reservation, counting RSS, the files the run wrote, its stdout and stderr, and open files with no name (memfd, unlinked). Reading another uid's `/proc/<pid>/fd` needs `CAP_SYS_PTRACE`, so the root server refuses to start without it (compose `cap_add`, ECS `linuxParameters` from `deploy_ecs.py`). Compose drops every other capability except CHOWN, DAC_OVERRIDE, FOWNER, KILL, SETGID and SETUID, sets `no-new-privileges` and mounts `sandbox/` read-only; ECS, which can add only SYS_PTRACE, drops the unused defaults (`deploy_ecs.SANDBOX_DROPPED`). Runs hold no capability. Every process of the uid is killed afterwards. A document's filename reaches the extractor in its environment, never its command line. Outputs are opened with `O_NOFOLLOW` and must be plain single-link files. `audit` refuses imports outside `libraries.allowed_imports()` and obvious escapes; the uid, the network and the rlimits are the real boundary. The sandbox has no secrets and no route out; only the landing and interactive workers reach it. `SANDBOX_ALLOW_SHARED_UID=1` runs it as the current user for tests and `make sandbox`.
-- A run may read one uploaded table beside its parent (`attachments.py`): `overmind dataset attach FILE --json` stages it through `/api/uploads/` (inspection records its sha256), MCP passes the `upload_id` as `attachment` to `try_dataset_script` / `add_dataset_version`, the worker parses it into a frame and sends it ahead of the parent in the same request (`attachment: {bytes, frame_bytes}` in the header; the memory reservation counts both frames). The version's identity is the script plus the file's sha256 (`attachments.identity`); `Cell.attachment` records name, bytes, rows and sha256, and the file is kept at `datasets/<id>/attachments/<sha256>` (download `GET .../attachment/?cell=`) and goes with the dataset. Uploads read by queued or running runs survive `cleanup_uploads`.
-- `executions.cancel` (Console **Stop** in Activity, `POST /executions/<id>/cancel/`, MCP `cancel_dataset_job` with `run`) moves a queued or running run to `cancelled` with a conditional update. A queued run never starts. The running worker sees it within a second, closes its sandbox request (the sandbox stops a run whose client disconnects, then frees its uid and reservation) and releases the project slot. A version is created only in the same transaction that moves its run from `running` to `ok` (`add_version(settle=)`), so a cancelled run leaves no version. A cancelled run is not reused.
-- `child.py` binds `pd`, `np`, `source`, `df`, `attachment` (the uploaded frame or None) and `prepare_examples`, disables pandas/numpy file IO, runs the script and writes `df` in the store's format. The sandbox is the only place a whole frame is in memory; the worker, REST and MCP read frames in bounded batches or DuckDB views.
-- `synthetic.py`: `add_synthetic_examples` appends 1–50 caller-written rows, checked against the parent's columns and the intent, as a new version; its identity is the canonical rows+instruction digest.
-- Live updates are Redis pubsub (`dataset:<id>`) replayed over SSE `events/`: `land_*` (`land_progress` carries `stage: "extracting"` for documents), `execution_queued|started|finished`, `version_added`, `dataset_updated`.
+Frames are Parquet under `MEDIA_ROOT/datasets/<dataset>/cells/<cell>.parquet`.
+Cell IDs bind versions; displayed version labels are derived by Dataset.versions().
+Source identity is `source_row`, not the current display position. The Console
+hides internal lineage columns, while export preserves them. SQL query responses
+decode declared JSON results, including aliases and JSON expressions, without
+reinterpreting ordinary text that happens to look like JSON.
 
-## MCP tools
+CLI uploads use DatasetTransfer receipts: a project request key binds SHA-256,
+byte count and destination recipe. Byte writes and publication serialize on the
+transfer, and publication persists the dataset IDs and landing task before
+dispatch. Repeating completion recovers an unacknowledged broker handoff; the
+landing task's claim prevents duplicate cells. Unscoped staging endpoints cannot
+access managed transfer bytes. An explicit json_rows_field selects a top-level
+JSON array and is retained in extraction metadata. MCP get_job(dataset_transfer)
+reads these facts without dispatching. CLI upload states are publication snapshots
+(`state_scope=at_publication`), not
+current landing status. `--wait` observes terminal landing; MCP `get_job` reads
+current progress. First-source attachment
+preserves a draft; later attachment appends a new version. Original document/image
+bytes, extraction metadata and row evidence remain retained. Local English Tesseract
+OCR covers scanned PDF regions and PNG/JPEG/WebP images. Image orientation and
+source coordinates survive extraction. OCR does not reconstruct visual tables.
+Document parsing runs in the isolated `sandbox` service (`sandbox/documents/`),
+without application credentials, media mounts or outbound network. The landing
+worker streams retained bytes and receives extraction progress; missing parser
+configuration fails closed. If the primary PDF parser returns no text on a page,
+`sandbox/documents/pdf_text.py` recovers the
+encoded layer through PDFium before OCR. This includes Type 3 text layers.
+`native_text_recovery` retains affected pages, engine/version, row/character
+counts and non-whitespace control-character count; rows carry their own method
+and regions. Encoding artifacts remain unchanged and flagged. Recovery does not
+certify visual fidelity or partial omissions on otherwise populated pages.
+Documents are capped at 100 MiB; PDFs at 2,000 pages. Upload reservations return
+the file-type byte limit, and chunk writes enforce it before landing. PDF page
+limits are checked before extraction. `overmind://dataset-upload` exposes these
+limits as numeric fields. Single and batch uploads persist file/stage progress;
+PDF OCR also reports total pages and completed/total OCR pages through
+`get_job(kind=dataset_run).progress.landing` and dataset inspection.
+Server-side analytics are measured during publication's full-row profile pass,
+including partition outputs, and bound to the exact fingerprint and rule version.
+Terminal cells show Metrics and collapsed Data alert chips. REST and MCP cells
+share the report; completed pipeline receipts include final-output analytics.
+Use `explore_dataset` to backfill historical versions without changing rows.
+Class imbalance/rare-class thresholds are advisory. Never argmax soft targets,
+infer gold labels, or present a majority baseline as model performance. Bounded
+coverage and `not_checked` risks stay explicit; see `docs/workshop-pipelines.md`.
 
-`services/mcp/tools_datasets.py` over `workshop.py`: `list_datasets`, `inspect_dataset` (source files with their extraction and limitations, tree, active version, `preparation_context`, sample, `running`, next actions), `query_dataset` (DuckDB SELECT over `t`, 10 s, 32 KiB; json columns are typed JSON and come back decoded), `create_dataset` (one tool for every source: `traces`, `llm_calls`, `version`; one `split` shape; optional `request_key`), `try_dataset_script`, `probe_dataset_version`, `add_dataset_version`, `add_synthetic_examples`, `diff_dataset_versions`, `activate_dataset_version`, `update_dataset`, `resume_dataset_import`, `cancel_dataset_job`. Landing is job kind `dataset_import`. The `prepare-dataset` prompt carries the preparation rules (optional `version` and `project_id`; the Console's **Prepare with agent** shows it filled for a version in a dialog with **Copy prompt**, through `GET .../prepare-prompt/?cell=`, which also passes `dataset_name`, `intent` and `capability`); the `dataset-upload` resource carries the CLI and REST upload flow.
+`inspect_dataset` pages source metadata independently with `source_offset` and
+`source_limit` (default 10, maximum 20). Follow `source_page.next_cursor`; response
+budgets may shorten a page. Complete checksums and extraction/OCR metadata survive
+pagination, rather than being replaced by truncated summaries.
 
-## Analytics
+Row storage preserves heterogeneous scalars and integers outside signed 64-bit
+range as JSON. Mixed numeric columns also use JSON when float promotion would
+lose integer precision. Shared pandas readers must preserve these values and
+nullable integers without another inference pass. This is storage fidelity,
+not agent-authored normalization; old immutable cells are not rewritten.
+`query_dataset` bounds its JSON output to 32 KiB as well as 100 rows. Oversize
+responses return `query_result_too_large` without clipping values; project or
+aggregate in SQL, or export the exact cell. A separate configurable execution
+deadline defaults to ten seconds and returns `query_timeout`; source cells and
+later queries remain usable. The byte/column budget is enforced while reading
+results, before building an unbounded Python result.
+Results above 200 columns also fail rather than omitting column metadata.
+MCP Workshop run summaries omit bulky row examples and preview samples from
+routine polling/history. `evidence_resource` points to the unchanged full receipt;
+measured progress, checks, lineage identities and timings stay inline.
+Preview duration and script runtime phases are measured separately from queue
+time. Runtime cleanup confirmation never implies publication success.
+Original sources can be downloaded through `overmind dataset export DATASET --source SHA256 --output FILE --json`; the CLI verifies bytes, refuses redirects
+and existing destinations, and removes checksum failures.
+The installed upload CLI handles one file per transfer. Serial attachments
+combine new rows with the preceding cell into a new version; wait for landing
+between attachments. Atomic REST batches have no resumable CLI/MCP handoff.
+Document-limit reservation errors expose `file_too_large`; no receipt is created.
 
-`contract.analytics` runs in `measure.describe_frame` for every version and lands in `Cell.analytics`: `labels` (per categorical field of `expected_output`, the value or each key of an object such as a decision row's questions: label counts, at most 50 labels, and the majority baseline) and `inputs` (columns, and keys of an object `input` or a decision row's state, each `{field, rows, of}`: `empty` on some rows, or `constant`, one value on every non-empty row with at least two such rows; a field empty on every row is only empty). Memory is bounded by the label and field caps. Versions measured before analytics existed are measured lazily: reading the dataset enqueues `tasks.datasets.measure_analytics` on `batch` (one per dataset at a time, 20 versions per run), which publishes `dataset_updated`. `inspect_dataset` returns it per version; the Console shows an **Analytics** section on the version card, open on the source and where it differs from the parent's.
+External results use either at most 2,000 inline rows/4 MiB or a project-scoped
+uploaded artifact cell and fingerprint. Every row retains source_row or supplies
+all contributing identities in \_overmind_parent_rows. The provenance service
+validates every parent and preserves content/group contamination identities.
+Scripts must emit the actual source_row or intentional parent declarations;
+landed fields are data, not instructions to adopt as transformation lineage.
+The original source remains unchanged.
+An artifact FK prevents disposal of a referenced uploaded output. External execution
+is recorded as external_attributed. Never promote source references or supplied
+human-review flags into proof of semantic correctness.
 
-## Preparation and splitting
+## Checks and consumers
 
-`context.preparation_context` supplies consumer requirements, whole-frame task-family profiles and the latest active behaviour contracts. Overmind measures technical fit only; task suitability is the caller's judgement and is reported separately. `prepare_examples` normalizes common shapes to `messages` or `input`/`expected_output` and preserves typed messages and tools.
+The platform measures format and change impact on the published output. Semantic
+quality remains unmeasured unless actual attributable evidence exists; technical
+compatibility is not a semantic pass. Existing reviews stay attached to their exact
+historical cells. Do not create a universal quality-approval gate.
 
-`partition.split_rows` is shared by source train/eval creation and internal training/validation splitting. It removes exact duplicate rows by default; training passes `deduplicate=False` to preserve every reviewed row. It unions normalized input matches, trace/conversation IDs, explicit `group_by` columns and synthetic seed lineage into indivisible components. Optional `stratify_by` balances categorical coverage across those components. Seeded random, head and tail ordering are supported; grouping can change the requested percentage. `source_spec.contamination_report` records actual counts, duplicate removal, group/content overlap and strata. Near-duplicate similarity is explicitly **not checked** by the split operation. Training checks the selected versions again through `rows.contamination`; dataset versions and capability cannot be changed after a job is created.
+Preserve full probability targets, option order, weights, repeated observations and
+valid blank states. Do not derive argmax labels or invent distributions from means.
+Decision/Jev preparation publishes a typed `decision`, retaining tied maxima and
+declared supervision metadata. Record evidence-backed target semantics in retained
+code and output metadata; historical preparation plans are not a writable API.
+Flat-source profiles and impact measurements include weights, semantics and target
+provenance. Profiler upgrades invalidate cached measurements for new requests;
+replaying a request key still returns its original frozen operation.
+Exploration measures sampling feasibility and allocations; derivation copies a
+complete source. Sample selection runs externally and returns through the import
+contract. Partition plans keep related content, declared groups and synthetic
+seeds together. Unknown explicit group fields fail construction; projected-away
+groups remain usable through preserved lineage. Partition request keys serialize
+at project scope. Generated member names reserve space for the role suffix while
+retaining the full plan name.
 
-A document split groups by `_overmind_document_id` unless `group_by` is given.
+Group identity aliases are shared by lineage recording and partition validation.
+A declared `content` column has a separate group identity from internal input
+fingerprints, including after projection removes that column.
 
-Modal jobs run exact CPU preprocessing after launch for the selected model, training type, context and dataset versions. Setup does not start, display or wait for this step. Technical incompatibilities fail preparation before GPU training; repairs are new workshop versions, and a job using revised versions is checked again. Explicit REST/MCP preparation remains available. See backend-architecture § Training preparation.
+Raw tables have no inferred feature/target mapping. Their full records, excluding
+platform row/provenance identities, receive versioned `record:v1:` fingerprints.
+Names such as `state`, `text`, `label` and `score` never select or exclude columns.
+Explicit input/chat envelopes and the complete native decision wire format use
+model-input fingerprints; native target variants stay together across flat,
+nested and wrapped formats. Declared groups and inherited source/seed keys remain
+partition constraints. Historical keys are not silently dropped or rewritten.
+For affected historical imports, follow the immutable-source rebuild procedure
+in `docs/workshop-pipelines.md` before creating new consumer snapshots.
 
-## Decision rows
+`use.check` verifies readability and technical fit. `use.use` / `use.freeze`
+pin exact cells in the consumer transaction. Training pins train/validation/eval
+cells atomically and does model-specific preprocessing outside Workshop.
+Later transformations append; they do not rewrite these frames.
+Sources and successful versions remain readable after failures or cancellation.
 
-A decision row is `input = {state, questions}` and `expected_output = {question key: answer}` (`services/datasets/decisions.py`, the one validator shared by the contract, `decision_jobs` and the API). A question is `{type, instructions, criteria}`: `choice` criteria map option keys to descriptions, `noul` has the options `true`/`false` (criteria optional), `score` criteria list levels and its options are the indexes `"0"`, `"1"`, …. An answer is one option or `{option: weight}` (normalised). The rules match the pinned unsloth `_target_for`/`_clef_question` and the decision server, so a valid row trains and scores. `contract.measure` adds `intent_report["decision"]` (`ok`, `reason` naming the first bad row, `rows`); the `train` and `eval` checks stay chat-only and an `eval` check refuses decision inputs, so no chat consumer reads them. Landing proposes `train` for decision rows. `use.use(..., decision=True)` gates on `Cell.fits_decision()`. `DatasetSerializer.decision_ready` is the list-level flag. The Console card shows **Ready for decision training** / **evaluation** and **Train a decision model** (`/training?models=decision&decision=true&datasetId=`); MCP agents read `overmind://decision-models` and start `start_decision_job`.
+## Contracts and verification
 
-## Consumers
+MCP contract 5.1 adds project revisions, packages, preview, validation, exact-run
+cancellation and binding save/state/run tools. The removed agent endpoints remain
+absent. `get_job` supports exact dataset_pipeline run IDs; revision/package/binding
+resources and paginated pipeline diagnostics expose retained facts. Existing source,
+exploration, partition, export and consumer-readiness operations remain.
 
-- A train version hands off to the training wizard (`/training?train=true&datasetId=`); an eval version to the optimiser (`/optimiser?optimize=true&datasetId=`) or to the training wizard as the eval dataset (`/training?train=true&evalDatasetId=`). There is no single-run eval flow.
-- A local loop (the SDK's optimiser and backtests) never reads a dataset by id. It pulls the used version through `GET .../export/?cell=&fmt=jsonl|csv` (a raw stream, never a use), whose response carries `X-Overmind-Cell`, `X-Overmind-Version` and `X-Overmind-Fingerprint`, and caches it as `.overmind/datasets/<cell>.jsonl` with the fingerprint beside it (`optimizer_api.export_dataset`).
+`docs/workshop-pipelines.md` records runtime setup and repeatable regression commands.
+Frontend uses the generated OpenAPI client.
+Keep account/project isolation, stable retry keys, changed-key conflicts, source
+checksum checks, failed/cancelled publication and artifact lineage covered.
+
+Native agents author explicit `id`/`input` dependencies in steps. Inputs name
+`source` or an earlier step; repeated inputs create real forks. The saved entity
+and MCP resource return `flow` with nodes, edges, conditions and output. Script
+conditions cite `expression` and entrypoint `line`, remain `agent_declared`, and
+never execute as expressions. Scripts route rows; every step executes, including
+empty branches. `inputs` concatenates distinct earlier branches in declared order;
+overlapping source_row identities fail before publication. The script receives a
+schema-compatible union; incompatible nonempty data columns/types fail rather than
+coercing values. It is a
+disjoint union, not a relational key join. Flow exposes terminal and unconsumed
+steps so native agents can converge training deliverables rather than leave dead ends.
+Publication records actual `input_cells`, `step_id` and condition evidence per cell.
+Cell `transformation` metadata binds publication membership and output fingerprint to
+the completed run, exact revision, entrypoint and package. It distinguishes isolated
+script execution, historical declarative operations, external imports, sources and unrecorded
+history; review text alone is not proof of execution. The Script section can inspect
+every retained package file, with checksum-verified character pagination shared by
+REST and MCP. Keep each step's substantive logic in its visible entrypoint; shared
+helpers contain genuinely reusable utilities, not an opaque step dispatcher. Change
+recipes by new revisions and executions, never rewriting historical cell scripts.
+The Console preserves full-size cell contents on a 20px grid-snapped flow canvas.
+Steps cascade down; sibling branches align side by side on the same horizontal
+layer. Cells open at scale 1; explicit zoom, Fit view and a toggleable minimap
+navigate the graph without changing cell dimensions. Reset and linked-cell focus
+restore scale 1; resizing preserves the chosen zoom. `preparation.py` builds the
+selected successful process from verified run inputs, partition members and
+derivations across datasets; unrelated attempts are not canvas nodes.
+The right-hand box contains dataset navigation and the minimap toggle, without
+cell search or a cell-selector strip.
+
+MCP contract 5.2 adds the `author-dataset-transformation` prompt and exact-revision
+lookup using `inspect_dataset_workbench(pipeline=REVISION_UUID)`: selected recipe,
+paged family history and scoped runs/bindings. Stale family updates return
+`revision_conflict`. Branch correctness requires independent member/coverage checks;
+declarations, preview prefixes and successful execution do not establish it.
+
+## Preparation execution and corrections
+
+Upload original source bytes once and pin upstream revisions. Register retained
+transformation code before processing the full data. Do not upload prepared
+outputs as unrelated sources. For corrections, update the same recipe family
+and run the corrected package against the original source; the resulting clean
+process replaces the displayed cells without repair-history or restore controls.
+Consumer-pinned artifacts remain immutable internally. Recipes belong to the
+project; reuse is optional and requires compatible source and target semantics.
+`inspect_dataset_workbench.preparation` exposes the same source-to-output graph
+as the Console, including recorded train/development/calibration/final links.
+
+Column contracts use `object` for a nested decision, never `json`. Declare the
+final step's `consumer` as `decision_train`, `decision_eval`, `chat_train` or
+`model_eval` to validate nested targets in both preview and publication. Preserve
+evidenced semantics and structured provenance; never remove them to pass checks.
+Preview samples a bounded prefix and does not establish coverage of every family.
+
+For row-independent transformations, declare step `batch_rows` (1–100000).
+Consecutive batches execute in separate restricted containers and concatenate in
+source order. Each expanded JSONL input/output must fit half the package's
+`scratch_mb`; each batch has the declared time limit. Global sorting, grouping,
+splitting and deduplication must not use batching. Row checks apply to the combined
+output, publication remains atomic, and progress records completed batches and
+rows. A failed or cancelled batch publishes no partial cells. CLI directory
+packages omit Python bytecode caches; other unsupported files remain errors.
+
+Controller recovery uses a dedicated PostgreSQL session lock. Only its owner may execute queued recipes. On startup it fails interrupted recipe runs and removes their owned containers before accepting new work. Recovery never publishes partial outputs or automatically replays scripts. Each batch clears the previous batch's execution identity and exit code before reporting progress.
+
+Large row stores bound staging and DataFrame chunks to 16 MiB of serialized row data (one larger row remains indivisible), with 256-row Arrow decoding batches. Declared transformation batches stream through temporary Parquet files rather than collecting all rows in memory. Runtime JSONL scratch limits remain separate and enforced.
+
+### Script association and cell comparisons
+
+Keep the existing cell and branch UI. `save_dataset_pipeline(dataset=..., package=...)` automatically retains the script and associates the current revision with its preparation. Registration retries return the old receipt without resetting a newer association. Submission also binds reused project recipes to the dataset; package-free execution remains prohibited. `DatasetPipeline.authoring_dataset_id` retains the request identity independently of dataset deletion.
+
+Grid comparisons use the recorded single input, so corrections do not display discarded attempts as their baseline. Multi-input cells do not invent a single comparison parent.
+
+Trace source cells expose a preparation prompt for the external coding agent. It
+pins the deployment, project, dataset and original source fingerprint, carries the
+explicit purpose and brief, and uses the retained-package workflow. Observed trace
+outputs never become verified references implicitly. Dataset polling refreshes the
+preparation graph by dataset revision; event reconnection also refreshes it.
+
+Creating a dataset from selected traces asks for its name and optional capability
+only. It lands with pending purpose; preparation and consumer intent follow in
+Workshop. Trace selections omit the table-only `all_spans` display parameter.

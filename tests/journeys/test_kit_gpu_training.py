@@ -1,6 +1,6 @@
 import pytest
 
-from .datasets import prepare, tickets, training_rows, until, upload
+from .datasets import tickets, training_rows, until, upload
 from .stack import drain
 
 PREPARE = "overbae.tasks.training_preparation.reconcile"
@@ -23,10 +23,10 @@ def training(workshop, cli, sample_agent, worker, sft, fake_modal, beat, tmp_pat
         cli, sample_agent, tickets(tmp_path), "--intent", "eval", "--capability", answer["id"]
     )
     drain(worker)
-    prepare(workshop, evals, "eval")
     job = workshop.call(
         "start_finetune",
         {
+            "request_key": "train-support-model",
             "dataset": train,
             "eval_dataset": evals,
             "base_model": "Qwen/Qwen3-1.7B",

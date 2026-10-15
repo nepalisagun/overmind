@@ -14,6 +14,7 @@ import { ServingStatusBadge } from "@/components/inference/serving-status";
 import { DetailErrorState } from "@/components/route-error";
 import {
   AlertDialog,
+  AlertDialogBody,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -121,7 +122,7 @@ function ModelDetailPage() {
           ) : null}
           <ServingCard
             actions={
-              projectId ? (
+              projectId && model.inferenceContract !== "decision" ? (
                 <ModelLiveAction
                   capabilityId={model.capabilityId}
                   jobs={jobs}
@@ -167,12 +168,15 @@ function ModelDetailPage() {
                   {model.maxModelLen.toLocaleString()} tokens
                 </LineageField>
                 <LineageField label="GPU">{model.gpuType || "—"}</LineageField>
+                <LineageField label="Output">
+                  {model.inferenceContract === "decision" ? "Decision probabilities" : "Chat"}
+                </LineageField>
                 <LineageField label="Precision">{model.quantization || "—"}</LineageField>
                 <LineageField label="Deployed">
                   <DateTime value={model.deployedAt ?? model.createdAt} />
                 </LineageField>
               </div>
-              <div className="space-y-3 border-t border-border/70 pt-4">
+              <div className="-mx-4 space-y-3 border-t border-border/70 px-4 pt-4">
                 <p className="text-sm font-medium">Weights & checkpoints</p>
                 <WeightsContent
                   checkpoints={checkpoints}
@@ -184,7 +188,8 @@ function ModelDetailPage() {
             </div>
           </Disclosure>
           <ApiSnippetDialog
-            capabilityId={model.capabilityId}
+            capabilityId={model.inferenceContract === "decision" ? null : model.capabilityId}
+            decisionDeploymentId={model.inferenceContract === "decision" ? model.id : undefined}
             modelId={model.modelId}
             onOpenChange={setSnippetOpen}
             open={snippetOpen}
@@ -235,12 +240,13 @@ function RedeployBanner({ model }: { model: DeployedModel }) {
 }
 
 function ServingCard({ model, actions }: { model: DeployedModel; actions?: React.ReactNode }) {
-  const reference = model.capabilityId ? `overmind/${model.capabilityId}` : model.modelId;
+  const alias = model.inferenceContract !== "decision" && model.capabilityId;
+  const reference = alias ? `overmind/${model.capabilityId}` : model.modelId;
   return (
     <Card className="flex flex-wrap items-start justify-between gap-4 p-4">
       <div className="min-w-0 space-y-2">
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>{model.capabilityId ? "Capability alias" : "Model ID"}</span>
+          <span>{alias ? "Capability alias" : "Model ID"}</span>
           {model.capabilityId ? (
             <CapabilityChip
               capabilityId={model.capabilityId}
@@ -390,7 +396,7 @@ function Disclosure({
 
 function DangerZone({ id, modelId }: { id: string; modelId: string }) {
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-t border-border/70 pt-4">
+    <div className="-mx-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-t border-border/70 px-4 pt-4">
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium">Delete deployment</p>
         <p className={cn(PROSE, "text-xs leading-snug text-muted-foreground")}>
@@ -447,7 +453,7 @@ function DeleteModelButton({ id, modelId }: { id: string; modelId: string }) {
             requests to this model will start failing.
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="space-y-1.5">
+        <AlertDialogBody className="space-y-1.5">
           <p className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
             Type
             <span className="font-mono text-xs text-foreground">{modelId}</span>
@@ -460,7 +466,7 @@ function DeleteModelButton({ id, modelId }: { id: string; modelId: string }) {
             placeholder={modelId}
             value={confirm}
           />
-        </div>
+        </AlertDialogBody>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <Button disabled={!canDelete} onClick={handleDelete} variant="destructive">

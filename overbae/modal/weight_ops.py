@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import re
 import shutil
 import tempfile
@@ -271,8 +270,8 @@ def _warn_unexpected_target_modules(
 
 
 def _lora_scale(lora_config: LoraConfig) -> float:
-    rank = math.sqrt(lora_config.r) if lora_config.use_rslora else lora_config.r
-    return lora_config.lora_alpha / rank
+    divisor = lora_config.r**0.5 if lora_config.use_rslora else lora_config.r
+    return lora_config.lora_alpha / divisor
 
 
 def _apply_gpt_oss_expert_loras(

@@ -2,16 +2,32 @@
 import type { ReactNode } from "react";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterContextProvider,
+} from "@tanstack/react-router";
+import { act, cleanup, render as renderComponent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import apiClient from "@/client";
 import type { ExperimentSnapshot } from "@/components/finetuning/job-snapshot";
+import { buildExperimentSnapshot } from "@/components/finetuning/job-snapshot";
+import type { LossCurveData } from "@/hooks/use-finetuning";
 import type { DeployedModelsQueryParams } from "@/hooks/use-inference";
-import type { FinetuningJobList } from "@/openapi";
+import { ApiError } from "@/lib/api-error";
+import { stageDetailLine, stageLabel, stageStatusLine } from "@/lib/finetuning-progress";
+import type { FinetuningJobList, NativeEvaluation, TrainingExperiment } from "@/openapi";
 
 const CAPABILITY_ID = "00000000-0000-4000-8000-000000000010";
 const PROJECT_ID = "00000000-0000-4000-8000-000000000001";
 const SERVING_ID = "ft:job-a:9f3c";
+
+function render(children: ReactNode) {
+  const router = createRouter({ history: createMemoryHistory(), routeTree: createRootRoute() });
+  return renderComponent(<RouterContextProvider router={router}>{children}</RouterContextProvider>);
+}
 
 /** This run's deployment is the oldest of 30, so no default-sized project page
  *  can contain it. */
@@ -30,7 +46,10 @@ const serverPage = ({ capability, pageSize }: DeployedModelsQueryParams) => {
   return { count: scoped.length, results: scoped.slice(0, pageSize ?? 25) };
 };
 
-const mocks = vi.hoisted(() => ({ deployedParams: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  deployedParams: vi.fn(),
+  monitoring: vi.fn().mockResolvedValue({ checks: [], nextOffset: null }),
+}));
 
 vi.mock("@/hooks/use-inference", () => ({
   useDeployedModelsQuery: (params: DeployedModelsQueryParams) => {
@@ -48,7 +67,20 @@ vi.mock("@/hooks/use-finetuning", () => ({
 }));
 
 vi.mock("@/client", () => ({
-  default: { finetuningJobs: { finetuningJobsLossCurvesRetrieve: vi.fn().mockResolvedValue({}) } },
+  default: {
+    finetuningJobs: {
+      finetuningJobsLossCurvesRetrieve: vi.fn().mockResolvedValue({}),
+      finetuningJobsMonitoringRetrieve: mocks.monitoring,
+    },
+    nativeEvaluations: {
+      nativeEvaluationsRetrieve: vi.fn().mockResolvedValue(null),
+    },
+    trainingExperiments: {
+      trainingExperimentsRetrieve: vi
+        .fn()
+        .mockResolvedValue({ evaluation: null, state: "training" }),
+    },
+  },
 }));
 
 vi.mock("@/components/finetuning/judge-eval-table", () => ({
@@ -75,7 +107,7 @@ vi.mock("@/components/finetuning/judge-eval-table", () => ({
 
 // The production action fetches the capability; it has its own tests.
 vi.mock("@/components/finetuning/model-live-action", () => ({
-  ModelLiveAction: () => null,
+  ModelLiveAction: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
 // The @lobehub icon ESM subpaths behind the provider logo don't resolve under
@@ -90,7 +122,9 @@ vi.mock("@/components/finetuning/finetuning-charts", () => ({
   ClassSeriesChart: () => null,
   ConfusionMatrixGrid: () => null,
   MetricSeriesChart: () => null,
-  MultiSeriesChart: () => null,
+  MultiSeriesChart: ({ series }: { series: unknown }) => (
+    <output aria-label="multi-series">{JSON.stringify(series)}</output>
+  ),
 }));
 
 // Radix Tooltip needs its provider.
@@ -101,6 +135,7 @@ vi.mock("@/components/ui/tooltip", () => ({
   TooltipTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
+import { StageProgress } from "./stage-progress";
 import { TrainingMonitorPanel } from "./training-monitor";
 
 const job = {
@@ -129,6 +164,11 @@ const job = {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.mocked(apiClient.trainingExperiments.trainingExperimentsRetrieve).mockResolvedValue({
+    evaluation: null,
+    state: "training",
+  } as TrainingExperiment);
+  vi.mocked(apiClient.nativeEvaluations.nativeEvaluationsRetrieve).mockResolvedValue(null!);
 });
 
 it("renders a shared incumbent once across a training group", () => {
@@ -189,4 +229,444 @@ describe("TrainingMonitorPanel deployed-model lookup", () => {
       projectId: PROJECT_ID,
     });
   });
+});
+
+it.each([
+  ["decision_cross_entropy", "Validation cross entropy"],
+  ["decision_supervised", "Validation objective loss"],
+])("shows native %s validation progress without chat token accuracy", (objective, lossLabel) => {
+  const nativeJobs = ["Pilot", "Full corpus"].map((name, i) => ({
+    ...job,
+    id: `native-${i}`,
+    name,
+    progress: {
+      diagnostics: {
+        completed: 600,
+        heartbeat_at: Date.now() / 1000,
+        stage: "initial_validation",
+        total: 1200,
+        unit: "decisions",
+      },
+      eval_history: [
+        {
+          brier: 0.4,
+          decisions: 1200,
+          eval_loss: 1.2,
+          hard_label_accuracy: 0.65,
+          hard_label_decisions: 1000,
+          step: 0,
+        },
+      ],
+      phase: "training",
+    },
+    status: "running",
+    trainingContract: { objective },
+  })) as unknown as FinetuningJobList[];
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={nativeJobs}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.getAllByText("Full corpus").length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/600 \/ 1,200 decisions/)).toHaveLength(2);
+  expect(screen.getAllByText("Validating base model")).toHaveLength(2);
+  expect(screen.queryByText("Token accuracy")).toBeNull();
+  expect(screen.getAllByText(lossLabel).length).toBeGreaterThan(0);
+  expect(screen.getAllByText("1.2000")).toHaveLength(2);
+});
+
+it("overlays development loss across all experiments", async () => {
+  mocks.monitoring.mockImplementation(({ id }: { id: string }) =>
+    Promise.resolve({
+      checks: [
+        {
+          metrics: { eval_loss: id === "native-0" ? 0.7 : 0.6 },
+          state: "completed",
+          step: 188,
+          stream: "development",
+        },
+      ],
+      nextOffset: null,
+    })
+  );
+  const nativeJobs = ["Pilot", "Full corpus"].map((name, i) => ({
+    ...job,
+    id: `native-${i}`,
+    name,
+    progress: { phase: "training" },
+    status: "running",
+    trainingContract: { objective: "decision_cross_entropy" },
+  })) as unknown as FinetuningJobList[];
+  render(
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={nativeJobs}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(await screen.findByText("Development loss")).toBeTruthy();
+  expect((await screen.findAllByText(/0.7/)).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/0.6/).length).toBeGreaterThan(0);
+});
+
+it("shows the frozen native plan beside its training job", () => {
+  const native = {
+    ...job,
+    nativeEvaluation: {
+      calibration: {},
+      calls: {},
+      config: {
+        baseline: "base",
+        participants: [
+          { key: "base", kind: "foundation", model: job.baseModel, name: "Unchanged base" },
+          {
+            job: job.id,
+            key: "candidate",
+            kind: "trained",
+            model: job.baseModel,
+            name: "Trained model",
+          },
+        ],
+        suites: { calibration: { cell: "cal", rows: 12 }, final: { cell: "final", rows: 48 } },
+      },
+      error: "",
+      id: "native-plan",
+      results: {},
+      state: "waiting_for_checkpoint",
+    },
+    trainingContract: { objective: "decision_cross_entropy" },
+  } as unknown as FinetuningJobList;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TrainingMonitorPanel
+        focusJobId={native.id}
+        groupJobs={[native]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.getAllByText("Waiting for checkpoint")).toHaveLength(2);
+  expect(screen.getByText(/48 decisions/)).toBeTruthy();
+  expect(screen.queryByText(/No eval dataset or eval set linked/)).toBeNull();
+});
+
+it.each([
+  404, 403, 500,
+])("treats only a missing optional training experiment as empty (HTTP %s)", async (status) => {
+  const message =
+    status === 404 ? "No TrainingExperiment matches the given query." : "Could not load experiment";
+  vi.mocked(apiClient.trainingExperiments.trainingExperimentsRetrieve).mockRejectedValue(
+    new ApiError(status, message, true)
+  );
+  const native = {
+    ...job,
+    nativeEvaluation: null,
+    trainingContract: { objective: "decision_cross_entropy" },
+  } as FinetuningJobList;
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <TrainingMonitorPanel
+        focusJobId={native.id}
+        groupJobs={[native]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  if (status === 404) {
+    expect(await screen.findByText("No evaluations pinned to this run")).toBeTruthy();
+    expect(screen.queryByText(message)).toBeNull();
+    expect(client.getQueryData(["training-experiment", PROJECT_ID, native.groupId])).toBeNull();
+  } else {
+    expect(await screen.findByText(message)).toBeTruthy();
+    expect(screen.queryByText("No evaluations pinned to this run")).toBeNull();
+  }
+  expect(apiClient.nativeEvaluations.nativeEvaluationsRetrieve).not.toHaveBeenCalled();
+});
+
+it.each([
+  1, 3,
+])("loads the run-pinned benchmark for an experiment with %s training jobs", async (count) => {
+  const nativeJobs = Array.from({ length: count }, (_, index) => ({
+    ...job,
+    id: `native-job-${index}`,
+    nativeEvaluation: null,
+    trainingContract: { objective: "decision_cross_entropy" },
+  })) as FinetuningJobList[];
+  const evaluation = {
+    calls: {},
+    config: {
+      participants: nativeJobs.map((j, i) => ({
+        job: j.id,
+        key: `candidate-${i}`,
+        kind: "trained",
+        model: j.baseModel,
+        name: j.name,
+      })),
+    },
+    id: "run-pinned-plan",
+    name: "Frozen run benchmark",
+    results: {},
+    state: "draft",
+  } as NativeEvaluation;
+  vi.mocked(apiClient.trainingExperiments.trainingExperimentsRetrieve).mockResolvedValue({
+    evaluation: evaluation.id,
+    state: "training",
+  } as TrainingExperiment);
+  vi.mocked(apiClient.nativeEvaluations.nativeEvaluationsRetrieve).mockResolvedValue(evaluation);
+  render(
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={nativeJobs}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.queryByText("No evaluations pinned to this run")).toBeNull();
+  const table = await screen.findByRole("table", { name: "Evaluation jobs" });
+  expect(within(table).getAllByRole("row")).toHaveLength(count + 1);
+  expect(screen.getAllByRole("link", { name: "Frozen run benchmark" })).toHaveLength(count);
+  expect(apiClient.nativeEvaluations.nativeEvaluationsRetrieve).toHaveBeenCalledWith({
+    id: "run-pinned-plan",
+  });
+});
+
+it.each([
+  { range: [913, 2184], remaining: "15–37 min training remaining (estimate)" },
+  { range: null, remaining: null },
+  { range: [-1, 2184], remaining: null },
+  { range: [2184, 913], remaining: null },
+])("shows elapsed time and only a valid range in minutes: $range", ({ range, remaining }) => {
+  const running = {
+    ...job,
+    progress: { elapsed_seconds: 728, eta_range_seconds: range, eta_seconds: 60 },
+    status: "running",
+  } as unknown as FinetuningJobList;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={[running]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  const label = screen.getByText(/elapsed/).textContent;
+  expect(label).toContain("12m 08s elapsed");
+  if (remaining) expect(label).toContain(remaining);
+  else expect(label).not.toContain("remaining");
+  expect(label).not.toContain("~1m");
+});
+
+it("describes local submission recovery without claiming a provider stage is missing", () => {
+  const unresolved = {
+    ...job,
+    progress: {},
+    status: "submission_unknown",
+  } as unknown as FinetuningJobList;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={[unresolved]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.getByText("Reconciling training submission")).toBeTruthy();
+  expect(screen.queryByText(/provider stage not reported/)).toBeNull();
+});
+
+it("explains model loading and exposes the saved stage history", () => {
+  const loading = {
+    ...job,
+    progress: {
+      activity: [
+        { message: "Checking base model weights", ts: 1 },
+        { message: "Loading base model onto GPU", ts: 2 },
+      ],
+      diagnostics: {
+        heartbeat_at: Date.now() / 1000 - 5,
+        last_progress_at: Date.now() / 1000 - 120,
+        stage: "loading_model",
+        stage_started_at: Date.now() / 1000 - 120,
+      },
+      phase: "training",
+      stage: "loading_model",
+    },
+    status: "running",
+  } as unknown as FinetuningJobList;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={[loading]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.getByText("Base weights ready · loading onto training GPU")).toBeTruthy();
+  expect(screen.getByText("Loading model")).toBeTruthy();
+  expect(screen.getByText(/2m 0s in this stage/)).toBeTruthy();
+  expect(screen.getByText(/5s since worker heartbeat/)).toBeTruthy();
+  expect(screen.getByText(/Loading percentage not reported/)).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: "Show activity log" }).length).toBeGreaterThan(0);
+});
+
+it("shows the actual startup substage and keeps absent heartbeat explicit", () => {
+  const loading = {
+    ...job,
+    progress: {
+      diagnostics: { stage: "configuring_adapters" },
+      stage: "configuring_adapters",
+    },
+    status: "running",
+  } as unknown as FinetuningJobList;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={[loading]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.getByText("Configuring adapters")).toBeTruthy();
+  expect(screen.getByText(/Worker heartbeat not reported/)).toBeTruthy();
+  expect(screen.queryByText(/Base weights ready/)).toBeNull();
+});
+
+it("does not present the last running step as the outcome of a cancelled job", () => {
+  const cancelled = {
+    ...job,
+    progress: {
+      activity: [{ kind: "stage", message: "Training started", ts: 1 }],
+      phase: "training",
+      stage: "training",
+    },
+    status: "cancelled",
+  } as unknown as FinetuningJobList;
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TrainingMonitorPanel
+        focusJobId={null}
+        groupJobs={[cancelled]}
+        onFocusJob={vi.fn()}
+        projectId={PROJECT_ID}
+      />
+    </QueryClientProvider>
+  );
+  expect(screen.queryByText("Training started")).toBeNull();
+});
+
+it("keeps row-level preparation progress when the live metrics response has no preparation field", () => {
+  const preparing = {
+    ...job,
+    progress: {
+      preparation: { completed_rows: 250, state: "running", total_rows: 1000 },
+    },
+    status: "preparing",
+  } as unknown as FinetuningJobList;
+  const curves = { progress: { diagnostics: {} } } as LossCurveData;
+  const snapshot = buildExperimentSnapshot(preparing, curves, "var(--chart-1)");
+  expect(stageStatusLine(snapshot.liveProgress)).toContain("250 / 1,000 rows");
+});
+
+it("shows measured preparation completion without treating an upload as finished tokenization", () => {
+  expect(
+    stageStatusLine({
+      preparation: { completed_rows: 250, stage: "tokenizing", state: "running", total_rows: 1000 },
+    })
+  ).toBe("Tokenizing · 250 / 1,000 rows (25%)");
+  expect(
+    stageStatusLine({
+      preparation: {
+        completed_rows: 1000,
+        stage: "uploading",
+        state: "starting",
+        total_rows: 1000,
+      },
+    })
+  ).toBe("Uploading training data · 1,000 rows prepared");
+  expect(stageLabel({ stage: "loading_model" })).toBe("Loading model");
+  expect(stageDetailLine({ stage: "loading_model" })).toBe(
+    "Base weights ready · loading onto training GPU"
+  );
+});
+
+it("shows measured transfer progress and ages it without inventing more completed work", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(200_000);
+  try {
+    render(
+      <StageProgress
+        progress={{
+          diagnostics: {
+            completed: 250,
+            last_progress_at: 190,
+            source_at: 190,
+            stage: "selecting_prepared_rows",
+            stage_started_at: 150,
+            total: 1000,
+            unit: "rows",
+          },
+          stage: "transferring",
+        }}
+      />
+    );
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("25");
+    expect(screen.getByText(/10s since last progress/)).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByText(/1m 10s since last progress/)).toBeTruthy();
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("25");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("does not invent a transfer percentage when the worker provides no measurements", () => {
+  render(<StageProgress progress={{ stage: "transferring" }} />);
+  expect(screen.queryByRole("progressbar")).toBeNull();
+  expect(screen.getByText(/Progress not reported/)).toBeTruthy();
+});
+
+it("identifies upload counts as acknowledged bytes rather than live network progress", () => {
+  const progress = {
+    diagnostics: {
+      completed: 1024,
+      files_completed: 1,
+      files_total: 2,
+      measurement: "provider_acknowledged_files",
+      stage: "uploading_selections",
+      total: 2048,
+      unit: "bytes",
+    },
+    stage: "transferring",
+  };
+  expect(stageDetailLine(progress)).toContain("1 KiB / 2 KiB acknowledged");
+  expect(stageDetailLine(progress)).toContain("1 / 2 files");
+  expect(stageLabel(progress)).toBe("Transferring data");
 });

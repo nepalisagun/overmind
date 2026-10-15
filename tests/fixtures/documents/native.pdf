@@ -1,43 +1,68 @@
-%PDF-1.4
+%PDF-1.3
+%“Œ‹ž ReportLab Generated PDF document (opensource)
 1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
+<<
+/F1 2 0 R
+>>
 endobj
 2 0 obj
-<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+<<
+/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
+>>
 endobj
 3 0 obj
-<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+<<
+/Contents 7 0 R /MediaBox [ 0 0 612 792 ] /Parent 6 0 R /Resources <<
+/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+>> /Rotate 0 /Trans <<
+
+>> 
+  /Type /Page
+>>
 endobj
 4 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+<<
+/PageMode /UseNone /Pages 6 0 R /Type /Catalog
+>>
 endobj
 5 0 obj
-<< /Length 57 >>
-stream
-BT /F1 18 Tf 72 700 Td (Invoice total: 1234.56 USD) Tj ET
-endstream
+<<
+/Author (anonymous) /CreationDate (D:20000101000000+00'00') /Creator (anonymous) /Keywords () /ModDate (D:20000101000000+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
+  /Subject (unspecified) /Title (untitled) /Trapped /False
+>>
 endobj
 6 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+<<
+/Count 1 /Kids [ 3 0 R ] /Type /Pages
+>>
 endobj
 7 0 obj
-<< /Length 65 >>
+<<
+/Filter [ /ASCII85Decode /FlateDecode ] /Length 131
+>>
 stream
-BT /F1 18 Tf 72 700 Td (Refunds are issued within 30 days.) Tj ET
-endstream
+GapQh0E=F,0U\H3T\pNYT^QKk?tc>IP,;W#U1^23ihPEM_?CT3",gCK)'Qp-TgkCe.$tqj."pY2BR&[)j_#p<.[9"\,j&209f"]T1Gr):%<g,u#g#sMd/n#^huWn@,9,n~>endstream
 endobj
 xref
 0 8
 0000000000 65535 f 
-0000000009 00000 n 
-0000000058 00000 n 
-0000000121 00000 n 
-0000000191 00000 n 
-0000000317 00000 n 
-0000000424 00000 n 
-0000000550 00000 n 
+0000000061 00000 n 
+0000000092 00000 n 
+0000000199 00000 n 
+0000000392 00000 n 
+0000000460 00000 n 
+0000000721 00000 n 
+0000000780 00000 n 
 trailer
-<< /Size 8 /Root 1 0 R /ID [<87ad7848a95136e09deb6a07c855de44> <87ad7848a95136e09deb6a07c855de44>] >>
+<<
+/ID 
+[<1c178198fbdfa51b25995d89d4102043><1c178198fbdfa51b25995d89d4102043>]
+% ReportLab generated PDF document -- digest (opensource)
+
+/Info 5 0 R
+/Root 4 0 R
+/Size 8
+>>
 startxref
-665
+1001
 %%EOF

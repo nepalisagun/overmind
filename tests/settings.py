@@ -14,10 +14,11 @@ os.environ.setdefault("FINETUNING_BACKEND", "modal")
 os.environ.setdefault("HF_TOKEN", "testing")
 os.environ.setdefault("BASETEN_API_KEY", "testing")
 os.environ.setdefault("TOGETHER_API_KEY", "testing")
+os.environ.setdefault("MODAL_ENVIRONMENT", "overmind-dev")
 os.environ.setdefault("MODAL_TOKEN_ID", "testing")
 os.environ.setdefault("MODAL_TOKEN_SECRET", "testing")
 os.environ.setdefault("OPENROUTER_API_KEY", "testing")
-os.environ.setdefault("SANDBOX_URL", "http://127.0.0.1:9")
+os.environ.setdefault("SANDBOX_URL", "http://sandbox.test")
 os.environ.setdefault("SANDBOX_TOKEN", "testing")
 # FileField storage stays local in tests even if .env opts into hosted S3.
 os.environ["AWS_STORAGE_BUCKET_NAME"] = ""
@@ -25,11 +26,6 @@ os.environ["AWS_STATIC_BUCKET_NAME"] = ""
 os.environ["AWS_S3_CUSTOM_DOMAIN"] = ""
 
 from overbae.settings import *  # noqa: E402, F403
-
-# overbae.settings loads .env into os.environ; a developer's own Overmind key there
-# would authenticate the journeys' CLI instead of the key each journey writes.
-os.environ.pop("OVERMIND_API_KEY", None)
-os.environ.pop("OVERMIND_BASE_URL", None)
 
 DATABASES = {
     "default": {

@@ -1,6 +1,7 @@
 /**
  * Every colour meaning in the app is declared here; call sites never write a
- * hex, an `hsl()` or a raw Tailwind palette class.
+ * hex, an `hsl()` or a raw Tailwind palette class. The semantic tokens behind
+ * `TONE_*` use the single dark palette.
  */
 
 /** `neutral` means "no signal", not "unknown-and-probably-bad". */
@@ -75,7 +76,6 @@ const STATES_BY_TONE: Array<[StatusTone, readonly string[]]> = [
       "deployed",
       "healthy",
       "live",
-      "ok",
       "passed",
       "ready",
       "succeeded",
@@ -87,9 +87,9 @@ const STATES_BY_TONE: Array<[StatusTone, readonly string[]]> = [
     [
       "analysing",
       "deploying",
-      "evaluating",
       "pending",
       "preparing",
+      "preprocessing",
       "queued",
       "running",
       "scheduled",
@@ -102,7 +102,7 @@ const STATES_BY_TONE: Array<[StatusTone, readonly string[]]> = [
     "warning",
     ["degraded", "dormant", "partially_completed", "paused", "review", "stale", "ungraded"],
   ],
-  ["neutral", ["draft", "skipped", "unknown"]],
+  ["neutral", ["awaiting_launch", "draft", "skipped", "unknown"]],
 ];
 
 const STATE_TONE: Record<string, StatusTone> = Object.fromEntries(
@@ -128,14 +128,14 @@ export const SERIES_COLORS: string[] = Array.from({ length: CATEGORICAL_SLOT_COU
 );
 
 /**
- * A fixed brand ink, not a palette token: call sites invert the pixel heading
- * icons wholesale with `invert`, so this must stay constant.
+ * A fixed brand ink, not a theme token: the pixel heading icons are inverted
+ * wholesale via `invert`, so this must stay constant.
  */
 export const ICON_INK = "#16120F";
 
 /**
- * A native `<input type="datetime-local">` opens the browser's own picker, which
- * the palette cannot reach, so the trigger and its picker are pinned light together.
+ * Native `<input type="datetime-local">` chrome renders its own light picker,
+ * so the trigger retains a light surface to match it.
  */
 export const NATIVE_DATE_TRIGGER =
-  "border-neutral-300 bg-white text-neutral-900 hover:bg-neutral-100 [color-scheme:light]";
+  "border-neutral-300 bg-white text-neutral-900 shadow-none hover:bg-neutral-100";

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import contextlib
 import fcntl
 import json
@@ -19,11 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from sandbox import libraries, tables
+from sandbox import packages
 
 GIB = 1024**3
-SCRIPT_CPU_SECONDS = 120
-SCRIPT_WALL_SECONDS = 300
 EXTRACT_CPU_SECONDS = 1200
 EXTRACT_WALL_SECONDS = 1260
 FILE_SIZE_BYTES = 2 * GIB
@@ -39,32 +36,11 @@ RESERVATION_SECONDS = 2 * 60 * 60
 EXTRACTION_BYTES = 1024**2
 UIDS = range(20000, 21000)
 SHARED_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
-# Measured peak of a script: 4-5.5x the frame's uncompressed Parquet bytes.
-_FRAME_FACTOR = 5.5
-_CHILD_BASE_BYTES = 256 * 1024**2
 _GROWTH = 1.5
 _BUDGET_SHARE = 0.6
 _WATCH_SECONDS = 0.2
 _DISK_EVERY = 5
 _KILLED = (-signal.SIGKILL, -signal.SIGXCPU)
-
-_FORBIDDEN_CALLS = frozenset(
-    {"open", "exec", "eval", "compile", "__import__", "input", "breakpoint", "exit", "quit"}
-)
-_FORBIDDEN_ATTRS = frozenset(
-    {
-        "__globals__",
-        "__builtins__",
-        "__subclasses__",
-        "__import__",
-        "__loader__",
-        "__spec__",
-        "system",
-        "popen",
-        "spawn",
-        "fork",
-    }
-)
 
 
 class BusyError(Exception):
@@ -79,6 +55,8 @@ class Outcome:
     seconds: float = 0.0
     output: BinaryIO | None = None
     extraction: dict | None = None
+    exit_code: int | None = None
+    runtime: dict | None = None
 
 
 def gib(value: float) -> str:
@@ -111,77 +89,30 @@ def memory_budget() -> int:
     return configured or int(host_memory() * _BUDGET_SHARE)
 
 
-def audit(script: str) -> list[str]:
-    allowed = libraries.allowed_imports()
-    violations: list[str] = []
-    try:
-        tree = ast.parse(script)
-    except SyntaxError as exc:
-        return [f"syntax error on line {exc.lineno}: {exc.msg}"]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".", 1)[0] not in allowed:
-                    violations.append(f"import {alias.name} is not allowed")
-        elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".", 1)[0] not in allowed:
-                violations.append(f"import from {node.module or '?'} is not allowed")
-        elif isinstance(node, ast.Call):
-            # re.compile and df.eval are methods; only the builtins themselves are refused.
-            if isinstance(node.func, ast.Name) and node.func.id in _FORBIDDEN_CALLS:
-                violations.append(f"{node.func.id}() is not allowed")
-        elif isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_ATTRS:
-            violations.append(f"{node.attr} is not allowed")
-    return sorted(set(violations))
-
-
-SCRIPT_MODES = ("cell", "inspect")
-ATTACHMENT = "attachment.parquet"
-
-
-def _frame_bytes(header: dict) -> int:
-    return int(header["input_bytes"]) + int((header.get("attachment") or {}).get("frame_bytes", 0))
-
-
 def need_for(header: dict) -> int:
-    """``input_bytes`` is the frame's uncompressed size for a script and the file's size
-    for a document; a script's attachment adds its own frame."""
-    if header["mode"] == "extract":
-        return max(2 * GIB, 4 * int(header["input_bytes"]))
-    return max(GIB, int(_frame_bytes(header) * _FRAME_FACTOR) + _CHILD_BASE_BYTES)
+    if header["mode"] == "package":
+        # Keep main's measured dataframe expansion allowance when admitting JSONL packages.
+        return max(GIB, int(header["input_bytes"] * 5.5) + 256 * 1024**2 + header["package_bytes"])
+    return max(2 * GIB, 4 * int(header["input_bytes"]))
 
 
 def refusal(header: dict, need: int, budget: int) -> str:
-    if header["mode"] in SCRIPT_MODES:
-        violations = audit(header["script"])
-        if violations:
-            return "; ".join(violations[:5])
+    if header["mode"] == "package":
+        memory = header.get("limits", {}).get("memory_mb")
+        if memory and memory * 1024**2 < need:
+            return f"The input needs about {gib(need)} GiB; increase memory_mb or use batch_rows."
+        if need > budget:
+            return f"The input needs about {gib(need)} GiB; this sandbox has {gib(budget)} GiB. Use batch_rows for independent rows."
     if need <= budget:
         return ""
-    if header["mode"] == "extract":
-        return (
-            f"This document needs about {gib(need)} GiB of memory to extract; "
-            f"this worker has {gib(budget)} GiB."
-        )
-    noun = "cell" if header["mode"] == "cell" else "script"
     return (
-        f"This version needs about {gib(need)} GiB of memory for a pandas {noun}; "
+        f"This document needs about {gib(need)} GiB of memory to extract; "
         f"this worker has {gib(budget)} GiB."
     )
 
 
 def input_matches(header: dict, path: Path) -> bool:
-    declared = int(header["input_bytes"])
-    if header["mode"] == "extract":
-        return path.stat().st_size == declared
-    attachment = header.get("attachment")
-    try:
-        return tables.uncompressed_bytes(path) <= declared and (
-            not attachment
-            or tables.uncompressed_bytes(path.with_name(ATTACHMENT)) <= attachment["frame_bytes"]
-        )
-    except (OSError, ValueError):
-        return False
+    return path.stat().st_size == int(header["input_bytes"])
 
 
 def can_trace() -> bool:
@@ -403,8 +334,8 @@ def _files_bytes(scratch: Path, uid: int | None, pids: list[int], held: list[Bin
 def hand_over(scratch: Path, uid: int | None) -> None:
     if uid is None:
         return
-    for path in [scratch, *scratch.iterdir()]:
-        os.chown(path, uid, uid)
+    for path in [scratch, *scratch.rglob("*")]:
+        os.chown(path, uid, uid, follow_symlinks=False)
 
 
 def _take_back(scratch: Path, uid: int | None) -> None:
@@ -465,14 +396,17 @@ class Child:
     cpu_seconds: int
     wall_seconds: int
     env: dict[str, str] | None = None
+    scratch_bytes: int | None = None
 
 
-def spawn(child: Child, scratch: Path, slot: Slot, stop: threading.Event | None = None) -> Outcome:
+def spawn(
+    child: Child, scratch: Path, slot: Slot, stop: threading.Event | None = None, on_progress=None
+) -> Outcome:
     uid = slot.uid
     hand_over(scratch, uid)
     rlimits = [
         child.cpu_seconds,
-        FILE_SIZE_BYTES,
+        min(FILE_SIZE_BYTES, child.scratch_bytes or FILE_SIZE_BYTES),
         0 if uid is None else PROCESSES,
         FILE_DESCRIPTORS,
     ]
@@ -507,6 +441,8 @@ def spawn(child: Child, scratch: Path, slot: Slot, stop: threading.Event | None 
         deadline = started + child.wall_seconds
         files = 0
         tick = 0
+        progress_offset = 0
+        peak_rss = peak_files = None
         try:
             while True:
                 try:
@@ -517,6 +453,8 @@ def spawn(child: Child, scratch: Path, slot: Slot, stop: threading.Event | None 
                 if stop is not None and stop.is_set():
                     stopped = f"The {child.noun} was cancelled."
                     break
+                if on_progress is not None:
+                    progress_offset = read_progress(scratch, progress_offset, on_progress)
                 members = _members(proc.pid, uid)
                 if tick % _DISK_EVERY == 0:
                     try:
@@ -529,6 +467,7 @@ def spawn(child: Child, scratch: Path, slot: Slot, stop: threading.Event | None 
                         break
                 tick += 1
                 rss = sum(rss for _, rss in members)
+                peak_rss, peak_files = max(peak_rss or 0, rss), max(peak_files or 0, files)
                 if time.monotonic() > deadline:
                     stopped = (
                         f"The {child.noun} ran longer than {child.wall_seconds}s and was stopped."
@@ -543,17 +482,29 @@ def spawn(child: Child, scratch: Path, slot: Slot, stop: threading.Event | None 
                         f"The {child.noun} used more than {gib(slot.limit)} GiB of memory and "
                         "scratch files and was stopped."
                     )
+                elif child.scratch_bytes is not None and files > child.scratch_bytes:
+                    stopped = f"The {child.noun} exceeded its scratch_mb limit."
                 if stopped:
                     break
         finally:
             _stop(proc.pid, uid)
             proc.wait()
             _take_back(scratch, uid)
+        if on_progress is not None:
+            read_progress(scratch, progress_offset, on_progress)
         stdout = _tail(out, STDOUT_CHARS)
         stderr = _tail(err, 2 * ERROR_CHARS)
     seconds = round(time.monotonic() - started, 3)
+    facts = {
+        "memory_limit_bytes": slot.limit,
+        "observed_peak_rss_bytes": peak_rss,
+        "observed_peak_scratch_bytes": peak_files,
+        "sample_interval_seconds": _WATCH_SECONDS,
+    }
     if stopped:
-        return Outcome(error=stopped, stdout=stdout, seconds=seconds)
+        return Outcome(
+            error=stopped, stdout=stdout, seconds=seconds, exit_code=proc.returncode, runtime=facts
+        )
     if proc.returncode != 0:
         failure = (stderr or stdout).strip()[-ERROR_CHARS:]
         if proc.returncode in _KILLED:
@@ -562,47 +513,43 @@ def spawn(child: Child, scratch: Path, slot: Slot, stop: threading.Event | None 
             error=failure or f"The {child.noun} exited with code {proc.returncode}.",
             stdout=stdout,
             seconds=seconds,
+            exit_code=proc.returncode,
+            runtime=facts,
         )
-    return Outcome(ok=True, stdout=stdout, seconds=seconds)
+    return Outcome(ok=True, stdout=stdout, seconds=seconds, exit_code=0, runtime=facts)
 
 
 def run(
-    header: dict, scratch: Path, source: Path, slot: Slot, stop: threading.Event | None = None
+    header: dict,
+    scratch: Path,
+    source: Path,
+    slot: Slot,
+    stop: threading.Event | None,
+    on_progress=None,
 ) -> Outcome:
-    if header["mode"] == "extract":
-        return _extract(header, scratch, source, slot, stop)
-    produce_frame = header["mode"] == "cell"
-    noun = "cell" if produce_frame else "script"
-    (scratch / "script.py").write_text(header["script"], encoding="utf-8")
-    child = Child(
-        argv=[
-            str(Path(__file__).with_name("child.py")),
-            "script.py",
-            source.name,
-            "output.parquet",
-            "cell" if produce_frame else "inspect",
-            ATTACHMENT if header.get("attachment") else "",
-        ],
-        noun=noun,
-        cpu_seconds=SCRIPT_CPU_SECONDS,
-        wall_seconds=SCRIPT_WALL_SECONDS,
-    )
-    outcome = spawn(child, scratch, slot, stop)
-    if outcome.ok and produce_frame:
-        outcome.output = claim(scratch / "output.parquet")
-        if outcome.output is None:
-            return Outcome(error="The cell's output could not be read.", stdout=outcome.stdout)
-    return outcome
-
-
-def _extract(
-    header: dict, scratch: Path, source: Path, slot: Slot, stop: threading.Event | None
-) -> Outcome:
+    if header["mode"] == "package":
+        limits = header.get("limits", {})
+        if "memory_mb" in limits:
+            slot.limit = min(slot.limit, limits["memory_mb"] * 1024**2)
+        child = Child(
+            argv=[str(Path(__file__).with_name("package_child.py"))],
+            noun="package",
+            cpu_seconds=limits.get("seconds", 300) * limits.get("cpus", 2),
+            wall_seconds=limits.get("seconds", 300),
+            scratch_bytes=limits.get("scratch_mb", 2048) * 1024**2,
+        )
+        outcome = spawn(child, scratch, slot, stop)
+        if outcome.ok:
+            outcome.output = claim(scratch / "output.jsonl", packages.MAX_OUTPUT_BYTES)
+            if outcome.output is None:
+                outcome.ok = False
+                outcome.error = "The package did not produce a readable regular output.jsonl."
+        return outcome
     child = Child(
         argv=[
             str(Path(__file__).with_name("documents") / "child.py"),
             source.name,
-            "output.parquet",
+            "output.json",
             "extraction.json",
         ],
         noun="document extraction",
@@ -611,7 +558,7 @@ def _extract(
         # Any process can read another's command line; only its own uid can read its environment.
         env={"SANDBOX_FILENAME": header["filename"]},
     )
-    outcome = spawn(child, scratch, slot, stop)
+    outcome = spawn(child, scratch, slot, stop, on_progress)
     if not outcome.ok:
         return outcome
     unreadable = Outcome(error="The extraction's output could not be read.", stdout=outcome.stdout)
@@ -623,7 +570,27 @@ def _extract(
             outcome.extraction = json.loads(report.read())
         except ValueError:
             return unreadable
-    outcome.output = claim(scratch / "output.parquet")
+    outcome.output = claim(scratch / "output.json")
     if outcome.output is None or not isinstance(outcome.extraction, dict):
         return unreadable
     return outcome
+
+
+def read_progress(scratch: Path, offset: int, callback) -> int:
+    report = claim(scratch / "progress.jsonl", 4 * 1024**2)
+    if report is None:
+        return offset
+    with report:
+        report.seek(offset)
+        for _ in range(100):
+            line = report.readline(8193)
+            if not line.endswith(b"\n") or len(line) > 8192:
+                break
+            offset = report.tell()
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                callback(value)
+    return offset

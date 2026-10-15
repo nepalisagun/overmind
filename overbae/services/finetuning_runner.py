@@ -9,22 +9,26 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import math
 import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
 from django.conf import settings
 
+from modal_shared.decisions import DECISION_OBJECTIVES
 from overbae.services.finetuning_policy import (
     BasetenTrainingPlan,
     baseten_context_length,  # noqa: F401 — re-exported; tests/consumers import it from here
     derive_baseten_training_plan,
 )
+from overbae.services.training_policies import profile_options
 from overbae.services.training_preparation import ready_for_job
+from overbae.services.training_transfer import stage_data
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +123,7 @@ class PollSnapshot:
     """
 
     epochs_completed: int | None = None
+    tokens_per_second: float | None = None
     tokens_processed: int | None = None
 
     # Step-based progress (Baseten; Together leaves these unset).
@@ -171,6 +176,7 @@ class PollSnapshot:
     telemetry and progress-bar noise filtered out, so provisioning / warm-up /
     dataset-prep stages read as real progress."""
 
+    diagnostics: dict[str, Any] = field(default_factory=dict)
     stage: str = ""
     """Pre-training sub-stage from ``BT_STAGE`` (``downloading_base_model`` →
     ``loading_model`` → ``model_loaded``); empty for providers that don't emit it."""
@@ -227,7 +233,7 @@ def _activity_message(raw: str) -> str | None:
 
     # The charts already carry BT_PROGRESS; evals and checkpoints ARE stage events, so
     # they survive below as one-liners.
-    if stripped.startswith("BT_PROGRESS "):
+    if stripped.startswith(("BT_PROGRESS ", "BT_MONITORING ")):
         return None
     # Calibration telemetry — not customer-facing.
     if stripped.startswith("BT_MEMORY "):
@@ -484,11 +490,46 @@ def thin_series(points: list[dict[str, Any]], cap: int = MAX_PERSISTED_SERIES_PO
     return thinned
 
 
+def native_time_range(snap):
+    intervals, previous = [], None
+    for row in snap.raw.get("metrics", []):
+        if row.get("event") != "BT_PROGRESS":
+            continue
+        step, elapsed = row.get("step"), row.get("elapsed_s")
+        if any(
+            not isinstance(value, (int, float)) or not math.isfinite(value)
+            for value in (step, elapsed)
+        ):
+            intervals, previous = [], None
+            continue
+        if previous:
+            steps, seconds = step - previous[0], elapsed - previous[1]
+            if steps < 0 or seconds < 0:
+                intervals = []
+            elif steps > 0 and seconds > 0:
+                intervals.append((seconds / steps, seconds, steps))
+        previous = (step, elapsed)
+    intervals = intervals[-30:]
+    window = {"intervals": len(intervals), "seconds": sum(item[1] for item in intervals)}
+    if (
+        len(intervals) < 5
+        or window["seconds"] < 30
+        or not snap.total_steps
+        or snap.step is None
+        or (snap.stage and snap.stage != "training")
+    ):
+        return None, window
+    remaining = max(0, snap.total_steps - snap.step)
+    speeds = sorted(item[0] for item in intervals)
+    average = window["seconds"] / sum(item[2] for item in intervals)
+    # Sparse slow batches still contribute to the elapsed-time average.
+    low = min(speeds[int((len(speeds) - 1) * 0.1)], average * 0.8)
+    high = max(speeds[math.ceil((len(speeds) - 1) * 0.9)], average * 1.3)
+    return [math.floor(low * remaining), math.ceil(high * remaining)], window
+
+
 def progress_from_snapshot(snap: PollSnapshot, *, started_at=None) -> dict[str, Any]:
     """The durable ``FinetuningJob.progress`` blob for one poll snapshot."""
-    import time as _time
-    from datetime import datetime
-
     trained = snap.step if snap.step is not None else snap.epochs_completed
     total = snap.total_steps
     percent: float | None = None
@@ -496,7 +537,7 @@ def progress_from_snapshot(snap: PollSnapshot, *, started_at=None) -> dict[str, 
         percent = min(100.0, round(100.0 * float(trained) / float(total), 2))
 
     eta_seconds: int | None = None
-    now = int(_time.time())
+    now = int(time.time())
     if snap.estimated_finish and snap.estimated_finish > now:
         eta_seconds = int(snap.estimated_finish - now)
     elif (
@@ -505,23 +546,38 @@ def progress_from_snapshot(snap: PollSnapshot, *, started_at=None) -> dict[str, 
         and started_at is not None
         and isinstance(started_at, datetime)
     ):
-        elapsed = max(1.0, (_time.time() - started_at.timestamp()))
+        elapsed = max(1.0, (time.time() - started_at.timestamp()))
         eta_seconds = int(elapsed * (100.0 - percent) / percent)
     elapsed_seconds: int | None = None
     if started_at is not None and isinstance(started_at, datetime):
-        elapsed_seconds = max(0, int(_time.time() - started_at.timestamp()))
+        elapsed_seconds = max(0, int(time.time() - started_at.timestamp()))
+    native = isinstance(snap.raw, dict) and "run_id" in snap.raw
+    eta_range, eta_window = None, None
+    if native:
+        eta_seconds = None
+        eta_range, eta_window = native_time_range(snap)
+        if snap.state in {"succeeded", "failed", "cancelled"}:
+            eta_seconds, eta_range = None, None
 
     return {
         "epochs_completed": snap.epochs_completed,
+        "tokens_per_second": snap.tokens_per_second,
         "tokens_processed": snap.tokens_processed,
         "trained_steps": trained,
         "total_steps": total,
         "percent": percent,
-        "estimated_finish": snap.estimated_finish,
+        "estimated_finish": None if native else snap.estimated_finish,
         "eta_seconds": eta_seconds,
+        "eta_range_seconds": eta_range,
+        "eta_window": eta_window,
+        "eta_basis": "recent_step_window; elapsed-time average with 0.8–1.3 planning margin, widened by observed step-time quantiles; training steps only, excludes final validation/reload; not confidence bounds"
+        if native
+        else "provider_or_elapsed_progress",
+        "compute_usage": (snap.raw.get("meta") or {}).get("compute_usage", []) if native else [],
         "elapsed_seconds": elapsed_seconds,
         "phase": snap.phase or "",
         "stage": snap.stage or "",
+        "diagnostics": snap.diagnostics,
         "download": snap.download,
         "provider_status": snap.state,
         "latest_train_loss": snap.train_loss,
@@ -534,7 +590,7 @@ def progress_from_snapshot(snap: PollSnapshot, *, started_at=None) -> dict[str, 
         "token_accuracy": snap.token_accuracy,
         "eval_token_accuracy": snap.eval_token_accuracy,
         "current_epoch": snap.current_epoch,
-        "eta_s": snap.eta_s,
+        "eta_s": eta_seconds if native else snap.eta_s,
         "metrics_history": thin_series(snap.metrics_history),
         "eval_history": thin_series(snap.eval_history),
         "activity": snap.activity,
@@ -758,7 +814,7 @@ class TogetherAIRunner(BaseFinetuningRunner):
                 "lora_trainable_modules", "all-linear"
             )
 
-        _skip = {"training_file", "model", "suffix", "lora"}
+        _skip = {"training_file", "model", "suffix", "lora", "monitoring"}
         for key, value in hp.items():
             normalised = self._HP_ALIASES.get(key, key)
             if normalised in _skip:
@@ -941,14 +997,7 @@ class BasetenRunner(BaseFinetuningRunner):
 
     # Shared with ModalRunner — sft_assets/train.py is the entrypoint both runners plug into.
     _ASSETS_DIR = Path(__file__).parent / "sft_assets"
-    _ASSET_FILES = (
-        "train.py",
-        "common.py",
-        "engine_unsloth.py",
-        "pretok.py",
-        "catalog.py",
-        "run.sh",
-    )
+    _ASSET_FILES = tuple(sorted(path.name for path in _ASSETS_DIR.glob("*.py"))) + ("run.sh",)
 
     def _api_key(self) -> str:
         key = getattr(settings, "BASETEN_API_KEY", "") or ""
@@ -1121,6 +1170,9 @@ class BasetenRunner(BaseFinetuningRunner):
             "ASSISTANT_ONLY_LOSS": "1" if dataset_type == "chat" else "0",
             "SEED": str(plan.seed),
         }
+        if (job.hyperparameters or {}).get("monitoring") is not None:
+            env["TRAINING_MONITORING"] = json.dumps(job.hyperparameters["monitoring"])
+            env["TRAINING_MONITOR_LOGS"] = "1"
         from overbae.modal.model_registry import get_unsloth_image  # noqa: PLC0415
 
         env["UNSLOTH_IMAGE"] = get_unsloth_image(str(job.base_model))
@@ -1299,12 +1351,12 @@ class BasetenRunner(BaseFinetuningRunner):
                 shutil.copytree(families_src, tmp / "families")
             # modal_shared lives outside overbae on purpose — overbae/__init__.py
             # imports Celery, which the bare Baseten container can't configure.
-            modelfam_src = Path(__file__).resolve().parents[2] / "modal_shared" / "modelfam"
-            if modelfam_src.is_dir():
-                pkg = tmp / "modal_shared"
-                pkg.mkdir(exist_ok=True)
-                (pkg / "__init__.py").write_text("")
-                shutil.copytree(modelfam_src, pkg / "modelfam")
+            shared_src = Path(__file__).resolve().parents[2] / "modal_shared"
+            shutil.copytree(
+                shared_src,
+                tmp / "modal_shared",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
             # Hand-patched {% generation %} chat templates.
             for template_dir in (
                 "llama_templates",
@@ -1384,7 +1436,14 @@ class BasetenRunner(BaseFinetuningRunner):
 
         for entry in logs:
             msg = (entry.get("message") or "").strip()
-            if msg.startswith("BT_PROGRESS "):
+            if msg.startswith("BT_MONITORING "):
+                try:
+                    raw_job["monitoring"] = _json.loads(msg[len("BT_MONITORING ") :])
+                except _json.JSONDecodeError:
+                    raw_job["monitoring_collection_error"] = (
+                        "Provider truncated a monitoring receipt"
+                    )
+            elif msg.startswith("BT_PROGRESS "):
                 try:
                     rec = _json.loads(msg[len("BT_PROGRESS ") :])
                     trained_steps = rec.get("step")
@@ -1625,19 +1684,19 @@ class ModalRunner(BaseFinetuningRunner):
     its tokens on the worker, and ``overmind-sft`` deployed.
     """
 
+    def __init__(self, release=None):
+        self.release = release
+
     @property
-    def _app_name(self) -> str:
-        return getattr(settings, "MODAL_SFT_APP_NAME", "overmind-sft")
+    def _app_name(self):
+        if self.release is None:
+            raise ValueError("Training observer requires a pinned worker release.")
+        return self.release["app"]
 
-    @staticmethod
-    def _modal_env() -> str | None:
-        """Modal environment from MODAL_ENVIRONMENT, or None for the client default.
-
-        Passed explicitly to every ``Function.from_name`` so this runner stays scoped to
-        the intended ``modal deploy --env`` target instead of relying on the SDK's
-        ambient-env fallback.
-        """
-        return os.environ.get("MODAL_ENVIRONMENT") or None
+    def _modal_env(self):
+        if self.release is None:
+            raise ValueError("Training observer requires a pinned worker environment.")
+        return self.release["environment"]
 
     def _await_base_model(self, hf_base: str) -> None:
         """Block until ``.base_models/`` has this repo. Concurrent jobs share the mutex."""
@@ -1685,11 +1744,20 @@ class ModalRunner(BaseFinetuningRunner):
         hp = dict(getattr(job, "hyperparameters", None) or {})
         return str((hp.get("training_type") or {}).get("type") or "Lora")
 
+    @staticmethod
+    def model_config(model_id: str) -> dict[str, Any]:
+        from overbae.modal.model_registry import get_all_models_by_backend  # noqa: PLC0415
+
+        config = get_all_models_by_backend("baseten").get(model_id) or get_all_models_by_backend(
+            "decision", include_disabled=False
+        ).get(model_id)
+        if not config:
+            raise ValueError(f"Model {model_id} is unavailable for Modal training.")
+        return config
+
     def _select_training_gpu(self, job, *, context_length: int = 0) -> tuple[str, int]:
         try:
-            from overbae.modal.model_registry import get_model_config_any_backend  # noqa: PLC0415
-
-            cfg = get_model_config_any_backend(job.base_model) or {}
+            cfg = self.model_config(job.base_model)
             params_b = (
                 float(cfg.get("total_params_b") or 0) or (cfg.get("num_parameters") or 0) / 1e9
             )
@@ -1704,11 +1772,6 @@ class ModalRunner(BaseFinetuningRunner):
                     gpu = "H200"
                 return clamp_gemma4_training_gpu(job.base_model, gpu, count)
         return clamp_gemma4_training_gpu(job.base_model, "H200", 4)
-
-    def training_gpu(self, job) -> tuple[str, int]:
-        """The GPU ``submit`` launched on, from the plan context it recorded."""
-        context_length = int((job.hyperparameters or {}).get("context_length") or 0)
-        return self._select_training_gpu(job, context_length=context_length)
 
     @staticmethod
     def _gpu_string(gpu_type: str, gpu_count: int) -> str:
@@ -1738,6 +1801,7 @@ class ModalRunner(BaseFinetuningRunner):
         env = {
             "MODEL_ID": hf_base,
             "BASE_MODEL_PATH": f"/weights/.base_models/{hf_base.replace('/', '--')}",
+            "PADDED_TOKEN_BUDGET": str(plan.token_budget),
             "TRAINING_TYPE": plan.training_type,
             "MAX_LENGTH": str(plan.context_length),
             "LORA_R": str(plan.lora_r),
@@ -1751,6 +1815,7 @@ class ModalRunner(BaseFinetuningRunner):
             "WARMUP_RATIO": str(plan.warmup_ratio),
             "WEIGHT_DECAY": str(plan.weight_decay),
             "SEED": str(plan.seed),
+            "DECISION_PRE_TRAINING_BASELINE": "1" if plan.pre_training_baseline else "0",
             "PACK_ROWS": "1" if plan.packing else "0",
         }
         from overbae.modal.model_registry import get_unsloth_image  # noqa: PLC0415
@@ -1787,10 +1852,9 @@ class ModalRunner(BaseFinetuningRunner):
         if num_examples == 0:
             raise RuntimeError("Dataset produced 0 training examples.")
 
-        from overbae.modal.model_registry import get_model_config_any_backend  # noqa: PLC0415
         from overbae.modal.training_type import training_context_length  # noqa: PLC0415
 
-        model_cfg = get_model_config_any_backend(job.base_model) or {}
+        model_cfg = self.model_config(job.base_model)
         ft_cfg = model_cfg.get("finetuning") or {}
         stats = dict((job.cell.stats if job.cell_id else None) or {})
         try:
@@ -1849,16 +1913,13 @@ class ModalRunner(BaseFinetuningRunner):
             params_b=float(model_cfg.get("total_params_b") or 0),
             max_steps=max_steps,
         )
+        if (job.hyperparameters or {}).get("runtime_profile"):
+            env["RUNTIME_PROFILE"] = json.dumps(job.hyperparameters["runtime_profile"])
+        if (job.hyperparameters or {}).get("monitoring") is not None:
+            env["TRAINING_MONITORING"] = json.dumps(job.hyperparameters["monitoring"])
         hidden = int(model_cfg.get("hidden_size") or 0)
         if hidden > 0:
             env["HIDDEN_SIZE"] = str(hidden)
-
-        with open(training_file_path) as f:
-            data_text = f.read()
-        val_text = None
-        if validation_file_path:
-            with open(validation_file_path) as f:
-                val_text = f.read()
 
         logger.info(
             "ModalRunner: submitting run %s — model=%s gpu=%s×%d ctx=%d batch=%d×%d epochs=%d",
@@ -1872,29 +1933,80 @@ class ModalRunner(BaseFinetuningRunner):
             plan.n_epochs,
         )
 
+        effective = {
+            "gpu_type": gpu_type,
+            "gpu_count": gpu_count,
+            "environment": self.release["environment"],
+            "release": self.release,
+            "parameters": {
+                key: env[key]
+                for key in (
+                    "SEED",
+                    "DECISION_PRE_TRAINING_BASELINE",
+                    "WEIGHT_DECAY",
+                    "LEARNING_RATE",
+                    "GRAD_ACCUM",
+                    "PER_DEVICE_BATCH",
+                    "MAX_LENGTH",
+                    "N_EPOCHS",
+                    "WARMUP_RATIO",
+                    "LORA_R",
+                    "LORA_ALPHA",
+                    "LORA_DROPOUT",
+                    "LORA_TARGET_MODULES",
+                    "TRAINING_TYPE",
+                    "PACK_ROWS",
+                    "LOAD_IN_4BIT",
+                    "MAX_STEPS",
+                    "PADDED_TOKEN_BUDGET",
+                )
+                if key in env
+            },
+        }
+        if "seed" in hp and int(env["SEED"]) != int(hp["seed"]):
+            raise ValueError("Effective seed differs from the requested seed.")
+        _FTJob.objects.filter(pk=job.pk).update(effective_configuration=effective)
+
         env_name = self._modal_env()
         upload_fn = modal.Function.from_name(
             self._app_name, "upload_dataset", environment_name=env_name
         )
         preparation = ready_for_job(job, plan.context_length)
-        upload_fn.remote(
-            run_id=run_id,
-            data_jsonl=data_text,
-            val_jsonl=val_text,
-            preparation_id=str(preparation.id),
-        )
+        env["TRAINING_OBJECTIVE"] = preparation.config["objective"]
+        env["UNSLOTH_IMAGE"] = preparation.config["stack"]
+        if hp.get("checkpoint_policy"):
+            env["DECISION_CHECKPOINT_POLICY"] = json.dumps(hp["checkpoint_policy"])
+        volume = modal.Volume.from_name("overmind-sft", environment_name=env_name)
+        paths = {"data": training_file_path}
+        if validation_file_path:
+            paths["val"] = validation_file_path
+        from overbae.services import training_submission  # noqa: PLC0415
 
+        stage_data(job, paths, run_id, preparation, volume, upload_fn, num_examples=num_examples)
+
+        training_submission.record_pre_dispatch_stage(
+            job,
+            "preparing_base_model",
+            "Checking base model weights and downloading missing files",
+        )
         self._await_base_model(env["MODEL_ID"])
+        training_submission.record_pre_dispatch_stage(
+            job, "starting_training_worker", "Base model weights ready; starting training worker"
+        )
 
         # One Function per frozen train stack — see modal_shared.stacks.TRAIN_FUNCTION_NAMES.
         from modal_shared.stacks import train_function_name  # noqa: PLC0415
-        from overbae.modal.model_registry import get_unsloth_image  # noqa: PLC0415
 
-        function_name = train_function_name(get_unsloth_image(job.base_model))
+        function_name = train_function_name(preparation.config["stack"])
         train_fn = modal.Function.from_name(
             self._app_name, function_name, environment_name=env_name
         )
-        call = train_fn.with_options(gpu=self._gpu_string(gpu_type, gpu_count)).spawn(
+        options = {"gpu": self._gpu_string(gpu_type, gpu_count)}
+        if preparation.config["objective"] in DECISION_OBJECTIVES:
+            options["retries"] = modal.Retries(max_retries=10, initial_delay=0.0)
+        options.update(profile_options(hp))
+        training_submission.dispatching(job, run_id)
+        call = train_fn.with_options(**options).spawn(
             run_id=run_id, env=env, gpu_type=gpu_type, gpu_count=gpu_count
         )
 
@@ -1999,6 +2111,16 @@ class ModalRunner(BaseFinetuningRunner):
                     eval_point["eval_loss"] = round(eval_loss, 6)
                 if eval_token_accuracy is not None:
                     eval_point["eval_token_accuracy"] = round(eval_token_accuracy, 6)
+                for key in (
+                    "argmax_target_agreement",
+                    "hard_label_accuracy",
+                    "hard_label_decisions",
+                    "brier",
+                    "decisions",
+                    "runtime_seconds",
+                ):
+                    if rec.get(key) is not None:
+                        eval_point[key] = rec[key]
                 eval_history.append(eval_point)
 
         import time as _time  # noqa: PLC0415
@@ -2071,6 +2193,14 @@ class ModalRunner(BaseFinetuningRunner):
         return PollSnapshot(
             state=state,
             epochs_completed=int(current_epoch) if current_epoch is not None else None,
+            tokens_per_second=next(
+                (
+                    float(rec["tokens_per_s"])
+                    for rec in reversed(snap.get("metrics") or [])
+                    if rec.get("tokens_per_s") is not None
+                ),
+                None,
+            ),
             tokens_processed=tokens_processed,
             trained_steps=trained_steps,
             step=trained_steps,
@@ -2092,7 +2222,11 @@ class ModalRunner(BaseFinetuningRunner):
             metrics_history=metrics_history,
             eval_history=eval_history,
             activity=[],
-            stage="",
+            diagnostics={
+                **(snap.get("telemetry") or {}),
+                **({"failure": meta["failure"]} if meta.get("failure") else {}),
+            },
+            stage=(snap.get("telemetry") or {}).get("stage", ""),
             download=None,
             output_model_name=output_model_name,
             error=error,
@@ -2144,9 +2278,12 @@ _RUNNER_REGISTRY: dict[str, type[BaseFinetuningRunner]] = {
 _DEFAULT_RUNNER = "baseten"
 
 
-def get_runner(backend: str | None = None) -> BaseFinetuningRunner:
+def get_runner(backend: str | None = None, *, job=None) -> BaseFinetuningRunner:
     """The runner for ``backend``, else ``settings.FINETUNING_BACKEND``."""
-    key = backend or getattr(settings, "FINETUNING_BACKEND", _DEFAULT_RUNNER)
+    pinned_backend = (
+        "modal" if job is not None and (job.requested_configuration or {}).get("runtime") else None
+    )
+    key = backend or pinned_backend or getattr(settings, "FINETUNING_BACKEND", _DEFAULT_RUNNER)
     if key == "together_ai":
         key = "together"
     cls = _RUNNER_REGISTRY.get(key)
@@ -2154,4 +2291,8 @@ def get_runner(backend: str | None = None) -> BaseFinetuningRunner:
         raise ValueError(
             f"Unknown fine-tuning backend '{key}'. Available: {list(_RUNNER_REGISTRY)}"
         )
+    if key == "modal":
+        from overbae.services.training_release import for_job
+
+        return cls(release=for_job(job)) if job is not None else cls()
     return cls()

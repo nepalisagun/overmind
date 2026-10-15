@@ -16,6 +16,24 @@ describe("finetuningJobsPollInterval", () => {
     expect(finetuningJobsPollInterval([])).toBe(false);
   });
 
+  it("continues until the native evaluation plan finishes", () => {
+    expect(
+      finetuningJobsPollInterval([
+        { nativeEvaluation: { state: "final_candidate" }, status: "succeeded" },
+      ])
+    ).toBe(5_000);
+    expect(
+      finetuningJobsPollInterval([
+        { nativeEvaluation: { state: "completed" }, status: "succeeded" },
+      ])
+    ).toBe(false);
+    expect(
+      finetuningJobsPollInterval([
+        { nativeEvaluation: { state: "submission_unknown" }, status: "succeeded" },
+      ])
+    ).toBe(false);
+  });
+
   it("polls while any job is unfinished, and before the first response", () => {
     expect(finetuningJobsPollInterval([{ status: "succeeded" }, { status: "running" }])).toBe(
       5_000
@@ -24,5 +42,11 @@ describe("finetuningJobsPollInterval", () => {
     // silently freeze the poll.
     expect(finetuningJobsPollInterval([{ status: "uploading" }])).toBe(5_000);
     expect(finetuningJobsPollInterval(undefined)).toBe(5_000);
+  });
+
+  it("stops polling deleted evaluations without hiding unfinished training", () => {
+    const nativeEvaluation = { deletedAt: new Date(), state: "paused" };
+    expect(finetuningJobsPollInterval([{ nativeEvaluation, status: "succeeded" }])).toBe(false);
+    expect(finetuningJobsPollInterval([{ nativeEvaluation, status: "running" }])).toBe(5_000);
   });
 });

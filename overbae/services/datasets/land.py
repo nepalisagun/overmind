@@ -1,9 +1,7 @@
 """Landing: rows arrive verbatim as cell 0, stamped with ``source_row``.
 
-A trace source lands one row per trace: the traces-table facts, the wire
-transcript, the delivered I/O and the trace's score, scoped to the selected
-capability's invocation when the trace holds one. Landing never triggers
-scoring. It proposes the capability rank and the intent.
+A trace source lands one row per trace, scoped to the selected capability when
+present. Ambiguous invocations fail before publication. Landing never triggers scoring.
 """
 
 from __future__ import annotations
@@ -11,41 +9,38 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import pickle
+import shutil
 import tempfile
-import time
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from django.db import transaction
 from django.utils import timezone
 
-from overbae.models import Cell, Dataset, TaskExecution
+from overbae.models import Cell, Dataset
 from overbae.models.traces import Span
 from overbae.services.datasets import (
     alignment,
     contract,
-    executions,
+    documents,
     files,
     measure,
+    operations,
     paths,
     selection,
     store,
 )
-from overbae.services.datasets.partition import preserve_lineage, split_positions
-from overbae.services.eval import units
-from sandbox import tables
+from overbae.services.datasets.partition import preserve_lineage, split_rows
 
 logger = logging.getLogger(__name__)
 
 
 class LandError(ValueError):
-    def __init__(self, message: str, *, code: str = "source_invalid") -> None:
-        super().__init__(message)
-        self.code = code
+    pass
 
 
 SPLIT_POSITIONS = ("head", "tail", "random")
@@ -69,7 +64,7 @@ class Landing:
         if position not in SPLIT_POSITIONS:
             raise LandError(f"position must be one of {', '.join(SPLIT_POSITIONS)}.")
         try:
-            train, evaluation, report = split_positions(
+            train, evaluation, report = split_rows(
                 self.rows,
                 eval_percent=eval_percent,
                 position=position,
@@ -80,63 +75,15 @@ class Landing:
         except ValueError as exc:
             raise LandError(str(exc)) from exc
         spec = {**self.spec, "contamination_report": report}
-        return (
-            replace(self, rows=_Picked(self.rows, train), spec=spec),
-            replace(self, rows=_Picked(self.rows, evaluation), spec=spec),
-        )
+        return replace(self, rows=train, spec=spec), replace(self, rows=evaluation, spec=spec)
 
 
-class _Picked:
-    def __init__(self, rows: Iterable[dict[str, Any]], positions: set[int]) -> None:
-        self.rows, self.positions = rows, positions
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        for position, row in enumerate(self.rows):
-            if position in self.positions:
-                yield row
-
-
-class _Chain:
-    def __init__(self, parts: list[Iterable[dict[str, Any]]]) -> None:
-        self.parts = parts
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        for part in self.parts:
-            yield from part
-
-
-class _Cleaned:
-    def __init__(self, rows: Iterable[Any]) -> None:
-        self.rows = rows
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        for row in self.rows:
-            row = dict(row) if isinstance(row, dict) else {"value": row}
-            row.pop(store.SOURCE_ROW, None)
-            yield row
-
-
-class _Spool:
-    def __init__(self, rows: Iterable[dict[str, Any]]) -> None:
-        self._dir = tempfile.TemporaryDirectory(prefix="landing-")
-        self._path = Path(self._dir.name) / "rows.pickle"
-        self.count = 0
-        with self._path.open("wb") as fh:
-            for row in rows:
-                pickle.dump(row, fh, protocol=pickle.HIGHEST_PROTOCOL)
-                self.count += 1
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        with self._path.open("rb") as fh:
-            for _ in range(self.count):
-                yield pickle.load(fh)  # noqa: S301 — written by this process
-
-
-def _stamped(row: dict[str, Any], offset: int) -> dict[str, Any]:
-    row = dict(row)
-    row[store.SOURCE_ROW] = offset
-    row["_overmind_provenance"] = preserve_lineage(row)
-    return row
+def _stamp_source_rows(rows):
+    for offset, row in enumerate(rows):
+        row = dict(row)
+        row[store.SOURCE_ROW] = offset
+        row["_overmind_provenance"] = preserve_lineage(row)
+        yield row
 
 
 @dataclass
@@ -146,26 +93,39 @@ class PreparedLanding:
     path: Path
     dataset_fields: dict[str, Any]
     cell_fields: dict[str, Any]
+    sources: list[dict]
 
 
-def prepare(dataset, landing, *, path, infer_capability=True):
+def prepare(dataset, landing, *, path, state=Dataset.State.IDLE, infer_capability=True):
     manifest = landing.manifest
-    if not manifest:
-        builder = tables.ManifestBuilder()
-        for offset, row in enumerate(landing.rows):
-            builder.add(_stamped(row, offset))
-        manifest = builder.manifest()
-    elif not any(column["name"] == "_overmind_provenance" for column in manifest):
+    if manifest and not any(column["name"] == "_overmind_provenance" for column in manifest):
         manifest = [*manifest, {"name": "_overmind_provenance", "type": "json"}]
-    with tables.TableWriter(path, manifest) as writer:
-        writer.write_rows(_stamped(row, offset) for offset, row in enumerate(landing.rows))
-    frame = store.Frame(path)
+
+    def checked_rows():
+        for index, row in enumerate(_stamp_source_rows(landing.rows)):
+            if index % 1000 == 0:
+                operations.check_cancelled(dataset.id)
+            yield row
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store.write_rows(path, checked_rows(), manifest)
+    operations.check_cancelled(dataset.id)
+    sources = landing.spec.get("sources", [])
     fields = {
         "source_kind": landing.kind,
-        "source_spec": {**landing.spec, "landed_at": timezone.now().isoformat()},
-        "state": Dataset.State.IDLE,
+        "source_spec": {
+            **landing.spec,
+            "sources": [
+                {key: value for key, value in source.items() if key != "staged_path"}
+                for source in sources
+            ],
+            "landed_at": timezone.now().isoformat(),
+        },
+        "state": state,
         "error": "",
-        "capability_rank": alignment.rank(dataset.project_id, frame),
+        "capability_rank": alignment.rank(
+            dataset.project_id, pd.DataFrame.from_records(store.head(path, 500))
+        ),
     }
     measured = Dataset.objects.select_related("capability").get(pk=dataset.pk)
     if infer_capability and measured.capability_id is None and fields["capability_rank"]:
@@ -173,21 +133,18 @@ def prepare(dataset, landing, *, path, infer_capability=True):
         if best["score"] > 0:
             fields["capability_id"] = best["capability_id"]
             measured.capability_id = best["capability_id"]
-    report = contract.measure(frame)
-    if measured.intent == Dataset.Intent.PENDING:
-        fields["intent"] = contract.propose_intent(frame, report)
-        measured.intent = fields["intent"]
-    source = dataset.source
+    source = dataset.cells.filter(position=0).first()
     return PreparedLanding(
         dataset.pk,
         source.pk if source else uuid.uuid4(),
         path,
         fields,
         {
-            **measure.describe_frame(measured, path, report=report),
+            **measure.describe_frame(measured, path, report=contract.measure_path(path)),
             "input_fingerprint": "",
             "seconds": 0.0,
         },
+        sources,
     )
 
 
@@ -196,30 +153,43 @@ def publish(dataset, prepared, *, user=None):
     if prepared.dataset_id != dataset.pk:
         raise LandError("The prepared source belongs to another dataset.")
     locked = Dataset.objects.select_for_update().get(pk=dataset.pk)
-    if locked.source is not None:
-        raise LandError("The dataset already has a source.")
+    operations.check_cancelled(locked.pk)
+    source = locked.cells.filter(position=0).first()
+    if source is not None and source.pk != prepared.cell_id:
+        raise LandError("The source changed before publication.")
+    for artifact in prepared.sources:
+        if artifact.get("staged_path"):
+            destination = paths.source_path(locked.pk, artifact["id"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(artifact["staged_path"], destination)
     destination = paths.cell_path(locked.pk, prepared.cell_id)
     destination.parent.mkdir(parents=True, exist_ok=True)
     prepared.path.replace(destination)
-    Cell.objects.create(
-        id=prepared.cell_id,
-        dataset=locked,
-        position=0,
-        title="Source",
-        created_by=user if getattr(user, "pk", None) else None,
-        **prepared.cell_fields,
-    )
+    if source is None:
+        Cell.objects.create(
+            id=prepared.cell_id,
+            dataset=locked,
+            position=0,
+            title="Source",
+            created_by=user if getattr(user, "pk", None) else None,
+            **prepared.cell_fields,
+        )
+    else:
+        fields = dict(prepared.cell_fields)
+        if source.preparation_plan:
+            fields["preparation_plan"] = {
+                **source.preparation_plan,
+                "result_fingerprint": fields["fingerprint"],
+            }
+        Cell.objects.filter(pk=source.pk).update(**fields)
     Dataset.objects.filter(pk=locked.pk).update(
-        **prepared.dataset_fields, active_id=prepared.cell_id, updated_at=timezone.now()
+        **prepared.dataset_fields, updated_at=timezone.now()
     )
     dataset.refresh_from_db()
-    from overbae.services.eval.eval_set import maybe_enqueue_card_evaluator_sync
-
-    maybe_enqueue_card_evaluator_sync(dataset)
     return dataset
 
 
-def commit(dataset, landing, *, user=None, infer_capability=True):
+def commit(dataset, landing, *, user=None, state=Dataset.State.IDLE, infer_capability=True):
     parent = paths.dataset_dir(dataset.pk)
     parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="source-", dir=parent) as directory:
@@ -227,234 +197,136 @@ def commit(dataset, landing, *, user=None, infer_capability=True):
             dataset,
             landing,
             path=Path(directory) / "source.parquet",
+            state=state,
             infer_capability=infer_capability,
         )
         return publish(dataset, prepared, user=user)
 
 
-def _file_rows(path: Path, filename: str, json_rows_field: str | None) -> files.FileRows:
-    try:
-        rows = files.FileRows(path, filename=filename, json_rows_field=json_rows_field)
-    except files.FileError as exc:
-        raise LandError(str(exc)) from exc
-    if not rows.count:
-        raise LandError("The file has no rows.")
-    return rows
-
-
-DOCUMENT_MANIFEST = [
-    {"name": store.SOURCE_ROW, "type": "integer"},
-    {"name": "text", "type": "string"},
-    {"name": "page", "type": "integer"},
-    {"name": "source_name", "type": "string"},
-    {"name": "_overmind_document_id", "type": "string"},
-    {"name": "_overmind_provenance", "type": "json"},
-]
-DOCUMENT_GROUP = "_overmind_document_id"
-EXTRACT_WAIT_SECONDS = 15 * 60
-EXTRACT_BUSY_RETRY_SECONDS = 5
-EXTRACT_UNREACHABLE_RETRY_SECONDS = (2, 4, 8)
-
-
-STOPPED = "The import was stopped."
-
-
-def _pause(seconds: float, stop: Any) -> None:
-    if stop is None:
-        time.sleep(seconds)
-    elif stop.wait(seconds):
-        raise LandError(STOPPED, code="cancelled")
-
-
-def _extract(path: Path, filename: str, output: Path, stop: Any = None) -> dict[str, Any]:
-    """The sandbox parses documents; a busy or unreachable sandbox is waited out here,
-    under the import's lease, before the import is blocked."""
-    header = {
-        "mode": "extract",
-        "filename": filename,
-        "input_bytes": files.stored_stat(path).st_size,
-    }
-    deadline = time.monotonic() + EXTRACT_WAIT_SECONDS
-    unreachable = 0
-    while True:
-        try:
-            reply = executions.sandbox_call(header, path, output, stop=stop)
-            break
-        except executions.SandboxCancelledError:
-            raise LandError(STOPPED, code="cancelled") from None
-        except executions.SandboxBusyError:
-            if time.monotonic() > deadline:
-                raise LandError(
-                    "Overmind is busy reading other documents. Retry the import.",
-                    code="sandbox_busy",
-                ) from None
-            _pause(EXTRACT_BUSY_RETRY_SECONDS, stop)
-        except executions.SandboxUnavailableError as exc:
-            logger.warning("sandbox unavailable for extraction of %s: %s", filename, exc)
-            if unreachable == len(EXTRACT_UNREACHABLE_RETRY_SECONDS):
-                raise LandError(
-                    "Documents cannot be read right now. Retry the import.",
-                    code="sandbox_unavailable",
-                ) from None
-            _pause(EXTRACT_UNREACHABLE_RETRY_SECONDS[unreachable], stop)
-            unreachable += 1
-        except executions.SandboxRefusedError as exc:
-            logger.error("sandbox refused extraction of %s: %s", filename, exc)
-            # Resumable: a fixed token or deployment lets the retained upload land.
-            raise LandError(
-                "The document could not be read. Retry the import.",
-                code="sandbox_refused",
-            ) from None
-    if not reply.get("ok"):
-        raise LandError(reply.get("error") or "The document could not be extracted.")
-    extraction = reply.get("extraction")
-    expected = [c["name"] for c in DOCUMENT_MANIFEST[1:]]
-    try:
-        names = [c["name"] for c in store.read_manifest(output)]
-    except (OSError, ValueError, KeyError) as exc:
-        raise LandError("The extracted rows could not be read.", code="extraction_lost") from exc
-    if names != expected or not isinstance(extraction, dict):
-        raise LandError("The extracted rows could not be read.", code="extraction_lost")
-    return extraction
-
-
-class _Extracted:
-    """Rows the sandbox extracted, one Parquet file per document, read lazily."""
-
-    def __init__(self, directory: tempfile.TemporaryDirectory, outputs: list[Path]) -> None:
-        self._directory = directory
-        self.outputs = outputs
-
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        for output in self.outputs:
-            yield from store.iter_rows(output)
-
-
-def _read_documents(
-    sources: list[tuple[Path, str]], *, on_extract: Any = None, stop: Any = None
-) -> Landing:
-    directory = tempfile.TemporaryDirectory(prefix="documents-")
-    outputs = []
-    described = []
-    limitations: list[str] = []
-    for index, (path, filename) in enumerate(sources):
-        if on_extract is not None:
-            on_extract(filename)
-        output = Path(directory.name) / f"{index}.parquet"
-        extraction = _extract(path, filename, output, stop)
-        digest = extraction.pop("sha256", "")
-        for limitation in extraction.get("limitations", []):
-            if limitation not in limitations:
-                limitations.append(limitation)
-        outputs.append(output)
-        described.append(
-            {
-                "filename": filename,
-                "bytes": files.stored_stat(path).st_size,
-                "sha256": digest,
-                "rows": store.row_count(output),
-                "extraction": extraction,
-            }
-        )
-    return Landing(
-        _Cleaned(_Extracted(directory, outputs)),
-        kind=Dataset.SourceKind.FILE,
-        spec={"files": described, "extraction": {"limitations": limitations}},
-        manifest=DOCUMENT_MANIFEST,
-    )
-
-
-def read_file(path: Path, *, filename: str, json_rows_field: str | None = None) -> Landing:
-    if files.is_document(filename):
-        return _read_documents([(path, filename)])
-    spec: dict[str, Any] = {"filename": filename}
-    if json_rows_field:
-        spec["json_rows_field"] = json_rows_field
-    return read_rows(_file_rows(path, filename, json_rows_field), spec=spec)
-
-
-def read_uploads(
-    upload_ids: list[str],
+def read_file(
+    path: Path,
     *,
+    filename: str,
+    on_progress: Callable[[dict], None] | None = None,
     json_rows_field: str | None = None,
-    on_extract: Any = None,
-    stop: Any = None,
 ) -> Landing:
-    stored = []
-    for upload_id in upload_ids:
-        filename = files.upload_filename(upload_id)
-        path = files.upload_data_path(upload_id)
-        if not filename or not path.exists():
-            raise LandError("An upload has expired. Start it again.")
-        stored.append((path, filename))
-    documents = [files.is_document(filename) for _, filename in stored]
-    if any(documents):
-        if not all(documents):
-            raise LandError(files.MIXED, code="mixed_sources")
-        return _read_documents(stored, on_extract=on_extract, stop=stop)
-    parts = []
-    sources = []
-    for path, filename in stored:
-        part = _file_rows(path, filename, json_rows_field)
-        sources.append(
-            {"filename": filename, "bytes": files.stored_stat(path).st_size, "rows": part.count}
-        )
-        parts.append(part)
-    spec: dict[str, Any] = {"files": sources}
-    if json_rows_field:
-        spec["json_rows_field"] = json_rows_field
-    return read_rows(_Chain(parts), spec=spec)
+    spool = None
 
+    def progress(detail):
+        if on_progress:
+            on_progress({"filename": filename, **detail})
 
-def read_rows(rows: Iterable[Any], *, spec: dict[str, Any] | None = None) -> Landing:
-    return Landing(_Cleaned(rows), kind=Dataset.SourceKind.FILE, spec=spec or {})
-
-
-def version_source(project_id: Any, spec: dict[str, Any]) -> Cell:
-    cell = (
-        Cell.objects.select_related("dataset")
-        .filter(pk=spec.get("cell_id"), dataset_id=spec.get("dataset_id"))
-        .filter(dataset__project_id=project_id)
-        .first()
+    progress(
+        {"stage": "extracting" if filename.lower().endswith(documents.SUFFIXES) else "reading"}
     )
-    if cell is None or not paths.cell_path(cell.dataset_id, cell.pk).exists():
-        raise LandError("The source version was deleted.", code="source_missing")
-    return cell
+    try:
+        if filename.lower().endswith(documents.SUFFIXES):
+            extracted, extraction = documents.extract(path, filename=filename, on_progress=progress)
+            spool = tempfile.TemporaryDirectory(prefix="overmind-document-")
+            cached = Path(spool.name) / "extracted.jsonl"
+            with cached.open("w") as output:
+                for row in extracted:
+                    output.write(json.dumps(row) + "\n")
+            rows = files.FileRows(cached, filename="extracted.jsonl")
+        else:
+            rows = files.FileRows(path, filename=filename, json_rows_field=json_rows_field)
+            extraction = (
+                {"json_rows_field": json_rows_field, "selection": "explicit"}
+                if json_rows_field
+                else {}
+            )
+    except (files.FileError, documents.DocumentError) as exc:
+        raise LandError(str(exc)) from exc
+    if not rows:
+        raise LandError("The file has no rows.")
+    identity = store.file_sha256(path)
+    artifact = {
+        "id": identity,
+        "sha256": identity,
+        "filename": filename,
+        "bytes": files.stored_stat(path).st_size,
+        "rows": len(rows),
+        "extraction": extraction,
+        "staged_path": str(path),
+    }
+    return Landing(
+        EvidenceRows(rows, identity, filename, spool),
+        spec={"filename": filename, "sources": [artifact]},
+    )
 
 
-class _Copied:
-    """A version's rows; each keeps the version and ``source_row`` it came from."""
+@dataclass
+class EvidenceRows:
+    source: files.FileRows
+    identity: str
+    filename: str
+    spool: tempfile.TemporaryDirectory | None = field(default=None, repr=False)
 
-    def __init__(self, cell: Cell, path: Path) -> None:
-        self.cell, self.path = cell, path
+    def __len__(self):
+        return len(self.source)
 
-    def __iter__(self) -> Iterator[dict[str, Any]]:
-        origin = str(self.cell.pk)
-        for row in store.records(self.path):
-            provenance = row.get("_overmind_provenance")
+    def __getitem__(self, index):
+        for offset, row in enumerate(self):
+            if offset == index:
+                return row
+        raise IndexError(index)
+
+    def __iter__(self):
+        for offset, original in enumerate(self.source):
+            row = dict(original)
             row["_overmind_provenance"] = {
-                **(provenance if isinstance(provenance, dict) else {}),
-                "copied_from": {"cell_id": origin, "source_row": row.get(store.SOURCE_ROW)},
+                **preserve_lineage(row),
+                "file": {"sha256": self.identity, "filename": self.filename, "row": offset},
             }
             yield row
 
 
-def read_version(project_id: Any, spec: dict[str, Any]) -> Landing:
-    """A version of another dataset in this project, as a new source."""
-    cell = version_source(project_id, spec)
-    path = paths.cell_path(cell.dataset_id, cell.pk)
+@dataclass
+class UploadRows:
+    sources: list[EvidenceRows]
+
+    def __len__(self):
+        return sum(len(source) for source in self.sources)
+
+    def __iter__(self):
+        for source in self.sources:
+            yield from source
+
+
+def read_uploads(
+    upload_ids: list[str], *, on_progress: Callable[[dict], None] | None = None
+) -> Landing:
+    parts = []
+    sources = []
+    for index, upload_id in enumerate(upload_ids):
+        filename = files.upload_filename(upload_id)
+        path = files.upload_data_path(upload_id)
+        if not filename or not path.exists():
+            raise LandError("An upload has expired. Start it again.")
+
+        def progress(detail, index=index):
+            if on_progress:
+                on_progress({"completed": index, "total": len(upload_ids), **detail})
+
+        part = read_file(path, filename=filename, on_progress=progress)
+        sources.extend(part.spec["sources"])
+        parts.append(part.rows)
+    if on_progress:
+        on_progress({"completed": len(upload_ids), "total": len(upload_ids), "stage": "merging"})
     return Landing(
-        _Cleaned(_Copied(cell, path)),
-        kind=Dataset.SourceKind.VERSION,
+        UploadRows(parts),
         spec={
-            "dataset_id": str(cell.dataset_id),
-            "dataset_name": cell.dataset.name,
-            "cell_id": str(cell.pk),
-            "version": cell.label,
-            "fingerprint": cell.fingerprint,
+            "sources": sources,
+            "files": [{k: item[k] for k in ("filename", "bytes", "rows")} for item in sources],
         },
-        manifest=store.read_manifest(path),
     )
+
+
+def read_rows(rows: list[dict[str, Any]], *, spec: dict[str, Any] | None = None) -> Landing:
+    rows = [dict(r) if isinstance(r, dict) else {"value": r} for r in rows]
+    for row in rows:
+        row.pop(store.SOURCE_ROW, None)
+    return Landing(rows, kind=Dataset.SourceKind.FILE, spec=spec or {})
 
 
 def land_rows(
@@ -504,20 +376,18 @@ def _attr(span: Span, key: str) -> Any:
 
 
 def _root(spans: list[Span]) -> Span:
-    """The parentless span, else the one span whose parent did not arrive; an
-    interrupted trace with several orphans falls back to its longest span."""
     for span in spans:
         if span.parent_span_id is None:
             return span
     ids = {span.span_id for span in spans}
-    orphans = [span for span in spans if span.parent_span_id not in ids]
-    if len(orphans) == 1:
-        return orphans[0]
+    roots = [span for span in spans if span.parent_span_id not in ids]
+    if len(roots) == 1:
+        return roots[0]
     return max(spans, key=lambda s: s.duration_ns or 0)
 
 
 def _delivered(spans: list[Span]) -> Any:
-    from overbae.services.eval import chatml
+    from overbae.services.transcripts import chatml
 
     for span in sorted(spans, key=lambda s: s.start_time_ns or 0, reverse=True):
         if str(_attr(span, "overmind.delivery")).lower() == "true":
@@ -539,7 +409,7 @@ def _first(usage: dict[str, Any], keys: tuple[str, ...]) -> float:
 def _usage(spans: list[Span]) -> dict[str, Any]:
     """Summed over the trace from ``Span.usage``, which keeps the attribute names
     as sent (``genai.prompt_tokens``, ``gen_ai.usage.input_tokens``, ...)."""
-    from overbae.services.eval import chatml
+    from overbae.services.transcripts import chatml
 
     prompt = completion = 0
     cost = 0.0
@@ -574,10 +444,8 @@ def _error(root: Span, spans: list[Span]) -> str | None:
 def trace_row(
     spans: list[Span], *, score: float | None, capability_id: str | None = None
 ) -> dict[str, Any]:
-    """One row for one trace: the traces-table facts, the wire transcript and the
-    capability's delivered I/O. ``spans`` is the whole trace, or one capability
-    invocation's subtree, in start order."""
-    from overbae.services.eval import chatml, normalizer
+    """``spans`` is one whole trace or selected invocation in start order."""
+    from overbae.services.transcripts import chatml, normalizer
 
     root = _root(spans)
     trajectory = normalizer.reconstruct_spans(spans, promote_harness=True)
@@ -588,9 +456,13 @@ def trace_row(
     raw_in, raw_out = normalizer.capability_io(spans)
     delivered = _delivered(spans)
     usage = _usage(spans)
-    capabilities = {str(s.capability_id): s.capability for s in spans if s.capability_id}
-    capability = capabilities.get(capability_id) or (
-        next(iter(capabilities.values())) if len(capabilities) == 1 else None
+    capabilities = {s.capability_id: s.capability for s in spans if s.capability_id}
+    capability = (
+        root.capability
+        if capability_id and str(root.capability_id) == capability_id
+        else next(iter(capabilities.values()))
+        if len(capabilities) == 1
+        else None
     )
     conversation = next(
         (s.conversation.external_id for s in (root, *spans) if s.conversation_id), None
@@ -628,52 +500,55 @@ def _chunks(items: Iterable[str], size: int) -> Iterator[list[str]]:
         yield batch
 
 
-def _scores(project_id: Any, trace_ids: list[str]) -> dict[str, list[tuple[str, float]]]:
-    """Each trace's scored task executions by unit span, oldest first: the row's
-    score is the last one inside the spans it lands."""
-    rows = (
-        TaskExecution.objects.filter(project_id=project_id, trace_id__in=trace_ids)
-        .exclude(success_score=None)
-        .order_by("started_at", "created_at")
-        .values_list("trace_id", "unit_span_id", "success_score")
-    )
-    scores: dict[str, list[tuple[str, float]]] = {}
-    for trace_id, span_id, score in rows:
-        scores.setdefault(trace_id, []).append((span_id, score))
-    return scores
+def _score(spans: list[Span]) -> float | None:
+    # Scoped imports use their invocation root, never a sibling or enclosing trace score.
+    attrs = _root(spans).eval_attributes or {}
+    return (attrs.get("trajectory") or {}).get("score", attrs.get("score"))
 
 
-def _invocation(spans: list[Span], capability_id: str | None) -> list[Span]:
-    """The capability's outermost invocation and its subtree; the whole trace
-    when the capability did not run in it."""
+def _ancestors(spans: list[Span], unit: Span) -> list[Span]:
+    by_id = {span.span_id: span for span in spans}
+    seen = {unit.span_id}
+    chain = []
+    cursor = by_id.get(unit.parent_span_id or "")
+    while cursor is not None and cursor.span_id not in seen:
+        seen.add(cursor.span_id)
+        chain.append(cursor)
+        cursor = by_id.get(cursor.parent_span_id or "")
+    return chain
+
+
+def _preferred_spans(spans: list[Span], capability_id: str | None) -> list[Span]:
     if not capability_id:
         return spans
     matches = [s for s in spans if str(s.capability_id) == capability_id]
-    outermost = [
+    if not matches:
+        return spans
+    roots = [
         s
         for s in matches
-        if not any(str(a.capability_id) == capability_id for a in units.ancestor_chain(spans, s))
+        if not any(str(a.capability_id) == capability_id for a in _ancestors(spans, s))
     ]
-    if not outermost:
-        return spans
-    if len(outermost) > 1:
+    if len(roots) != 1:
         raise LandError(
-            f"Trace {spans[0].trace_id} has {len(outermost)} separate invocations of the "
-            "selected capability. Select LLM calls, or land rows for each invocation."
+            f"Trace {spans[0].trace_id} has {len(roots)} separate invocations of the selected "
+            "capability. Select LLM calls or import explicit invocation rows."
         )
-    return sorted(units.subtree_spans(spans, outermost[0]), key=lambda s: s.start_time_ns or 0)
+    return sorted(
+        [s for s in spans if s == roots[0] or roots[0] in _ancestors(spans, s)],
+        key=lambda s: s.start_time_ns or 0,
+    )
 
 
 def iter_trace_rows(
     project_id: Any,
     trace_ids: Iterable[str],
     *,
-    capability_id: str | None = None,
     on_progress: Any = None,
+    preferred_capability_id: str | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Two queries per chunk of traces, then pure assembly; a trace whose spans
-    are gone is skipped, and one with repeated invocations of ``capability_id``
-    fails the landing."""
+    """One query per chunk of traces, then pure assembly; a trace whose spans
+    are gone is skipped."""
     done = 0
     for chunk in _chunks(trace_ids, TRACE_CHUNK):
         spans = (
@@ -684,23 +559,14 @@ def iter_trace_rows(
         by_trace: dict[str, list[Span]] = {}
         for span in spans:
             by_trace.setdefault(span.trace_id, []).append(span)
-        scores = _scores(project_id, chunk)
         for trace_id in chunk:
             trace_spans = by_trace.get(trace_id)
             if not trace_spans:
                 continue
-            scoped = _invocation(trace_spans, capability_id)
-            ids = {s.span_id for s in scoped}
-            score = next(
-                (
-                    value
-                    for span_id, value in reversed(scores.get(trace_id, []))
-                    if scoped is trace_spans or span_id in ids
-                ),
-                None,
-            )
+            scoped = _preferred_spans(trace_spans, preferred_capability_id)
+            score = _score(scoped)
             try:
-                row = trace_row(scoped, score=score, capability_id=capability_id)
+                row = trace_row(scoped, score=score, capability_id=preferred_capability_id)
             except Exception:  # noqa: BLE001 — one unreadable trace must not sink the batch
                 logger.warning("trace %s did not land", trace_id, exc_info=True)
                 continue
@@ -710,29 +576,21 @@ def iter_trace_rows(
             on_progress(done)
 
 
-def read_traces(
-    project_id: Any,
-    spec: dict[str, Any],
-    *,
-    capability_id: Any = None,
-    on_progress: Any = None,
-) -> Landing:
-    """One row per trace, in selection order. ``spec`` is a ``TraceSource`` payload;
-    its capability filter, else the destination ``capability_id``, scopes each row."""
+def read_traces(project_id: Any, spec: dict[str, Any], *, on_progress: Any = None) -> Landing:
+    """One row per trace, in selection order. ``spec`` is a ``TraceSource`` payload."""
     try:
         source = selection.TraceSource.parse(spec)
-        selected = source.filters.get("capability") or capability_id
-        rows = _Spool(
+        rows = list(
             iter_trace_rows(
                 project_id,
                 source.iter_trace_ids(project_id),
-                capability_id=str(selected) if selected else None,
                 on_progress=on_progress,
+                preferred_capability_id=source.preferred_capability_id,
             )
         )
     except selection.TraceSourceError as exc:
         raise LandError(str(exc)) from exc
-    if not rows.count:
+    if not rows:
         raise LandError("No traces matched. Widen the selection or check the project.")
     return Landing(
         rows, kind=Dataset.SourceKind.TRACES, spec=source.spec(), manifest=list(TRACE_MANIFEST)
@@ -746,10 +604,12 @@ def land_traces(
     user: Any = None,
     on_progress: Any = None,
 ) -> Dataset:
-    read = read_traces(
-        dataset.project_id, spec, capability_id=dataset.capability_id, on_progress=on_progress
+    from overbae.services.datasets.dispatch import _trace_preference
+
+    spec = _trace_preference({"traces": spec}, dataset.capability_id)["traces"]
+    return commit(
+        dataset, read_traces(dataset.project_id, spec, on_progress=on_progress), user=user
     )
-    return commit(dataset, read, user=user)
 
 
 # A tool call whose arguments carry a serialised agent state can weigh hundreds of

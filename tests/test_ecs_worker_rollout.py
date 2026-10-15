@@ -91,24 +91,6 @@ def test_every_release_overrides_stale_worker_command(definition, queue):
     assert rendered["containerDefinitions"][1]["image"] == "otel:stable"
 
 
-def test_the_sandbox_release_runs_the_server_and_checks_its_health(definition):
-    definition["family"] = "sandbox"
-    definition["containerDefinitions"][0]["name"] = "sandbox"
-    rendered = render_task_definition(
-        definition, service="sandbox", image="repo:new", cluster="test-cluster"
-    )
-    container = rendered["containerDefinitions"][0]
-    assert container["command"] == ["python", "-m", "sandbox"]
-    assert container["entryPoint"] == ["/usr/local/bin/worker-entrypoint.sh"]
-    assert "127.0.0.1:8080/health" in container["healthCheck"]["command"][-1]
-    assert container["linuxParameters"]["initProcessEnabled"] is True
-    capabilities = container["linuxParameters"]["capabilities"]
-    assert capabilities["add"] == ["SYS_PTRACE"]
-    assert "NET_RAW" in capabilities["drop"]
-    needed = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID", "SYS_PTRACE"}
-    assert not needed & set(capabilities["drop"])
-
-
 def test_migration_cannot_start_http_server(definition, service):
     definition["containerDefinitions"][0]["name"] = "api"
     request = migration_request(
@@ -186,6 +168,95 @@ def test_a_release_builds_on_the_latest_revision_of_the_family(monkeypatch, defi
     [release] = registered
     assert release["taskRoleArn"] == "arn:aws:iam::123:role/latest"
     assert release["containerDefinitions"][0]["environment"] == [
-        {"name": "FROM", "value": "terraform"}
+        {"name": "FROM", "value": "terraform"},
+        {"name": "RUN_DB_BOOTSTRAP", "value": "0"},
+        {"name": "WORKSHOP_EXECUTION_BACKEND", "value": "sandbox-package-v1"},
     ]
     assert release["containerDefinitions"][0]["image"] == "repo:new"
+
+
+def test_document_parser_keeps_main_isolation_command_and_health(definition):
+    definition["containerDefinitions"][0]["name"] = "sandbox"
+    rendered = render_task_definition(
+        definition, service="sandbox", image="repo:new", cluster="test"
+    )
+    container = rendered["containerDefinitions"][0]
+    assert container["command"] == ["python", "-m", "sandbox"]
+    assert container["linuxParameters"]["initProcessEnabled"] is True
+    assert container["linuxParameters"]["capabilities"]["add"] == ["SYS_PTRACE"]
+    assert "NET_RAW" in container["linuxParameters"]["capabilities"]["drop"]
+    assert "/health" in container["healthCheck"]["command"][-1]
+
+
+def test_dedicated_workshop_controller_has_no_deployable_command(definition):
+    definition["containerDefinitions"][0]["name"] = "workshop-runner"
+    with pytest.raises(ValueError, match="No reviewed command"):
+        render_task_definition(
+            definition, service="workshop-runner", image="repo:new", cluster="test"
+        )
+
+
+@pytest.mark.parametrize("counter", ["desiredCount", "runningCount", "pendingCount"])
+def test_first_cutover_refuses_active_consumers(monkeypatch, counter):
+    from scripts import deploy_ecs
+
+    monkeypatch.setattr(deploy_ecs, "describe_service", lambda cluster, name: {counter: 1})
+    with pytest.raises(RuntimeError, match="drained, stopped"):
+        deploy_ecs.require_drained_consumers("test")
+
+
+def test_first_cutover_checks_every_consumer(monkeypatch):
+    from scripts import deploy_ecs
+
+    checked = []
+
+    def stopped(cluster, name):
+        checked.append(name)
+        return {"desiredCount": 0, "runningCount": 0, "pendingCount": 0}
+
+    monkeypatch.setattr(deploy_ecs, "describe_service", stopped)
+    deploy_ecs.require_drained_consumers("test")
+    assert set(checked) == {
+        "api",
+        "celery-control-worker",
+        "celery-io-worker",
+        "celery-batch-worker",
+        "celery-landing-worker",
+        "celery-interactive-worker",
+        "celery-beat",
+        "sandbox",
+    }
+
+
+def test_cutover_does_not_guess_service_capacity(monkeypatch):
+    from scripts import deploy_ecs
+
+    monkeypatch.setattr(deploy_ecs, "describe_service", lambda cluster, name: {"desiredCount": 0})
+    with pytest.raises(ValueError, match="recorded service capacity"):
+        deploy_ecs.deploy("test", "api", "repo:new")
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+@pytest.mark.parametrize("desired", [0, 1])
+def test_cutover_checks_deployed_release_and_not_desired_count(monkeypatch, migrated, desired):
+    def service(cluster, name):
+        return {"taskDefinition": name + ":1", "desiredCount": desired, "runningCount": 1}
+
+    def aws(*args, **kwargs):
+        name = args[-1].split(":")[0]
+        environment = (
+            [{"name": "WORKSHOP_EXECUTION_BACKEND", "value": "sandbox-package-v1"}]
+            if migrated
+            else []
+        )
+        return {
+            "taskDefinition": {"containerDefinitions": [{"name": name, "environment": environment}]}
+        }
+
+    monkeypatch.setattr(deploy_ecs, "describe_service", service)
+    monkeypatch.setattr(deploy_ecs, "aws", aws)
+    if migrated:
+        deploy_ecs.preflight("test")
+    else:
+        with pytest.raises(RuntimeError, match="drained, stopped"):
+            deploy_ecs.preflight("test")

@@ -20,6 +20,13 @@ import {
     ProviderEnumToJSON,
     ProviderEnumToJSONTyped,
 } from './ProviderEnum';
+import type { SplitMethodE87Enum } from './SplitMethodE87Enum';
+import {
+    SplitMethodE87EnumFromJSON,
+    SplitMethodE87EnumFromJSONTyped,
+    SplitMethodE87EnumToJSON,
+    SplitMethodE87EnumToJSONTyped,
+} from './SplitMethodE87Enum';
 import type { FinetuningJobStatusEnum } from './FinetuningJobStatusEnum';
 import {
     FinetuningJobStatusEnumFromJSON,
@@ -34,13 +41,13 @@ import {
     FinetuningJobEventToJSON,
     FinetuningJobEventToJSONTyped,
 } from './FinetuningJobEvent';
-import type { SplitMethodEnum } from './SplitMethodEnum';
+import type { NativeEvaluation } from './NativeEvaluation';
 import {
-    SplitMethodEnumFromJSON,
-    SplitMethodEnumFromJSONTyped,
-    SplitMethodEnumToJSON,
-    SplitMethodEnumToJSONTyped,
-} from './SplitMethodEnum';
+    NativeEvaluationFromJSON,
+    NativeEvaluationFromJSONTyped,
+    NativeEvaluationToJSON,
+    NativeEvaluationToJSONTyped,
+} from './NativeEvaluation';
 
 /**
  *
@@ -48,6 +55,36 @@ import {
  * @interface FinetuningJob
  */
 export interface FinetuningJob {
+    /**
+     *
+     * @type {string}
+     * @memberof FinetuningJob
+     */
+    requestKey?: string | null;
+    /**
+     *
+     * @type {any}
+     * @memberof FinetuningJob
+     */
+    readonly requestedConfiguration: any | null;
+    /**
+     *
+     * @type {any}
+     * @memberof FinetuningJob
+     */
+    acceptedFindings?: any | null;
+    /**
+     *
+     * @type {any}
+     * @memberof FinetuningJob
+     */
+    readonly record: any | null;
+    /**
+     *
+     * @type {NativeEvaluation}
+     * @memberof FinetuningJob
+     */
+    readonly nativeEvaluation: NativeEvaluation | null;
     /**
      *
      * @type {string}
@@ -77,7 +114,7 @@ export interface FinetuningJob {
      * @type {string}
      * @memberof FinetuningJob
      */
-    evalDataset: string;
+    evalDataset?: string | null;
     /**
      *
      * @type {string}
@@ -89,13 +126,19 @@ export interface FinetuningJob {
      * @type {string}
      * @memberof FinetuningJob
      */
-    evalSet: string;
+    evalSet?: string | null;
     /**
      *
      * @type {string}
      * @memberof FinetuningJob
      */
     evalJudgeModel?: FinetuningJobEvalJudgeModelEnum;
+    /**
+     *
+     * @type {Array<string>}
+     * @memberof FinetuningJob
+     */
+    benchmarkModels?: Array<string>;
     /**
      *
      * @type {boolean}
@@ -158,10 +201,10 @@ export interface FinetuningJob {
     validationCell?: string | null;
     /**
      *
-     * @type {SplitMethodEnum}
+     * @type {SplitMethodE87Enum}
      * @memberof FinetuningJob
      */
-    splitMethod?: SplitMethodEnum;
+    splitMethod?: SplitMethodE87Enum;
     /**
      *
      * @type {number}
@@ -240,6 +283,12 @@ export interface FinetuningJob {
      * @memberof FinetuningJob
      */
     readonly deployedModelId: string | null;
+    /**
+     *
+     * @type {string}
+     * @memberof FinetuningJob
+     */
+    readonly decisionJobId: string | null;
     /**
      *
      * @type {any}
@@ -359,11 +408,12 @@ export type FinetuningJobModelTierEnum = typeof FinetuningJobModelTierEnum[keyof
  * Check if a given object implements the FinetuningJob interface.
  */
 export function instanceOfFinetuningJob(value: object): value is FinetuningJob {
+    if (!('requestedConfiguration' in value) || value['requestedConfiguration'] === undefined) return false;
+    if (!('record' in value) || value['record'] === undefined) return false;
+    if (!('nativeEvaluation' in value) || value['nativeEvaluation'] === undefined) return false;
     if (!('id' in value) || value['id'] === undefined) return false;
     if (!('project' in value) || value['project'] === undefined) return false;
     if (!('dataset' in value) || value['dataset'] === undefined) return false;
-    if (!('evalDataset' in value) || value['evalDataset'] === undefined) return false;
-    if (!('evalSet' in value) || value['evalSet'] === undefined) return false;
     if (!('cellInfo' in value) || value['cellInfo'] === undefined) return false;
     if (!('triggeredBy' in value) || value['triggeredBy'] === undefined) return false;
     if (!('baseModel' in value) || value['baseModel'] === undefined) return false;
@@ -372,6 +422,7 @@ export function instanceOfFinetuningJob(value: object): value is FinetuningJob {
     if (!('modelWeightsLocation' in value) || value['modelWeightsLocation'] === undefined) return false;
     if (!('outputModelName' in value) || value['outputModelName'] === undefined) return false;
     if (!('deployedModelId' in value) || value['deployedModelId'] === undefined) return false;
+    if (!('decisionJobId' in value) || value['decisionJobId'] === undefined) return false;
     if (!('progress' in value) || value['progress'] === undefined) return false;
     if (!('result' in value) || value['result'] === undefined) return false;
     if (!('errorMessage' in value) || value['errorMessage'] === undefined) return false;
@@ -398,14 +449,20 @@ export function FinetuningJobFromJSONTyped(json: any, ignoreDiscriminator: boole
     }
     return {
 
+        'requestKey': json['request_key'] == null ? undefined : json['request_key'],
+        'requestedConfiguration': json['requested_configuration'],
+        'acceptedFindings': json['accepted_findings'] == null ? undefined : json['accepted_findings'],
+        'record': json['record'],
+        'nativeEvaluation': NativeEvaluationFromJSON(json['native_evaluation']),
         'id': json['id'],
         'project': json['project'],
         'capability': json['capability'] == null ? undefined : json['capability'],
         'dataset': json['dataset'],
-        'evalDataset': json['eval_dataset'],
+        'evalDataset': json['eval_dataset'] == null ? undefined : json['eval_dataset'],
         'evalCell': json['eval_cell'] == null ? undefined : json['eval_cell'],
-        'evalSet': json['eval_set'],
+        'evalSet': json['eval_set'] == null ? undefined : json['eval_set'],
         'evalJudgeModel': json['eval_judge_model'] == null ? undefined : json['eval_judge_model'],
+        'benchmarkModels': json['benchmark_models'] == null ? undefined : json['benchmark_models'],
         'evalIncumbentBefore': json['eval_incumbent_before'] == null ? undefined : json['eval_incumbent_before'],
         'evalIncumbentAfter': json['eval_incumbent_after'] == null ? undefined : json['eval_incumbent_after'],
         'evalModelBefore': json['eval_model_before'] == null ? undefined : json['eval_model_before'],
@@ -416,7 +473,7 @@ export function FinetuningJobFromJSONTyped(json: any, ignoreDiscriminator: boole
         'cell': json['cell'] == null ? undefined : json['cell'],
         'cellInfo': json['cell_info'],
         'validationCell': json['validation_cell'] == null ? undefined : json['validation_cell'],
-        'splitMethod': json['split_method'] == null ? undefined : SplitMethodEnumFromJSON(json['split_method']),
+        'splitMethod': json['split_method'] == null ? undefined : SplitMethodE87EnumFromJSON(json['split_method']),
         'triggeredBy': json['triggered_by'],
         'name': json['name'] == null ? undefined : json['name'],
         'useCase': json['use_case'] == null ? undefined : json['use_case'],
@@ -430,6 +487,7 @@ export function FinetuningJobFromJSONTyped(json: any, ignoreDiscriminator: boole
         'modelWeightsLocation': json['model_weights_location'],
         'outputModelName': json['output_model_name'],
         'deployedModelId': json['deployed_model_id'],
+        'decisionJobId': json['decision_job_id'],
         'progress': json['progress'],
         'result': json['result'],
         'errorMessage': json['error_message'],
@@ -451,13 +509,15 @@ export function FinetuningJobToJSON(json: any): FinetuningJob {
     return FinetuningJobToJSONTyped(json, false);
 }
 
-export function FinetuningJobToJSONTyped(value?: Omit<FinetuningJob, 'id'|'cell_info'|'triggered_by'|'status'|'provider'|'model_weights_location'|'output_model_name'|'deployed_model_id'|'progress'|'result'|'error_message'|'retry_count'|'celery_task_id'|'cost_usd'|'billed_minutes'|'cost_synced_at'|'created_at'|'updated_at'|'started_at'|'completed_at'|'events'> | null, ignoreDiscriminator: boolean = false): any {
+export function FinetuningJobToJSONTyped(value?: Omit<FinetuningJob, 'requested_configuration'|'record'|'native_evaluation'|'id'|'cell_info'|'triggered_by'|'status'|'provider'|'model_weights_location'|'output_model_name'|'deployed_model_id'|'decision_job_id'|'progress'|'result'|'error_message'|'retry_count'|'celery_task_id'|'cost_usd'|'billed_minutes'|'cost_synced_at'|'created_at'|'updated_at'|'started_at'|'completed_at'|'events'> | null, ignoreDiscriminator: boolean = false): any {
     if (value == null) {
         return value;
     }
 
     return {
 
+        'request_key': value['requestKey'],
+        'accepted_findings': value['acceptedFindings'],
         'project': value['project'],
         'capability': value['capability'],
         'dataset': value['dataset'],
@@ -465,6 +525,7 @@ export function FinetuningJobToJSONTyped(value?: Omit<FinetuningJob, 'id'|'cell_
         'eval_cell': value['evalCell'],
         'eval_set': value['evalSet'],
         'eval_judge_model': value['evalJudgeModel'],
+        'benchmark_models': value['benchmarkModels'],
         'eval_incumbent_before': value['evalIncumbentBefore'],
         'eval_incumbent_after': value['evalIncumbentAfter'],
         'eval_model_before': value['evalModelBefore'],
@@ -474,7 +535,7 @@ export function FinetuningJobToJSONTyped(value?: Omit<FinetuningJob, 'id'|'cell_
         'validation_dataset': value['validationDataset'],
         'cell': value['cell'],
         'validation_cell': value['validationCell'],
-        'split_method': SplitMethodEnumToJSON(value['splitMethod']),
+        'split_method': SplitMethodE87EnumToJSON(value['splitMethod']),
         'name': value['name'],
         'use_case': value['useCase'],
         'base_model': value['baseModel'],

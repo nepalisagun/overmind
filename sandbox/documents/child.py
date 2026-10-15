@@ -5,14 +5,6 @@ import sys
 import traceback
 from pathlib import Path
 
-MANIFEST = [
-    {"name": "text", "type": "string"},
-    {"name": "page", "type": "integer"},
-    {"name": "source_name", "type": "string"},
-    {"name": "_overmind_document_id", "type": "string"},
-    {"name": "_overmind_provenance", "type": "json"},
-]
-
 
 def main(argv: list[str]) -> None:
     limits, document, output, extraction = argv
@@ -25,11 +17,14 @@ def main(argv: list[str]) -> None:
         resource.setrlimit(resource.RLIMIT_NPROC, (processes, processes))
     # -I keeps the working directory off sys.path; import the code next to this file.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from sandbox import tables
     from sandbox.documents.extract import DocumentError, extract
 
+    def progress(value):
+        with open("progress.jsonl", "a", encoding="utf-8") as report:
+            report.write(json.dumps(value) + "\n")
+
     try:
-        rows, metadata = extract(Path(document), filename)
+        rows, metadata = extract(Path(document), filename=filename, on_progress=progress)
     except DocumentError as exc:
         sys.stderr.write(str(exc))
         raise SystemExit(3) from None
@@ -37,8 +32,7 @@ def main(argv: list[str]) -> None:
         traceback.print_exc(file=sys.stdout)
         sys.stderr.write("The document could not be read.")
         raise SystemExit(3) from None
-    with tables.TableWriter(output, MANIFEST) as writer:
-        writer.write_rows(rows)
+    Path(output).write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
     Path(extraction).write_text(json.dumps(metadata), encoding="utf-8")
 
 

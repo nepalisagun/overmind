@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from overbae.services.datasets import contract
@@ -27,9 +28,9 @@ SHAPES = {
 
 
 @pytest.mark.parametrize("name", SHAPES)
-def test_a_row_fits_train_exactly_when_the_export_trains_on_it(name, frame_of):
+def test_a_row_fits_train_exactly_when_the_export_trains_on_it(name):
     record = SHAPES[name]
-    fits = contract.measure(frame_of([record]))["train"]["ok"]
+    fits = contract.measure(pd.DataFrame([record]))["train"]["ok"]
     try:
         exported = validate_rows([row_to_finetuning_line(row_from_record(0, record))]).valid
     except ValueError:
@@ -38,11 +39,11 @@ def test_a_row_fits_train_exactly_when_the_export_trains_on_it(name, frame_of):
     assert fits is (name in {"transcript", "transcript with tools", "trace row", "json text"})
 
 
-def test_one_bad_row_fails_the_train_contract_and_names_it(frame_of):
-    df = frame_of([{"messages": TURNS}, {"messages": None}])
+def test_one_bad_row_fails_the_train_contract_and_names_it():
+    df = pd.DataFrame([{"messages": TURNS}, {"messages": None}])
     report = contract.measure(df)["train"]
     assert report["ok"] is False
-    assert report["failures"] == [{"row": 2, "reason": "messages is empty"}]
+    assert report["failures"] == [{"row": 1, "reason": "messages is empty"}]
 
 
 @pytest.mark.parametrize(
@@ -57,38 +58,24 @@ def test_one_bad_row_fails_the_train_contract_and_names_it(frame_of):
         ([{"input": "q"}], "no expected_output values"),
     ],
 )
-def test_the_eval_contract_says_what_is_missing(rows, reason, frame_of):
-    report = contract.measure(frame_of(rows))["eval"]
+def test_the_eval_contract_says_what_is_missing(rows, reason):
+    report = contract.measure(pd.DataFrame(rows))["eval"]
     assert (report["ok"], report["reason"]) == (False, reason)
 
 
-def test_an_empty_table_fits_nothing(frame_of):
-    report = contract.measure(frame_of([]))
+def test_an_empty_table_fits_nothing():
+    report = contract.measure(pd.DataFrame())
     assert report["train"] == report["eval"] == {"ok": False, "reason": "no rows"}
 
 
-@pytest.mark.parametrize(
-    ("rows", "intent"),
-    [
-        ([{"messages": TURNS}], "train"),
-        ([{"input": "q", "expected_output": "a"}], "eval"),
-        ([{"question": "q", "answer": "a"}], "eval"),
-        ([{"sensor": 1, "temp": 20.5}], "pending"),
-    ],
-)
-def test_the_proposed_intent_follows_the_rows(rows, intent, frame_of):
-    df = frame_of(rows)
-    assert contract.propose_intent(df, contract.measure(df)) == intent
-
-
-def test_a_table_without_text_is_marked_as_not_fixable(frame_of):
-    numbers = contract.measure(frame_of([{"sensor": 1, "temp": 20.5}]))
-    words = contract.measure(frame_of([{"prompt": "hi", "completion": "hello"}]))
+def test_a_table_without_text_is_marked_as_not_fixable():
+    numbers = contract.measure(pd.DataFrame([{"sensor": 1, "temp": 20.5}]))
+    words = contract.measure(pd.DataFrame([{"prompt": "hi", "completion": "hello"}]))
     assert numbers["train"]["fixable"] is numbers["eval"]["fixable"] is False
     assert "fixable" not in words["train"] and "fixable" not in words["eval"]
 
 
-def test_a_transcript_that_landing_cut_does_not_fit_train(frame_of):
+def test_a_transcript_that_landing_cut_does_not_fit_train():
     from overbae.services.datasets import land
 
     huge = [
@@ -108,37 +95,6 @@ def test_a_transcript_that_landing_cut_does_not_fit_train(frame_of):
         {"role": "assistant", "content": "done"},
     ]
     row = land.bounded_row({"messages": huge})
-    report = contract.measure(frame_of([row, {"messages": TURNS}]))["train"]
+    report = contract.measure(pd.DataFrame([row, {"messages": TURNS}]))["train"]
     assert report["ok"] is False
-    assert report["failures"] == [{"row": 1, "reason": "a value was cut at landing"}]
-
-
-def _decision_rows(answers: list, question: dict) -> list[dict]:
-    return [
-        {
-            "input": {"state": f"ticket {i}", "questions": {"intent": question}},
-            "expected_output": {"intent": answer},
-        }
-        for i, answer in enumerate(answers)
-    ]
-
-
-def test_a_decision_table_with_thin_option_coverage_passes_with_an_advisory(frame_of):
-    options = {f"team{i:02d}": f"Team {i}" for i in range(26)}
-    question = {"type": "choice", "instructions": "Which team?", "criteria": options}
-    answers = [key for key in options for _ in range(4)]
-
-    report = contract.measure(frame_of(_decision_rows(answers, question)))["decision"]
-
-    assert report["ok"] is True
-    assert report["warnings"] == ["question intent: 26 of 26 options have fewer than 5 rows"]
-
-
-def test_a_decision_table_dominated_by_one_answer_passes_with_an_advisory(frame_of):
-    urgent = {"type": "noul", "instructions": "Is it urgent?"}
-    answers = ["false"] * 93 + ["true"] * 7
-
-    report = contract.measure(frame_of(_decision_rows(answers, urgent)))["decision"]
-
-    assert report["ok"] is True
-    assert report["warnings"] == ["question intent: 'false' is the answer in 93% of rows"]
+    assert report["failures"] == [{"row": 0, "reason": "a value was cut at landing"}]

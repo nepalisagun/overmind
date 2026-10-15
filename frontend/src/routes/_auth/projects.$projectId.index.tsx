@@ -20,6 +20,7 @@ import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/ui/page-header";
 import { PageShell } from "@/components/ui/page-shell";
 import { Skeleton } from "@/components/ui/skeleton";
+import { SortableHeader } from "@/components/ui/sortable-header";
 import {
   Table,
   TableBody,
@@ -30,6 +31,7 @@ import {
 } from "@/components/ui/table";
 import { useOnboardingStatus, useProjectQuery } from "@/hooks/use-query";
 import { useSubscriptionQuery } from "@/hooks/use-subscription";
+import { useTableSort } from "@/hooks/use-table-sort";
 import { useDeleteToken, useTokensList } from "@/hooks/use-tokens";
 import { ApiError } from "@/lib/api-error";
 import { featureFlags } from "@/lib/feature-flags";
@@ -269,6 +271,7 @@ function ProjectOverviewBand({
 }
 
 function ApiKeysList({ projectId }: { projectId: string }) {
+  const { sort, onSort, sortRows } = useTableSort<"name" | "prefix" | "createdAt" | "isActive">();
   const { data: tokenData, isLoading, error } = useTokensList(projectId);
   const deleteToken = useDeleteToken();
 
@@ -304,15 +307,45 @@ function ApiKeysList({ projectId }: { projectId: string }) {
       <Table className="w-full [&_td:first-child]:pl-4 [&_th:first-child]:pl-4">
         <TableHeader>
           <TableRow>
-            <TableHead className="h-8 py-1">Name</TableHead>
-            <TableHead className="h-8 py-1 text-center">Prefix</TableHead>
-            <TableHead className="hidden h-8 py-1 text-center sm:table-cell">Created</TableHead>
-            <TableHead className="h-8 py-1 text-center">Status</TableHead>
+            <SortableHeader
+              className="h-8 py-1"
+              label="Name"
+              onSort={onSort}
+              sort={sort}
+              sortKey="name"
+            />
+            <SortableHeader
+              className="h-8 py-1 text-center"
+              label="Prefix"
+              onSort={onSort}
+              sort={sort}
+              sortKey="prefix"
+            />
+            <SortableHeader
+              className="hidden h-8 py-1 text-center sm:table-cell"
+              label="Created"
+              onSort={onSort}
+              sort={sort}
+              sortKey="createdAt"
+            />
+            <SortableHeader
+              className="h-8 py-1 text-center"
+              label="Status"
+              onSort={onSort}
+              sort={sort}
+              sortKey="isActive"
+            />
             <TableHead className="h-8 w-16 py-1 text-center">Actions</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {tokenData.tokens.map((token) => (
+          {sortRows(tokenData.tokens, (token, key) =>
+            key === "createdAt"
+              ? token.createdAt?.getTime()
+              : key === "isActive"
+                ? token.isActive !== false
+                : token[key]
+          ).map((token) => (
             <TableRow className="hover:bg-wash-raised" key={token.tokenId}>
               <TableCell className="py-1.5 font-mono text-sm">{token.name ?? "Unnamed"}</TableCell>
               <TableCell className="py-1.5 text-center font-mono text-xs text-muted-foreground">
@@ -489,6 +522,7 @@ function parseInviteMembershipError(err: unknown, email: string): MembershipInvi
 }
 
 function ProjectMembersCard({ projectId }: { projectId: string }) {
+  const { sort, onSort, sortRows } = useTableSort<"user">();
   const queryClient = useQueryClient();
   const [emailInput, setEmailInput] = useState("");
   const [sentTo, setSentTo] = useState<string | null>(null);
@@ -677,49 +711,57 @@ function ProjectMembersCard({ projectId }: { projectId: string }) {
             <Table className="w-full [&_td:first-child]:pl-4 [&_th:first-child]:pl-4">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="h-8 py-1">User</TableHead>
+                  <SortableHeader
+                    className="h-8 py-1"
+                    label="User"
+                    onSort={onSort}
+                    sort={sort}
+                    sortKey="user"
+                  />
                   {showActions ? (
                     <TableHead className="h-8 w-16 py-1 text-center">Actions</TableHead>
                   ) : null}
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {members.map((member) => {
-                  const isSelf = myUserId != null && member.user === myUserId;
-                  return (
-                    <TableRow className="hover:bg-wash-raised" key={member.id}>
-                      <TableCell className="py-1.5 font-mono text-sm">
-                        {member.userEmail ?? `User #${member.user}`}
-                      </TableCell>
-                      {showActions ? (
-                        <TableCell className="py-1.5 text-center">
-                          {isSelf || !canRemoveOthers ? null : (
-                            <ConfirmDialog
-                              confirmLabel="Remove member"
-                              description={`Remove ${member.userEmail ?? "this member"} from the project? They will lose access.`}
-                              destructive
-                              isPending={removeMember.isPending}
-                              keepOpenOnError
-                              onConfirm={() => removeMember.mutateAsync(member.id)}
-                              title="Remove member?"
-                              trigger={
-                                <Button
-                                  aria-label="Remove member"
-                                  className="text-destructive hover:text-destructive"
-                                  disabled={removeMember.isPending}
-                                  size="icon-xs"
-                                  variant="ghost"
-                                >
-                                  <Icon.delete />
-                                </Button>
-                              }
-                            />
-                          )}
+                {sortRows(members, (member) => member.userEmail ?? `User #${member.user}`).map(
+                  (member) => {
+                    const isSelf = myUserId != null && member.user === myUserId;
+                    return (
+                      <TableRow className="hover:bg-wash-raised" key={member.id}>
+                        <TableCell className="py-1.5 font-mono text-sm">
+                          {member.userEmail ?? `User #${member.user}`}
                         </TableCell>
-                      ) : null}
-                    </TableRow>
-                  );
-                })}
+                        {showActions ? (
+                          <TableCell className="py-1.5 text-center">
+                            {isSelf || !canRemoveOthers ? null : (
+                              <ConfirmDialog
+                                confirmLabel="Remove member"
+                                description={`Remove ${member.userEmail ?? "this member"} from the project? They will lose access.`}
+                                destructive
+                                isPending={removeMember.isPending}
+                                keepOpenOnError
+                                onConfirm={() => removeMember.mutateAsync(member.id)}
+                                title="Remove member?"
+                                trigger={
+                                  <Button
+                                    aria-label="Remove member"
+                                    className="text-destructive hover:text-destructive"
+                                    disabled={removeMember.isPending}
+                                    size="icon-xs"
+                                    variant="ghost"
+                                  >
+                                    <Icon.delete />
+                                  </Button>
+                                }
+                              />
+                            )}
+                          </TableCell>
+                        ) : null}
+                      </TableRow>
+                    );
+                  }
+                )}
                 {invites.map((invite) => (
                   <TableRow className="hover:bg-wash-raised" key={invite.id}>
                     <TableCell className="py-1.5 font-mono text-sm">

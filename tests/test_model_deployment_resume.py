@@ -22,7 +22,7 @@ pytestmark = pytest.mark.django_db
 @pytest.fixture
 def deployed(serving):
     project = Project.objects.create(name="Deployment recovery")
-    dataset = frozen_dataset(project, TRAIN_ROWS, name="train")
+    dataset = frozen_dataset(project, TRAIN_ROWS, name="train", contract="train")
     job = FinetuningJob.objects.create(
         project=project,
         dataset=dataset,
@@ -214,6 +214,80 @@ def test_complete_adapter_pipeline_persists_every_stage(deployed, fake_modal):
     assert deployed.adapter_path == "/weights/.adapters/" + deployed.model_id
     assert deployed.lora_rank == 16
     tick.assert_called_once()
+
+
+def test_decision_checkpoint_deploys_and_verifies_without_chat_registration(
+    deployed, fake_modal, monkeypatch
+):
+    job = deployed.finetuning_job
+    deployed.delete()
+    job.status = "deploying"
+    job.hyperparameters = {"objective": "decision_cross_entropy"}
+    job.result = {
+        "artifact_identity": "a" * 64,
+        "reload_verification": {
+            "decisions": 32,
+            "max_absolute_error": 0,
+            "tolerance": 0.0001,
+            "weight_reload": "exact",
+        },
+    }
+    job.effective_configuration = {
+        "parameters": {"MAX_LENGTH": "4096"},
+        "gpu_type": "H100",
+        "gpu_count": 1,
+    }
+    job.save()
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "test")
+    row = deployment.ensure_training_deployment(str(job.pk))
+    assert deployment.ensure_training_deployment(str(job.pk)).pk == row.pk
+    assert row.inference_contract == "decision"
+    assert row.checkpoint_hash == "a" * 64
+    runtime = row.serving_runtime["app"]
+    fake_modal.deploy(
+        runtime,
+        "publish",
+        lambda **_: {
+            "weights_path": "/weights/.decisions/" + "a" * 64,
+            "artifact_identity": "a" * 64,
+        },
+    )
+    fake_modal.deploy(
+        runtime, "pre_warm", lambda **_: {"verified": True, "artifact_identity": "a" * 64}
+    )
+    for stage in ["base", "archive", "weights", "warm"]:
+        assert row.deployment_stage == stage
+        advance(row)
+        assert row.status != "ready"
+        advance(row)
+    assert row.status == "ready"
+    assert row.quantization == "bf16"
+    assert row.gpu_type == "H100"
+    assert row.adapter_path == ""
+    assert row.inference_url == f"/api/deployed-models/{row.pk}/inference/"
+    assert fake_modal.spawns() == [
+        "fetch_base_model",
+        "sync_modal_checkpoint_to_s3",
+        "publish",
+        "pre_warm",
+    ]
+    advance(row)
+    job.refresh_from_db()
+    assert job.status == "succeeded"
+    assert job.result["artifact_identity"] == "a" * 64
+
+
+def test_decision_deployment_does_not_accept_unverified_serving_result(deployed, fake_modal):
+    DeployedModel.objects.filter(pk=deployed.pk).update(
+        inference_contract="decision",
+        checkpoint_hash="a" * 64,
+        serving_runtime={"app": "decision-serving-test", "environment": "overmind-dev"},
+    )
+    at_stage(deployed, fake_modal, "warm", state="done", result={"verified": False})
+    advance(deployed)
+    assert deployed.status != "ready"
+    assert deployed.deployed_at is None
+    assert "invalid result" in deployed.error_message
 
 
 @pytest.mark.parametrize("adapter", [False, True])

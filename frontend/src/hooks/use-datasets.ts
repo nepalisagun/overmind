@@ -1,4 +1,4 @@
-/** Every dataset query and mutation. Nested JSON blobs (reports, rows, impact)
+/** Every dataset query and mutation. Nested JSON blobs (reports, rows, chat)
  *  come back verbatim from the server, so their keys stay snake_case here. */
 
 import { useEffect, useRef } from "react";
@@ -12,7 +12,6 @@ import type {
   ColumnStat,
   Dataset,
   DatasetPair,
-  Execution,
   IntentEnum,
   PaginatedDatasetList,
   PositionEnum,
@@ -20,6 +19,7 @@ import type {
 } from "@/openapi";
 
 export type Intent = IntentEnum;
+export type CellState = "queued" | "running" | "ok" | "failed";
 
 export interface ColumnInfo {
   name: string;
@@ -62,20 +62,18 @@ export interface RowsParams {
 
 export type DatasetEvent =
   | { type: "replay.done" }
-  | { type: "land_started" | "land_done" }
-  | { type: "land_progress"; stage?: string; traces?: number }
-  | { type: "land_failed"; error?: string }
-  | { type: "land_cancelled" }
+  | { type: "land_started" | "land_progress" | "land_done" | "land_failed"; [k: string]: unknown }
+  | { type: "run_started" | "run_done" | "run_failed"; cell_id?: string; error?: string }
   | {
-      type: "execution_queued" | "execution_started" | "execution_finished";
-      execution_id: string;
-      mode: Execution["mode"];
-      parent_id: string | null;
-      state: Execution["state"];
-      cell_id: string | null;
+      type: "cell_started" | "cell_done" | "cell_failed";
+      cell_id: string;
+      version?: string;
+      state?: CellState;
+      rows?: number;
+      error?: string;
+      cached?: boolean;
     }
-  | { type: "version_added"; cell_id: string; parent_id: string; position: number }
-  | { type: "dataset_updated"; changed: Record<string, string | null> };
+  | { type: "dataset_changed" };
 
 /** The query that produced a traces selection, not the ids it matched. */
 export interface TraceSelectionSpec {
@@ -90,7 +88,8 @@ export interface TraceSelectionSpec {
 export function traceSelectionBody(selection: TraceSelectionSpec) {
   const filters: Record<string, string> = {};
   for (const [key, value] of Object.entries(selection.filters ?? {})) {
-    if (value !== undefined && value !== "") filters[key] = value;
+    // The table's span display mode is not a dataset selection predicate.
+    if (key !== "all_spans" && value !== undefined && value !== "") filters[key] = value;
   }
   return {
     exclude_trace_ids: selection.excludeTraceIds ?? [],
@@ -102,9 +101,10 @@ export function traceSelectionBody(selection: TraceSelectionSpec) {
 }
 
 export const INTENT_LABEL: Record<string, string> = {
-  eval: "Evaluation",
-  pending: "Not set",
-  train: "Training",
+  eval: "Eval",
+  explore: "Data exploration",
+  pending: "Pending",
+  train: "Train",
 };
 
 export const intentOf = (dataset: Dataset | null | undefined): Intent =>
@@ -114,7 +114,9 @@ export const cellsOf = (dataset: Dataset | null | undefined): Cell[] =>
   Array.isArray(dataset?.cells) ? (dataset.cells as Cell[]) : [];
 
 export const isVisibleDatasetColumn = (column: { name: string }): boolean =>
-  column.name !== "source_row" && !column.name.startsWith("_overmind_");
+  column.name !== "source_row" &&
+  column.name !== "_overmind_provenance" &&
+  column.name !== "_overmind_document_id";
 
 export const columnsOf = (cell: Cell | null | undefined): ColumnInfo[] =>
   Array.isArray(cell?.columns) ? (cell.columns as ColumnInfo[]).filter(isVisibleDatasetColumn) : [];
@@ -127,14 +129,17 @@ export const fitOf = (cell: Cell | null | undefined): { ok: boolean; reason: str
 export const rankOf = (dataset: Dataset | null | undefined): CapabilityRank[] =>
   Array.isArray(dataset?.capabilityRank) ? (dataset.capabilityRank as CapabilityRank[]) : [];
 
-export const activeCellOf = (dataset: Dataset | null | undefined): Cell | null =>
-  cellsOf(dataset).find((c) => c.id === dataset?.active) ?? null;
+export const activeCellOf = (dataset: Dataset | null | undefined): Cell | null => {
+  const ran = cellsOf(dataset).filter((c) => c.state === "ok" && c.fingerprint);
+  if (dataset?.active) {
+    const chosen = ran.find((c) => c.id === dataset.active);
+    if (chosen) return chosen;
+  }
+  return ran.at(-1) ?? null;
+};
 
-export const isBusy = (ds: Dataset | null | undefined): boolean => ds?.state === "landing";
-
-/** The import failed or was stopped, so the dataset has no source. */
-export const importEnded = (ds: Pick<Dataset, "state">): boolean =>
-  ds.state === "error" || ds.state === "stopped";
+export const isBusy = (ds: Dataset | null | undefined): boolean =>
+  !!ds && (ds.state === "running" || ds.state === "landing");
 
 /** The used-version block consumers carry (`cell_info`). */
 export interface UsedVersionInfo {
@@ -164,20 +169,16 @@ const datasetKeys = {
   all: ["datasets"] as const,
   columns: (id: string, cell: string | undefined) => ["datasets", id, "columns", cell] as const,
   detail: (id: string) => ["datasets", "detail", id] as const,
-  executions: (id: string) => ["datasets", id, "executions"] as const,
-  inventory: (projectId: string | undefined) =>
-    ["datasets", "list", projectId, "inventory"] as const,
   list: (projectId: string | undefined, filters: DatasetListFilters) =>
     ["datasets", "list", projectId, filters] as const,
-  preparePrompt: (id: string, cell: string) => ["datasets", id, "prepare-prompt", cell] as const,
   rows: (id: string, cell: string | undefined, params: RowsParams) =>
     ["datasets", id, "rows", cell, params] as const,
+  usage: (id: string, cell: string) => ["datasets", id, "usage", cell] as const,
 };
 
 export function invalidateDataset(qc: ReturnType<typeof useQueryClient>, id?: string) {
   if (id) void qc.invalidateQueries({ queryKey: ["datasets", id] });
   if (id) void qc.invalidateQueries({ queryKey: datasetKeys.detail(id) });
-  if (id) void qc.invalidateQueries({ queryKey: ["dataset", id] });
   void qc.invalidateQueries({ queryKey: ["datasets", "list"] });
   void qc.invalidateQueries({ queryKey: ["capability-detail"] });
 }
@@ -189,6 +190,14 @@ export interface DatasetListFilters {
   ordering?: string;
   page?: number;
   pageSize?: number;
+}
+
+export function useDatasetPreparationQuery(datasetId: string, cell?: string, revision?: number) {
+  return useQuery({
+    queryFn: () => apiClient.datasets.datasetsPreparationRetrieve({ cell, id: datasetId }),
+    // Dataset polling must refresh the graph even when a completion event was missed.
+    queryKey: ["datasets", datasetId, "preparation", cell, revision],
+  });
 }
 
 export function useDatasetsQuery(projectId: string | undefined, filters: DatasetListFilters = {}) {
@@ -209,66 +218,48 @@ export function useDatasetsQuery(projectId: string | undefined, filters: Dataset
   });
 }
 
-/** Every dataset of a project, all pages. A row that moves between pages while
- *  they are read is kept once. */
-export async function fetchProjectDatasets(
-  projectId: string,
-  signal?: AbortSignal
-): Promise<Dataset[]> {
-  const byId = new Map<string, Dataset>();
-  let page = 1;
-  let more = true;
-  while (more) {
+export async function fetchProjectDatasets(projectId: string, signal?: AbortSignal) {
+  const datasets = new Map<string, Dataset>();
+  for (let page = 1; ; page += 1) {
     const result = await apiClient.datasets.datasetsList(
       { page, pageSize: 100, project: projectId },
       { signal }
     );
-    for (const dataset of result.results) byId.set(dataset.id, dataset);
-    more = !!result.next;
-    page += 1;
+    for (const dataset of result.results) datasets.set(dataset.id, dataset);
+    if (!result.next) return [...datasets.values()];
   }
-  return [...byId.values()];
 }
 
-export function useDatasetInventoryQuery(projectId: string | undefined) {
-  return useQuery<Dataset[]>({
+export function useProjectDatasetsQuery(projectId: string | undefined) {
+  return useQuery({
     enabled: !!projectId,
     queryFn: ({ signal }) => fetchProjectDatasets(projectId!, signal),
-    queryKey: datasetKeys.inventory(projectId),
-    refetchInterval: (query) =>
-      query.state.data?.some((ds) => isBusy(ds) || (ds.running ?? 0) > 0) ? 3000 : 15000,
+    queryKey: ["datasets", "list", projectId, "inventory"],
+    refetchInterval: (query) => (query.state.data?.some(isBusy) ? 3000 : 15000),
   });
 }
 
-const working = (ds: Dataset | undefined) => isBusy(ds) || (ds?.running ?? 0) > 0;
-
+/** Polls while the dataset is busy; the SSE stream fills the gaps. */
 export function useDatasetQuery(id: string | undefined) {
   return useQuery<Dataset>({
     enabled: !!id,
     placeholderData: keepPreviousData,
     queryFn: () => apiClient.datasets.datasetsRetrieve({ id: id! }),
     queryKey: datasetKeys.detail(id ?? ""),
-    refetchInterval: (query) => (working(query.state.data) ? 3000 : false),
-  });
-}
-
-export function useDatasetExecutionsQuery(id: string, enabled: boolean) {
-  return useQuery<Execution[]>({
-    enabled,
-    queryFn: () => apiClient.datasets.datasetsExecutionsList({ id, limit: 20 }),
-    queryKey: datasetKeys.executions(id),
-    refetchInterval: (query) =>
-      query.state.data?.some((run) => run.state === "queued" || run.state === "running")
-        ? 3000
-        : false,
+    refetchInterval: (query) => (isBusy(query.state.data) ? 3000 : false),
   });
 }
 
 /** Raw fetch: rows carry user column names as keys, which the generated client
  *  would camelize. */
-export function useRowsQuery(id: string | undefined, cell: string | undefined, params: RowsParams) {
+export function useRowsQuery(
+  id: string | undefined,
+  cell: string | undefined,
+  params: RowsParams,
+  enabled = true
+) {
   return useQuery<RowsPage>({
-    enabled: !!id,
+    enabled: !!id && enabled,
     placeholderData: keepPreviousData,
     queryFn: async () => {
       const search = new URLSearchParams({
@@ -293,9 +284,9 @@ export function useRowsQuery(id: string | undefined, cell: string | undefined, p
   });
 }
 
-export function useColumnsQuery(id: string | undefined, cell: string | undefined) {
+export function useColumnsQuery(id: string | undefined, cell: string | undefined, enabled = true) {
   return useQuery<ColumnStat[]>({
-    enabled: !!id,
+    enabled: !!id && enabled,
     queryFn: () => apiClient.datasets.datasetsColumnsList({ cell, id: id! }),
     queryKey: datasetKeys.columns(id ?? "", cell),
     retry: false,
@@ -305,9 +296,10 @@ export function useColumnsQuery(id: string | undefined, cell: string | undefined
 export interface CreateDatasetInput {
   projectId: string;
   name: string;
-  intent: Intent;
+  brief?: string;
+  intent?: Intent;
   capabilityId?: string | null;
-  source: SourceRequest;
+  source?: SourceRequest;
 }
 
 export function useCreateDatasetMutation() {
@@ -316,6 +308,7 @@ export function useCreateDatasetMutation() {
     mutationFn: (input: CreateDatasetInput) =>
       apiClient.datasets.datasetsCreate({
         datasetCreateRequest: {
+          brief: input.brief,
           capability: input.capabilityId,
           intent: input.intent,
           name: input.name,
@@ -332,6 +325,7 @@ export type SplitPosition = PositionEnum;
 export interface CreateDatasetSplitInput {
   projectId: string;
   name: string;
+  brief?: string;
   capabilityId?: string | null;
   source: SourceRequest;
   evalPercent: number;
@@ -348,6 +342,7 @@ export function useCreateDatasetSplitMutation() {
     mutationFn: (input) =>
       apiClient.datasets.datasetsSplitCreate({
         datasetSplitCreateRequest: {
+          brief: input.brief,
           capability: input.capabilityId,
           deduplicate: input.deduplicate,
           evalPercent: input.evalPercent,
@@ -363,12 +358,21 @@ export function useCreateDatasetSplitMutation() {
   });
 }
 
+export function useAttachDatasetSourceMutation(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (sourceRequest: SourceRequest) =>
+      apiClient.datasets.datasetsSourceCreate({ id, sourceRequest }),
+    onError: (err) => notify.error(err, "Couldn't attach the source"),
+    onSuccess: () => invalidateDataset(qc, id),
+  });
+}
+
 export interface DatasetPatch {
   name?: string;
   capability?: string | null;
   intent?: Intent;
   active?: string | null;
-  expectedActive?: string;
 }
 
 export function usePatchDatasetMutation(id: string) {
@@ -386,67 +390,8 @@ export function useDeleteDatasetMutation() {
   return useMutation({
     mutationFn: (id: string) => apiClient.datasets.datasetsDestroy({ id }),
     onError: (e) => notify.error(e, "Couldn't delete dataset"),
-    onSuccess: (_, id) => {
-      qc.removeQueries({ queryKey: datasetKeys.detail(id) });
-      invalidateDataset(qc);
-    },
+    onSuccess: () => invalidateDataset(qc),
   });
-}
-
-export function useResumeImportMutation(id: string) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: () => apiClient.datasets.datasetsResumeImportCreate({ id }),
-    onError: (e) => notify.error(e, "Couldn't retry the import"),
-    onSuccess: () => invalidateDataset(qc, id),
-  });
-}
-
-export function useCancelImportMutation(id: string) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: () => apiClient.datasets.datasetsCancelImportCreate({ id }),
-    onError: (e) => notify.error(e, "Couldn't cancel the import"),
-    onSuccess: () => invalidateDataset(qc, id),
-  });
-}
-
-export function useCancelExecutionMutation(id: string) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (executionId: string) =>
-      apiClient.datasets.datasetsExecutionsCancelCreate({ executionId, id }),
-    onError: (e) => notify.error(e, "Couldn't cancel the run"),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: datasetKeys.executions(id) });
-      invalidateDataset(qc, id);
-    },
-  });
-}
-
-/** The prepare-dataset MCP prompt filled with this project, dataset and version. */
-export function usePreparePromptQuery(id: string, cell: string, enabled: boolean) {
-  return useQuery({
-    enabled,
-    queryFn: async () =>
-      (await apiClient.datasets.datasetsPreparePromptRetrieve({ cell, id })).prompt,
-    queryKey: datasetKeys.preparePrompt(id, cell),
-  });
-}
-
-export async function downloadAttachment(id: string, cell: string, filename: string) {
-  saveBlob(await apiClient.datasets.datasetsAttachmentRetrieve({ cell, id }), filename);
-}
-
-function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 export async function downloadExport(
@@ -462,7 +407,13 @@ export async function downloadExport(
     const detail = (await res.json().catch(() => null))?.detail;
     throw new Error(typeof detail === "string" ? detail : `Export failed (HTTP ${res.status}).`);
   }
-  saveBlob(await res.blob(), `${filename}.${fmt}`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${filename}.${fmt}`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 /** Fetch-based SSE (EventSource cannot send an Authorization header). Replays the
@@ -503,8 +454,6 @@ export function useDatasetEvents(
         const res = await fetchWithAuth(`/api/datasets/${datasetId}/events/`, {
           signal: controller.signal,
         });
-        // A deleted dataset or a lost permission will not come back on a retry.
-        if (res.status === 403 || res.status === 404) return;
         if (!res.ok || !res.body) throw new Error(`events ${res.status}`);
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -530,3 +479,21 @@ export function useDatasetEvents(
     };
   }, [datasetId]);
 }
+
+export const useCancelDatasetMutation = (id: string) => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiClient.datasets.datasetsCancelCreate({ id }),
+    onError: (error) => notify.error(error, "Cancellation request failed"),
+    onSuccess: () => invalidateDataset(qc, id),
+  });
+};
+
+export const useResumeDatasetImportMutation = (id: string) => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiClient.datasets.datasetsResumeImportCreate({ id }),
+    onError: (error) => notify.error(error, "Import recovery failed"),
+    onSuccess: () => invalidateDataset(qc, id),
+  });
+};

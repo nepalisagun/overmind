@@ -20,16 +20,12 @@ export interface StatusMeta {
  * status surface reads too.
  */
 const STATUS_FACE: Record<string, { icon: React.ReactNode; label: string; spinning?: boolean }> = {
+  awaiting_launch: { icon: <Icon.job className="size-3.5" />, label: "Awaiting launch" },
   cancelled: { icon: <Icon.failed className="size-3.5" />, label: "Cancelled" },
   completed: { icon: <Icon.success className="size-3.5" />, label: "Completed" },
   deploying: {
     icon: <Spinner className="text-current" size="sm" />,
     label: "Deploying",
-    spinning: true,
-  },
-  evaluating: {
-    icon: <Spinner className="text-current" size="sm" />,
-    label: "Evaluating",
     spinning: true,
   },
   failed: { icon: <Icon.failed className="size-3.5" />, label: "Failed" },
@@ -42,6 +38,11 @@ const STATUS_FACE: Record<string, { icon: React.ReactNode; label: string; spinni
   preparing: {
     icon: <Spinner className="text-current" size="sm" />,
     label: "Preparing",
+    spinning: true,
+  },
+  preprocessing: {
+    icon: <Spinner className="text-current" size="sm" />,
+    label: "Preparing data",
     spinning: true,
   },
   queued: { icon: <Icon.job className="size-3.5" />, label: "Queued" },
@@ -71,8 +72,7 @@ export function resolveStatus(status: string | null | undefined, fallback: strin
 }
 
 /**
- * In-progress uses inverted surface tokens, not a pinned white fill, which
- * vanishes into the cream canvas in light mode. h-7 matches Button size=sm.
+ * h-7 matches Button size=sm.
  */
 export function statusBadgeClassName(cfg: StatusMeta, solidProgress?: boolean): string {
   return cn(
@@ -108,12 +108,14 @@ export function StatusBadge({
 
 export function ResolvedStatusBadge({
   cfg,
+  label,
   icon = cfg.icon,
   solidProgress = false,
   progress,
   className,
 }: {
   cfg: StatusMeta;
+  label?: string;
   icon?: React.ReactNode;
   solidProgress?: boolean;
   progress?: number | null;
@@ -126,7 +128,7 @@ export function ResolvedStatusBadge({
       aria-label={
         normalizedProgress == null
           ? undefined
-          : `${cfg.label}, ${Math.round(normalizedProgress)}% complete`
+          : `${label ?? cfg.label}, ${Math.round(normalizedProgress)}% complete`
       }
       aria-valuemax={normalizedProgress == null ? undefined : 100}
       aria-valuemin={normalizedProgress == null ? undefined : 0}
@@ -149,7 +151,7 @@ export function ResolvedStatusBadge({
       )}
       <span className="relative z-10 inline-flex items-center gap-1">
         {icon}
-        <span>{cfg.label}</span>
+        <span>{label ?? cfg.label}</span>
         {normalizedProgress != null && (
           <span className="font-mono tabular-nums">{Math.round(normalizedProgress)}%</span>
         )}

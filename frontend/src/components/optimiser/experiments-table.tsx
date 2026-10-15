@@ -37,7 +37,7 @@ import { clearUnseenCompletion, useUnseenCompletionKeys } from "@/lib/unseen-job
 import type { OptimizerExperiment } from "@/openapi";
 import { OptimizerExperimentStatusEnum } from "@/openapi";
 
-type SortKey = "capability" | "status" | "dataset" | "score" | "created";
+type SortKey = "type" | "capability" | "status" | "dataset" | "score" | "created";
 
 function ScoreCell({
   baseline,
@@ -143,6 +143,7 @@ export function ExperimentsTable({
     const sort = parseDrfOrdering(ordering || undefined);
     const requestedKey = sort?.field;
     const key: SortKey =
+      requestedKey === "type" ||
       requestedKey === "capability" ||
       requestedKey === "status" ||
       requestedKey === "dataset" ||
@@ -154,6 +155,11 @@ export function ExperimentsTable({
     return [...filtered].sort((a, b) => {
       let cmp = 0;
       switch (key) {
+        case "type":
+          cmp = optimizerRunTypeMeta(optimizerRunType(a)).label.localeCompare(
+            optimizerRunTypeMeta(optimizerRunType(b)).label
+          );
+          break;
         case "capability":
           cmp = a.capabilityName.localeCompare(b.capabilityName);
           break;
@@ -213,7 +219,7 @@ export function ExperimentsTable({
       ),
       header: "Run type",
       id: "mode",
-      meta: { noTruncate: true },
+      meta: { noTruncate: true, orderingField: "type" },
       minSize: 130,
       size: 148,
     },

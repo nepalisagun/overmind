@@ -7,12 +7,15 @@ Capability classification is cached by codebase context. Benchmark ranking is pu
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
+from modal_shared.decisions import DECISION_OBJECTIVES
 from overbae.core.errors import InputValidationError
 from overbae.services.serving_context import evaluation_budget, serving_plan
+from overbae.services.training_contract import dataset_objective, validate_effective_batch
 
-from .analysis import build_analysis
+from .analysis import build_analysis, dataset_summary
 from .candidates import build_candidate, dataset_total_tokens
 from .catalog import MODEL_MIN_BATCH, active_backend, find_catalog_model, tier_models
 
@@ -25,11 +28,11 @@ def get_recommendation(
     dataset_id: str,
     capability_id: str | None = None,
     *,
-    cell: Any = None,
-    eval_cell: Any = None,
+    eval_dataset_id: str | None = None,
+    cell=None,
+    eval_cell=None,
 ) -> dict[str, Any]:
-    """Ranked fine-tuning candidates for a dataset version (the active one by default),
-    grounded in its capability's context and sized for ``eval_cell`` when given.
+    """Ranked fine-tuning candidates for a dataset, grounded in its capability's context.
 
     Without ``capability_id`` classify the dataset, even if it has a capability mapping.
     """
@@ -45,21 +48,37 @@ def get_recommendation(
         capability = Capability.objects.get(pk=capability_id, project_id=dataset.project_id)
 
     stats = dataset_stats(dataset, cell)
+    native = dataset_objective(cell or dataset.active_cell) in DECISION_OBJECTIVES
     if capability is not None:
         task_type = classify_capability_task(capability)
         source = "capability" if task_type != "unknown" else "unknown"
     else:
-        task_type, source = _resolve_task_type(dataset, stats)
+        task_type, source = _resolve_task_type(dataset, stats, native=native)
+    capability_context = collect_capability_context(capability) if capability is not None else None
+    if native:
+        return {
+            "task_type": task_type,
+            "task_type_source": source,
+            "dataset": dataset_summary(stats),
+            "candidates": [],
+            "excluded": [],
+            "shown": [],
+            "skill_weights": {},
+            "benchmark_snapshot": {"generated_at": None},
+            "capability_context": capability_context,
+        }
     analysis = build_analysis(
         stats,
         task_type=task_type,
         task_type_source=source,
-        capability_context=collect_capability_context(capability)
-        if capability is not None
-        else None,
+        capability_context=capability_context,
     )
-    if eval_cell is not None:
-        budget = evaluation_budget(eval_cell, capability=capability)
+    if eval_dataset_id:
+        evaluation = Dataset.objects.get(pk=eval_dataset_id, project_id=dataset.project_id)
+        cell = eval_cell or evaluation.active_cell
+        if cell is None:
+            raise InputValidationError("The evaluation dataset has no readable version.")
+        budget = evaluation_budget(cell, capability=capability)
         accepted = []
         for candidate in analysis["candidates"]:
             try:
@@ -83,6 +102,11 @@ def estimate_for_hyperparams(
     n_epochs: int,
     use_lora: bool,
     cell: Any = None,
+    validation_cell=None,
+    validation_enabled=True,
+    validation_split_ratio=0.2,
+    split_method="random",
+    hyperparameters=None,
 ) -> dict[str, Any]:
     """Re-estimate cost and duration for user-edited hyperparameters."""
     from overbae.modal.model_registry import context_headroom  # noqa: PLC0415
@@ -95,8 +119,12 @@ def estimate_for_hyperparams(
     from overbae.services.finetuning_pricing import estimate_training_run  # noqa: PLC0415
 
     dataset = Dataset.objects.get(pk=dataset_id)
+    if active_backend() in {"modal", "baseten"}:
+        validate_effective_batch(hyperparameters or {})
     stats = dataset_stats(dataset, cell)
-    entry = find_catalog_model(base_model)
+    selected = cell or dataset.active_cell
+    native = selected is not None and dataset_objective(selected) in DECISION_OBJECTIVES
+    entry = find_catalog_model(base_model, decision=native)
     if entry is None:
         raise ValueError(f"Unknown base model: {base_model}")
     params_b = entry.get("total_params_b")
@@ -106,6 +134,13 @@ def estimate_for_hyperparams(
     kind_label = "LoRA" if use_lora else "full"
     if not training_enabled(entry, kind):
         raise ValueError(f"Model {base_model} does not support {kind_label} fine-tuning")
+    requested_context = (hyperparameters or {}).get("context_length")
+    if active_backend() in {"modal", "baseten"} and requested_context is not None:
+        from overbae.services.finetuning_policy import validate_requested_context_length
+
+        validate_requested_context_length(
+            requested_context, model_max=training_context_length(entry, kind)
+        )
     max_tokens = int(stats.get("max_token_length") or 0)
     if max_tokens and active_backend() != "modal":
         model_max = training_context_length(entry, kind)
@@ -117,8 +152,52 @@ def estimate_for_hyperparams(
                 + (f" (need {max_tokens + headroom:,} with headroom)" if headroom else "")
                 + "."
             )
+    from overbae.services.finetuning_validator import validate_dataset
+
+    checked = validate_dataset(
+        str(dataset.id),
+        cell_id=str(selected.id),
+        validation_cell_id=str(validation_cell.id) if validation_cell else None,
+        validation_dataset_id=str(validation_cell.dataset_id) if validation_cell else None,
+        validation_enabled=validation_enabled,
+        validation_split_ratio=validation_split_ratio,
+        split_method=split_method,
+    )
+    if not checked.valid:
+        raise ValueError("The selected training split is not technically compatible.")
+    count = checked.stats.get("train_examples", selected.rows)
+    selected_tokens = round(dataset_total_tokens(stats) * count / max(1, selected.rows))
+
+    if active_backend() == "modal" and native:
+        from overbae.services.training_forecast import forecast
+
+        recipe = {**(hyperparameters or {}), "objective": dataset_objective(selected)}
+        tokens = selected_tokens * int(recipe.get("n_epochs", n_epochs))
+        measured = forecast(dataset.project_id, base_model, recipe, tokens=tokens, stats=stats)
+        measured["token_estimate"] = "proportional_to_selected_rows"
+        measured["selected_training_rows"] = count
+        duration = measured["training_seconds"]
+        cost = measured["training_gpu_usd"]
+        return {
+            "forecast": measured,
+            "cost_estimate": {
+                "usd": cost[1],
+                "price_per_million_usd": None,
+                "trained_tokens": tokens,
+                "minimum_applied": False,
+            }
+            if cost
+            else None,
+            "time_estimate": {
+                "seconds": None,
+                "human": f"{math.floor(duration[0] / 60)}–{math.ceil(duration[1] / 60)} min"
+                if duration
+                else "Unmeasured recipe",
+            },
+            "trained_tokens": tokens,
+        }
     return estimate_training_run(
-        dataset_tokens=dataset_total_tokens(stats),
+        dataset_tokens=selected_tokens,
         n_epochs=n_epochs,
         total_params_b=float(params_b),
         use_lora=use_lora,
@@ -137,7 +216,9 @@ def recommend_hyperparams_for_model(
 
     dataset = Dataset.objects.get(pk=dataset_id)
     stats = dataset_stats(dataset, cell)
-    entry = find_catalog_model(base_model)
+    selected = cell or dataset.active_cell
+    native = selected is not None and dataset_objective(selected) in DECISION_OBJECTIVES
+    entry = find_catalog_model(base_model, decision=native)
     if entry is None:
         raise ValueError(f"Unknown base model: {base_model}")
     max_tokens = int(stats.get("max_token_length") or 0)
@@ -157,7 +238,7 @@ def recommend_hyperparams_for_model(
     tier = next(
         (
             t
-            for t, models in tier_models().items()
+            for t, models in tier_models(backend="decision" if native else None).items()
             if any(m.get("id") == base_model for m in models)
         ),
         "small",
@@ -165,7 +246,7 @@ def recommend_hyperparams_for_model(
     return build_candidate(stats, model_entry=entry, tier=tier)
 
 
-def _resolve_task_type(dataset, stats: dict[str, Any]) -> tuple[str, str]:
+def _resolve_task_type(dataset, stats: dict[str, Any], *, native: bool = False) -> tuple[str, str]:
     """The dataset's task type and where it came from.
 
     A dataset that went straight to the wizard has no context, so it is classified inline
@@ -174,12 +255,17 @@ def _resolve_task_type(dataset, stats: dict[str, Any]) -> tuple[str, str]:
     from overbae.models import DatasetContext  # noqa: PLC0415
     from overbae.services.benchmarks.classify import classify_task_type  # noqa: PLC0415
     from overbae.services.benchmarks.taxonomy import TaskType  # noqa: PLC0415
-    from overbae.services.eval.context_extractor import enqueue_refresh  # noqa: PLC0415
+    from overbae.services.datasets.profiler import enqueue_refresh  # noqa: PLC0415
 
     context = DatasetContext.objects.filter(dataset=dataset).first()
+    # Chat-output shape cannot establish the semantic task of typed decision rows.
+    if native and (context is None or context.task_type_source != "semantic"):
+        return "unknown", "unknown"
     if context is not None:
         if context.task_type in set(TaskType.values):
             return context.task_type, context.task_type_source or "heuristic"
+        if native:
+            return "unknown", "unknown"
         profile = context.profile or {}
         if not _carries_classifier_inputs(profile):
             profile = _profile(dataset)
@@ -198,7 +284,7 @@ def _carries_classifier_inputs(profile: dict[str, Any]) -> bool:
 def _profile(dataset) -> dict[str, Any]:
     """Profiling reads datapoints and their spans; a failure degrades the task type rather
     than the wizard."""
-    from overbae.services.eval import profiler  # noqa: PLC0415
+    from overbae.services.datasets import profiler  # noqa: PLC0415
 
     try:
         return profiler.profile_dataset(dataset)

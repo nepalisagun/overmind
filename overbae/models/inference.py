@@ -45,6 +45,10 @@ class DeployedModel(models.Model):
     )
     # Slug used in vLLM --served-model-name, e.g. "ft-llama31-abc12345"
     model_id = models.CharField(max_length=200, unique=True, db_index=True)
+    inference_contract = models.CharField(
+        max_length=16, choices=[("chat", "Chat"), ("decision", "Decision")], default="chat"
+    )
+    serving_runtime = models.JSONField(default=dict, blank=True)
     status = models.CharField(
         max_length=20,
         choices=Status.choices,

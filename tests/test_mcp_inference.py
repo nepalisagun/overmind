@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from django.core.cache import cache
@@ -11,12 +13,21 @@ from rest_framework.test import APIClient
 from starlette.testclient import TestClient
 
 from modal_shared.context_budget import DEFAULT_OUTPUT_TOKENS
-from overbae.models import APIToken, DeployedModel, InferenceCall, Project, ProjectMembership, User
+from overbae.models import (
+    APIToken,
+    Capability,
+    DeployedModel,
+    InferenceCall,
+    InferenceRequest,
+    ModelActivation,
+    Project,
+    ProjectMembership,
+    User,
+)
+from overbae.services import inference_live, inference_requests
 from overbae.services.mcp.server import create_mcp_application
 
 pytestmark = pytest.mark.django_db(transaction=True)
-
-INFERENCE = "http://inference.test"
 
 
 @pytest.fixture
@@ -53,6 +64,7 @@ def infer(serving, **overrides):
             "name": "run_inference",
             "arguments": {
                 "deployment": str(serving.model.pk),
+                "request_key": "test-" + uuid.uuid4().hex,
                 "messages": [{"role": "user", "content": "Hello"}],
                 **overrides,
             },
@@ -63,16 +75,90 @@ def infer(serving, **overrides):
     return result
 
 
-def budgets(fake_llm) -> list[int]:
-    return [r.body["max_tokens"] for r in fake_llm.requests if r.url.startswith(INFERENCE)]
+def provider_response(content="Hello", finish_reason="stop"):
+    return Mock(
+        ok=True,
+        json=lambda: {
+            "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 12, "total_tokens": 20},
+        },
+    )
+
+
+def test_decision_rest_and_mcp_share_typed_durable_inference(serving, fake_modal):
+    model = serving.model
+    model.inference_contract = "decision"
+    model.serving_runtime = {"app": "decision-test", "environment": "test"}
+    model.checkpoint_hash = "a" * 64
+    model.save()
+    decision = {
+        "state": "passenger",
+        "question": "Survived?",
+        "kind": "choice",
+        "options": ["No", "Yes"],
+    }
+    payload = {"request_key": "native", "decisions": [decision]}
+    api = APIClient()
+    api.force_authenticate(user=serving.user, token=serving.token)
+    response = api.post(f"/api/deployed-models/{model.pk}/inference/", payload, format="json")
+    assert response.status_code == 202, response.data
+    receipt = InferenceRequest.objects.get(pk=response.data["id"])
+    assert receipt.payload["serving_app"] == "decision-test"
+    assert "max_tokens" not in receipt.payload
+    result = rpc(
+        serving,
+        "tools/call",
+        {"name": "run_inference", "arguments": {"deployment": str(model.pk), **payload}},
+    )["result"]
+    assert not result.get("isError"), result
+    assert result["structuredContent"]["job"]["id"] == str(receipt.pk)
+    predictions = [{"options": ["No", "Yes"], "probabilities": [0.2, 0.8]}]
+    fake_modal.deploy(
+        "decision-test",
+        "inference_request",
+        lambda request_id, payload: {
+            "predictions": predictions,
+            "model_identity": "a" * 64,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0},
+            "finish_reason": "stop",
+            "latency_ms": 12,
+        },
+    )
+    inference_requests.advance(receipt.pk)
+    inference_requests.advance(receipt.pk)
+    response = api.get(f"/api/inference-requests/{receipt.pk}/")
+    assert response.status_code == 200
+    assert response.data["status"] == "succeeded"
+    assert response.data["result"]["predictions"] == predictions
+    assert InferenceCall.objects.filter(pk=receipt.pk).count() == 1
+    bad = api.post(
+        f"/api/deployed-models/{model.pk}/inference/",
+        {**payload, "decisions": [{**decision, "target_probabilities": [0, 1]}]},
+        format="json",
+    )
+    assert bad.status_code == 400
+    assert infer(serving)["isError"]
+    other = Project.objects.create(name="Other decision project", slug="other-decision")
+    DeployedModel.objects.filter(pk=model.pk).update(project=other)
+    InferenceRequest.objects.filter(pk=receipt.pk).update(project=other)
+    assert api.get(f"/api/inference-requests/{receipt.pk}/").status_code == 404
+    assert (
+        api.post(f"/api/deployed-models/{model.pk}/inference/", payload, format="json").status_code
+        == 404
+    )
 
 
 @pytest.mark.parametrize(
     "budget", [{}, {"max_tokens": None}, {"max_tokens": 4096}, {"max_tokens": 12000}]
 )
-def test_mcp_and_production_preserve_the_same_output_reservation(serving, fake_llm, budget):
+def test_mcp_and_production_preserve_the_same_output_reservation(serving, monkeypatch, budget):
+    post = Mock(side_effect=lambda *args, **kwargs: provider_response())
+    monkeypatch.setattr("overbae.services.inference_client.requests.post", post)
     result = infer(serving, **budget)
     assert not result.get("isError"), result
+    request = InferenceRequest.objects.get(pk=result["structuredContent"]["job"]["id"])
+    mcp_budget = request.payload["max_tokens"]
+    post.assert_not_called()
 
     api = APIClient()
     api.force_authenticate(user=serving.user, token=serving.token)
@@ -86,40 +172,70 @@ def test_mcp_and_production_preserve_the_same_output_reservation(serving, fake_l
         format="json",
     )
     assert response.status_code == 200, response.data
-    mcp_budget, api_budget = budgets(fake_llm)
-    assert mcp_budget == api_budget == (budget.get("max_tokens") or DEFAULT_OUTPUT_TOKENS)
+    assert mcp_budget == post.call_args.kwargs["json"]["max_tokens"]
+    assert mcp_budget == (budget.get("max_tokens") or DEFAULT_OUTPUT_TOKENS)
+    assert post.call_count == 1
     assert (
-        InferenceCall.objects.filter(deployed_model=serving.model, outcome="succeeded").count() == 2
+        InferenceCall.objects.filter(deployed_model=serving.model, outcome="succeeded").count() == 1
     )
 
 
 @pytest.mark.parametrize("budget", [0, -1, True, "8192", 1.5])
-def test_mcp_rejects_invalid_output_reservations_before_inference(serving, fake_llm, budget):
+def test_mcp_rejects_invalid_output_reservations_before_inference(serving, monkeypatch, budget):
+    post = Mock()
+    monkeypatch.setattr("overbae.services.inference_client.requests.post", post)
     result = infer(serving, max_tokens=budget)
     assert result["isError"]
     assert result["structuredContent"]["error"]["code"] == "invalid_input"
-    assert budgets(fake_llm) == []
+    post.assert_not_called()
     assert not InferenceCall.objects.filter(deployed_model=serving.model).exists()
 
 
 def test_mcp_context_rejection_is_non_retryable_and_preserves_the_requested_budget(
-    serving, scripted
+    serving, monkeypatch
 ):
-    inference = scripted(INFERENCE).reply(
-        400, text="maximum context length exceeded; secret provider body"
+    post = Mock(
+        return_value=Mock(
+            ok=False, status_code=400, text="maximum context length exceeded; secret provider body"
+        )
     )
-    result = infer(serving, max_tokens=16384)
+    monkeypatch.setattr("overbae.services.inference_client.requests.post", post)
+    result = infer(
+        serving,
+        max_tokens=16000,
+        messages=[{"role": "user", "content": "context " * 1000}],
+    )
+    request_id = result["structuredContent"]["job"]["id"]
+    monkeypatch.setattr(inference_requests, "spawn", lambda request: "fc-test")
+    monkeypatch.setattr(
+        inference_requests,
+        "poll",
+        lambda call_id: ("complete", {"error_code": "context_length_exceeded"}),
+    )
+    inference_requests.advance(request_id)
+    inference_requests.advance(request_id)
+    job = rpc(
+        serving,
+        "tools/call",
+        {"name": "get_job", "arguments": {"kind": "inference_request", "id": request_id}},
+    )["result"]["structuredContent"]
+    assert job["status"] == "failed"
+    assert job["job_error"] == "context_length_exceeded"
+    assert job["details"]["retry_safe"] is False
+    assert "secret provider body" not in json.dumps(job)
+    assert InferenceRequest.objects.get(pk=request_id).payload["max_tokens"] == 16000
+
+
+@pytest.mark.parametrize("budget", [16384, 20000])
+def test_mcp_rejects_impossible_output_budget_without_waking_a_worker(serving, monkeypatch, budget):
+    post = Mock()
+    monkeypatch.setattr("overbae.services.inference_client.requests.post", post)
+    result = infer(serving, max_tokens=budget)
     assert result["isError"]
     error = result["structuredContent"]["error"]
     assert error["code"] == "context_length_exceeded"
     assert error["retryable"] is False
-    assert "reserved output" in error["message"]
-    assert "secret provider body" not in json.dumps(result)
-    [call] = inference.calls
-    assert call.json["max_tokens"] == 16384
-    call = InferenceCall.objects.get(deployed_model=serving.model)
-    assert call.outcome == "failed"
-    assert call.error_code == "context_length_exceeded"
+    post.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -130,15 +246,31 @@ def test_mcp_context_rejection_is_non_retryable_and_preserves_the_requested_budg
     ],
 )
 def test_large_budgets_keep_generation_truncation_separate_from_response_clipping(
-    serving, fake_llm, content, finish_reason, truncated, clipped
+    serving, monkeypatch, content, finish_reason, truncated, clipped
 ):
-    fake_llm.on(
-        lambda r: r.url.startswith(INFERENCE),
-        {"content": content, "finish_reason": finish_reason},
+    monkeypatch.setattr(
+        "overbae.services.inference_client.requests.post",
+        Mock(return_value=provider_response(content, finish_reason)),
     )
     result = infer(serving, max_tokens=12000)
     assert not result.get("isError"), result
-    output = result["structuredContent"]
+    request_id = result["structuredContent"]["job"]["id"]
+    monkeypatch.setattr(inference_requests, "spawn", lambda request: "fc-test")
+    monkeypatch.setattr(
+        inference_requests,
+        "poll",
+        lambda call_id: (
+            "complete",
+            {"content": content, "finish_reason": finish_reason, "latency_ms": 10},
+        ),
+    )
+    inference_requests.advance(request_id)
+    inference_requests.advance(request_id)
+    output = rpc(
+        serving,
+        "tools/call",
+        {"name": "get_job", "arguments": {"kind": "inference_request", "id": request_id}},
+    )["result"]["structuredContent"]["details"]["result"]
     assert output["finish_reason"] == finish_reason
     assert output["truncated"] is truncated
     assert output["content_clipped"] is clipped
@@ -157,7 +289,7 @@ def test_large_budgets_keep_generation_truncation_separate_from_response_clippin
     ],
 )
 def test_read_only_mcp_deployment_exposes_current_worker_state(
-    serving, fake_modal, runners, recent, warming, expected
+    serving, monkeypatch, runners, recent, warming, expected
 ):
     serving.key, _ = APIToken.create_for_user(
         serving.user, project=serving.project, permission=["read"]
@@ -168,11 +300,17 @@ def test_read_only_mcp_deployment_exposes_current_worker_state(
     serving.model.save()
     if recent:
         InferenceCall.objects.create(deployed_model=serving.model, project=serving.project)
-    fake_modal.worker_stats = (
-        RuntimeError("provider secret body")
-        if runners is None
-        else {"backlog": 0, "num_running_inputs": 0, "num_total_runners": runners}
+    stats = AsyncMock(
+        return_value={
+            "backlog": 0,
+            "num_running_inputs": 0,
+            "num_total_runners": runners,
+            "available": True,
+        }
     )
+    if runners is None:
+        stats.side_effect = RuntimeError("provider secret body")
+    monkeypatch.setattr(inference_live, "_bounded_worker_stats", stats)
     result = rpc(
         serving,
         "resources/read",
@@ -186,23 +324,60 @@ def test_read_only_mcp_deployment_exposes_current_worker_state(
     assert payload["worker"]["recently_active"] is recent
     assert payload["metrics"]["request_count"] == 0
     assert "provider secret" not in json.dumps(payload)
-    assert fake_modal.called("") == ["stats"]
+    assert stats.await_count == 1
 
 
-def test_worker_resource_checks_project_before_remote_measurements(serving, fake_modal):
+def test_worker_resource_checks_project_before_remote_measurements(serving, monkeypatch):
     foreign = Project.objects.create(name="Other", slug="other-serving")
     model = DeployedModel.objects.create(
         project=foreign, model_id="ft-foreign-serving", status="ready"
     )
-    model.gpu_type = "A100-80GB"
-    model.weights_path = "/weights/foreign"
-    model.save()
+    stats = AsyncMock()
+    monkeypatch.setattr(inference_live, "_bounded_worker_stats", stats)
     result = rpc(serving, "resources/read", {"uri": f"overmind://deployments/{model.pk}"})
     assert result["error"]["code"] == 404
-    assert fake_modal.log == []
+    stats.assert_not_awaited()
 
 
 def test_activation_metadata_declares_external_verification(serving):
     result = rpc(serving, "tools/list", {})["result"]
     tool = next(tool for tool in result["tools"] if tool["name"] == "set_active_model")
     assert tool["annotations"]["openWorldHint"] is True
+
+
+def test_job_poll_exposes_deployment_stage_and_status_change_time(serving):
+    now = timezone.now()
+    serving.model.status = "warming"
+    serving.model.status_changed_at = now
+    serving.model.deployment_stage = "warm"
+    serving.model.deployment_deadline = now + timedelta(hours=4)
+    serving.model.save()
+    result = rpc(
+        serving,
+        "tools/call",
+        {"name": "get_job", "arguments": {"kind": "deployment", "id": str(serving.model.id)}},
+    )["result"]["structuredContent"]
+    assert result["progress"]["stage"] == "warm"
+    assert result["progress"]["deadline"] == serving.model.deployment_deadline.isoformat()
+    assert result["updated_at"] == now.isoformat().replace("+00:00", "Z")
+
+
+def test_activation_poll_exposes_deadline_without_claiming_worker_progress(serving):
+    now = timezone.now()
+    capability = Capability.objects.create(project=serving.project, name="Test", slug="test")
+    activation = ModelActivation.objects.create(
+        capability=capability,
+        target=serving.model,
+        stage="verifying",
+        started_at=now,
+        next_poll_at=now + timedelta(seconds=15),
+        deadline=now + timedelta(minutes=50),
+    )
+    result = rpc(
+        serving,
+        "tools/call",
+        {"name": "get_job", "arguments": {"kind": "model_activation", "id": str(activation.id)}},
+    )["result"]["structuredContent"]
+    assert result["progress"]["deadline"] == activation.deadline.isoformat()
+    assert result["progress"]["next_poll_at"] == activation.next_poll_at.isoformat()
+    assert result["updated_at"] is None

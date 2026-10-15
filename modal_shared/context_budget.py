@@ -6,6 +6,10 @@ from typing import Any
 DEFAULT_OUTPUT_TOKENS = 8192
 CONTEXT_HEADROOM = 512
 INCOMPLETE_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+CONTEXT_BUDGET_MESSAGE = (
+    "The input and reserved output exceed the deployed context. "
+    "Reduce the request or redeploy with a larger serving context."
+)
 
 
 def is_context_limit_error(status: int, body: bytes | str | dict) -> bool:

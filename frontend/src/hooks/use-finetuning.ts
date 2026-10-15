@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/client";
+import type { FinetuningProgress } from "@/lib/finetuning-progress";
 import { notify } from "@/lib/notify";
 import { backoffPolling } from "@/lib/poll";
 import { isTerminalFinetuningStatus } from "@/lib/running-jobs";
@@ -14,11 +15,13 @@ import type {
 } from "@/openapi";
 
 export interface ValidateDatasetParams {
+  cellId?: string;
+  validationCellId?: string;
   datasetId: string;
   validationEnabled?: boolean;
   validationSplitRatio?: number;
   validationDatasetId?: string | null;
-  splitMethod?: string;
+  splitMethod?: DatasetValidateRequestRequest["splitMethod"];
 }
 
 export const useTrainingBenchmarksQuery = (projectId: string) =>
@@ -62,10 +65,23 @@ export function defaultFinetuneName({
 
 /** Derived from the cached data alone, so every observer of the key agrees. */
 export function finetuningJobsPollInterval(
-  results: Array<{ status: string }> | undefined
+  results:
+    | Array<{
+        status: string;
+        nativeEvaluation?: { state?: string; deletedAt?: Date | null } | null;
+      }>
+    | undefined
 ): number | false {
   if (!results) return 5_000;
-  return results.some((j) => !isTerminalFinetuningStatus(j.status)) ? 5_000 : false;
+  return results.some(
+    (j) =>
+      !isTerminalFinetuningStatus(j.status) ||
+      (j.nativeEvaluation?.state != null &&
+        !j.nativeEvaluation.deletedAt &&
+        !["completed", "failed", "submission_unknown"].includes(String(j.nativeEvaluation.state)))
+  )
+    ? 5_000
+    : false;
 }
 
 export const useFinetuningJobsQuery = (projectId: string | undefined) =>
@@ -82,6 +98,7 @@ export const useFinetuningJobsQuery = (projectId: string | undefined) =>
   });
 
 export interface FinetuningRunsQueryParams {
+  ordering?: import("@/openapi").FinetuningJobsRunsListOrderingEnum;
   projectId: string | undefined;
   page: number;
   pageSize: number;
@@ -91,10 +108,9 @@ export interface FinetuningRunsQueryParams {
   baseModel?: string;
 }
 
-/** Each run carries its complete job set, so per-run aggregates cover the whole
- *  run; `count` counts runs. Rows are always newest-first — the endpoint
- *  accepts `?ordering=` and ignores it, so none is sent. */
+/** Each page carries complete runs; sorting precedes pagination. */
 export const useFinetuningRunsQuery = ({
+  ordering,
   projectId,
   page,
   pageSize,
@@ -109,6 +125,7 @@ export const useFinetuningRunsQuery = ({
       apiClient.finetuningJobs.finetuningJobsRunsList({
         baseModel: baseModel || undefined,
         dataset: dataset || undefined,
+        ordering,
         page,
         pageSize,
         project: projectId,
@@ -117,6 +134,7 @@ export const useFinetuningRunsQuery = ({
       }),
     queryKey: [
       "finetuning-runs",
+      ordering ?? null,
       projectId,
       page,
       pageSize,
@@ -126,8 +144,9 @@ export const useFinetuningRunsQuery = ({
       baseModel || null,
     ],
     refetchInterval: (q) =>
-      backoffPolling(q, () =>
-        finetuningJobsPollInterval(q.state.data?.results.flatMap((r) => r.jobs))
+      backoffPolling(
+        q,
+        () => finetuningJobsPollInterval(q.state.data?.results.flatMap((r) => r.jobs)) || 10_000
       ),
   });
 
@@ -149,7 +168,7 @@ export const useFinetuningRunJobsQuery = (runId: string | undefined) =>
       });
       if (page.results.length > 0) return page.results;
       const job = await apiClient.finetuningJobs.finetuningJobsRetrieve({ id: runId! });
-      return [job as unknown as FinetuningJobList];
+      return [{ ...job, trainingContract: job.record?.contract } as unknown as FinetuningJobList];
     },
     queryKey: ["finetuning-run-jobs", runId],
     refetchInterval: (q) => backoffPolling(q, () => finetuningJobsPollInterval(q.state.data)),
@@ -249,8 +268,10 @@ export const useValidateDatasetMutation = () =>
         typeof params === "string"
           ? { datasetId: params }
           : {
+              cellId: params.cellId,
               datasetId: params.datasetId,
               splitMethod: params.splitMethod,
+              validationCellId: params.validationCellId,
               validationDatasetId: params.validationDatasetId,
               validationEnabled: params.validationEnabled,
               validationSplitRatio: params.validationSplitRatio,
@@ -387,10 +408,13 @@ export interface FinetuningCheckpointRow {
 }
 
 interface FinetuningProgressSnapshot {
+  diagnostics?: Record<string, unknown> | null;
+  preparation?: FinetuningProgress["preparation"];
   trained_steps?: number | null;
   total_steps?: number | null;
   percent?: number | null;
   eta_seconds?: number | null;
+  eta_range_seconds?: [number, number] | null;
   elapsed_seconds?: number | null;
   estimated_finish?: number | null;
   tokens_processed?: number | null;

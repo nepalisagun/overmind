@@ -15,7 +15,6 @@ from overbae.models import (
     Project,
     ProjectMembership,
     Span,
-    TaskExecution,
     User,
 )
 from overbae.services.mcp.catalog import CATALOG
@@ -50,13 +49,7 @@ def test_all_tools_return_structured_content_and_project_scoped_rows():
         end_time_ns=2,
         duration_ns=1,
         status_code=1,
-    )
-    TaskExecution.objects.create(
-        project=context.project,
-        capability=capability,
-        trace_id="b" * 32,
-        unit_span_id="tool-root",
-        status=TaskExecution.Status.COMPLETED,
+        eval_attributes={"score": 0.5, "trajectory": {"score": 0.8}},
     )
     eval_run = EvalRun.objects.create(project=context.project, name="Eval", dataset=dataset)
     finetune = FinetuningJob.objects.create(
@@ -70,10 +63,9 @@ def test_all_tools_return_structured_content_and_project_scoped_rows():
         ("inspect_capability_health", {"capability": "support", "days": 7}),
         ("query_failures", {"capability": "support"}),
         ("query_traces", {"capability": "support"}),
-        ("query_task_executions", {"capability": "support"}),
         ("get_job", {"kind": "eval_run", "id": str(eval_run.id)}),
         ("get_job", {"kind": "finetune", "id": str(finetune.id)}),
-        ("get_job", {"kind": "dataset_import", "id": str(dataset.id)}),
+        ("get_job", {"kind": "dataset_run", "id": str(dataset.id)}),
     ]
 
     async def invoke():
@@ -93,11 +85,12 @@ def test_all_tools_return_structured_content_and_project_scoped_rows():
     eval_job, finetune_job, dataset_job = (r.structuredContent for r in results[-3:])
 
     assert body["query_traces"]["traces"][0]["trace_id"] == "b" * 32
-    assert body["query_task_executions"]["task_executions"][0]["trace_id"] == "b" * 32
+    assert body["query_traces"]["traces"][0]["eval_score"] == 0.5
+    assert body["query_traces"]["traces"][0]["trajectory_score"] == 0.8
     assert eval_job["resource"]["uri"] == f"overmind://eval-runs/{eval_run.id}"
     assert finetune_job["resource"]["uri"] == f"overmind://finetunes/{finetune.id}"
-    assert dataset_job["resource"]["uri"] == f"overmind://jobs/dataset_import/{dataset.id}"
-    assert dataset_job["kind"] == "dataset_import"
+    assert dataset_job["resource"]["uri"] == f"overmind://jobs/dataset_run/{dataset.id}"
+    assert dataset_job["kind"] == "dataset_run"
     assert dataset_job["id"] == str(dataset.id)
 
 
@@ -111,6 +104,32 @@ def test_invalid_tool_input_is_safe_and_typed():
     assert result.isError is True
     assert result.structuredContent["error"]["code"] == "invalid_input"
     assert "ValidationError" not in result.content[0].text
+
+
+def test_query_failures_includes_failed_check_when_span_average_passes():
+    context, capability, _ = _context()
+    Span.objects.create(
+        span_id="failed-check",
+        trace_id="c" * 32,
+        project=context.project,
+        capability=capability,
+        name="answer",
+        start_time_ns=1,
+        eval_attributes={
+            "score": 0.8,
+            "metrics": {
+                "format": {"score": 0.2, "reason": "Expected JSON"},
+                "grounding": {"score": 1.0},
+            },
+        },
+    )
+
+    result = asyncio.run(CATALOG.call("query_failures", {"capability": "support"}, context))
+
+    assert result.isError is False
+    assert result.structuredContent["failures"][0]["failed_scores"] == [
+        {"metric": "format", "score": 0.2, "reason": "Expected JSON"}
+    ]
 
 
 def test_query_traces_exact_session_counts_root_traces():

@@ -216,6 +216,7 @@ TRAINING_ENTRIES = [
         ("another-org/Qwen3.5-9B", None),
         ("Qwen3.5-9B", None),
         ("", None),
+        ("unsloth/Qwen3.5-9B", "qwen/qwen3.5-9b"),
     ],
 )
 def test_training_route_requires_an_exact_available_model(fake_llm, model, expected):
@@ -233,6 +234,40 @@ def test_training_route_requires_a_configured_key(fake_llm, monkeypatch):
 def test_training_route_does_not_guess_when_catalog_is_unavailable(fake_llm):
     fake_llm.fail(_is_catalog, 503)
     assert model_catalog.resolve_training_openrouter_slug("Qwen/Qwen3.5-9B") is None
+
+
+@pytest.mark.parametrize(
+    ("model_id", "entry", "expected"),
+    [
+        (
+            "Qwen/Qwen3.5-4B",
+            {"id": "qwen/new-4b", "hugging_face_id": "Qwen/Qwen3.5-4B"},
+            "qwen/new-4b",
+        ),
+        ("Qwen/Qwen3.5-4B", {"id": "qwen/qwen3.5-9b", "hugging_face_id": "Qwen/Qwen3.5-9B"}, None),
+        ("Qwen/Qwen3.5-9B", {"id": "qwen/other:batch", "hugging_face_id": "Qwen/Qwen3.5-9B"}, None),
+        (
+            "Qwen/Qwen3.5-9B",
+            {"id": "qwen/qwen3.5-9b-base", "hugging_face_id": "Qwen/Qwen3.5-9B-Base"},
+            None,
+        ),
+        (
+            "Qwen/Qwen3.5-9B",
+            {"id": "qwen/relisted-9b", "hugging_face_id": "Qwen/Qwen3.5-9B"},
+            "qwen/relisted-9b",
+        ),
+        (
+            "org/private-finetune",
+            {"id": "qwen/qwen3.5-9b", "hugging_face_id": "Qwen/Qwen3.5-9B"},
+            None,
+        ),
+    ],
+)
+def test_training_lookup_preserves_checkpoint_identity_when_catalog_changes(
+    model_id, entry, expected, fake_llm
+):
+    fake_llm.catalog_payload = [entry]
+    assert model_catalog.resolve_training_openrouter_slug(model_id) == expected
 
 
 class TestCachedTokenPricing:

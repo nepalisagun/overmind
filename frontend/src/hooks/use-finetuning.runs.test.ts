@@ -90,17 +90,42 @@ describe("useTrainingBenchmarksQuery", () => {
 });
 
 describe("useFinetuningRunsQuery", () => {
+  it("discovers jobs started outside the Console even when history is empty or finished", () => {
+    const options = optionsOf(() =>
+      useFinetuningRunsQuery({ page: 1, pageSize: 25, projectId: "proj-1" })
+    );
+    const poll = options.refetchInterval;
+    if (typeof poll !== "function") throw new Error("Expected adaptive history polling");
+    const query = (jobs: { status: string }[], fetchFailureCount = 0) =>
+      ({ state: { data: { results: [{ jobs }] }, fetchFailureCount } }) as never;
+    expect(poll(query([]))).toBe(10_000);
+    expect(poll(query([{ status: "succeeded" }]))).toBe(10_000);
+    expect(poll(query([{ status: "preprocessing" }]))).toBe(5_000);
+    expect(poll(query([], 3))).toBe(false);
+  });
+
   it("keys every param and sends none of the empty ones", async () => {
     const options = optionsOf(() =>
       useFinetuningRunsQuery({ page: 2, pageSize: 25, projectId: "proj-1", search: "   " })
     );
 
-    expect(options.queryKey).toEqual(["finetuning-runs", "proj-1", 2, 25, null, null, null, null]);
+    expect(options.queryKey).toEqual([
+      "finetuning-runs",
+      null,
+      "proj-1",
+      2,
+      25,
+      null,
+      null,
+      null,
+      null,
+    ]);
 
     await fetchWith(options);
     expect(mocks.runsList).toHaveBeenCalledWith({
       baseModel: undefined,
       dataset: undefined,
+      ordering: undefined,
       page: 2,
       pageSize: 25,
       project: "proj-1",
@@ -114,6 +139,7 @@ describe("useFinetuningRunsQuery", () => {
       useFinetuningRunsQuery({
         baseModel: "meta/llama-3.1-8b",
         dataset: "ds-1",
+        ordering: "-credits",
         page: 1,
         pageSize: 25,
         projectId: "proj-1",
@@ -124,6 +150,7 @@ describe("useFinetuningRunsQuery", () => {
 
     expect(options.queryKey).toEqual([
       "finetuning-runs",
+      "-credits",
       "proj-1",
       1,
       25,
@@ -138,6 +165,7 @@ describe("useFinetuningRunsQuery", () => {
       expect.objectContaining({
         baseModel: "meta/llama-3.1-8b",
         dataset: "ds-1",
+        ordering: "-credits",
         search: "nightly",
         status: "failed",
       })
@@ -157,13 +185,15 @@ describe("useFinetuningRunJobsQuery", () => {
     expect(mocks.retrieve).not.toHaveBeenCalled();
   });
 
-  it("falls back to the lone job when the run key is a job id", async () => {
+  it("retains the lone job's training contract when the run key is a job id", async () => {
+    const contract = { objective: "decision_cross_entropy" };
+    const job = { id: "job-legacy", record: { contract } };
     mocks.list.mockResolvedValue({ results: [] });
-    mocks.retrieve.mockResolvedValue({ id: "job-legacy" });
+    mocks.retrieve.mockResolvedValue(job);
 
     const options = optionsOf(() => useFinetuningRunJobsQuery("job-legacy"));
 
-    expect(await fetchWith(options)).toEqual([{ id: "job-legacy" }]);
+    expect(await fetchWith(options)).toEqual([{ ...job, trainingContract: contract }]);
     expect(mocks.retrieve).toHaveBeenCalledWith({ id: "job-legacy" });
   });
 });

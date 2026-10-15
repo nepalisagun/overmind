@@ -21,7 +21,9 @@ pytestmark = pytest.mark.django_db
 
 
 def _dataset(capability: Capability) -> Dataset:
-    ds = frozen_dataset(capability.project, [{"input": {"q": "test"}}], capability=capability)
+    ds = frozen_dataset(
+        capability.project, [{"input": {"q": "test"}}], capability=capability, contract="eval"
+    )
     return ds
 
 
@@ -529,3 +531,40 @@ def test_metrics_separate_failures_end_to_end_and_warm_engine_latency():
     assert response.data["avg_latency_ms"] == 10
     assert response.data["end_to_end_p50_ms"] == 300
     assert response.data["latest_failure"]["id"] == str(failed.pk)
+
+
+@pytest.mark.parametrize("field", ["avg_latency_ms", "avg_tokens_per_second"])
+def test_deployed_models_sort_by_displayed_median_before_pagination(field):
+    user, project = make_user(), make_project()
+    make_member(user, project)
+    slow_mean = _deployed_model(project, _job(project))
+    fast_mean = _deployed_model(project, _job(project))
+    unmeasured = _deployed_model(project, _job(project))
+    for model, values in [(slow_mean, [10, 20, 3000]), (fast_mean, [30, 40, 50])]:
+        for value in values:
+            InferenceCall.objects.create(
+                deployed_model=model,
+                project=project,
+                latency_ms=value,
+                tokens_per_second=value,
+                is_cold=False,
+                outcome="succeeded",
+            )
+    for prefix, expected, median in [("", slow_mean, 20), ("-", fast_mean, 40)]:
+        response = auth_client(user).get(
+            reverse("deployedmodel-list"),
+            {
+                "project": project.id,
+                "ordering": prefix + field,
+                "page_size": 1,
+            },
+        )
+        assert response.status_code == 200, response.data
+        assert response.data["count"] == 3
+        assert response.data["results"][0]["id"] == str(expected.id)
+        assert response.data["results"][0][field] == median
+        last = auth_client(user).get(
+            reverse("deployedmodel-list"),
+            {"project": project.id, "ordering": prefix + field, "page_size": 1, "page": 3},
+        )
+        assert last.data["results"][0]["id"] == str(unmeasured.id)

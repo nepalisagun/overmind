@@ -2,10 +2,12 @@ import logging
 from collections import defaultdict
 
 from django.core.exceptions import ValidationError
-from django.db.models import Avg, Count, Max, Min, OuterRef, Q, Subquery, Sum
+from django.db.models import Avg, Count, FloatField, Max, Min, OuterRef, Q, Subquery, Sum
 from django.db.models.expressions import RawSQL
-from django.db.models.functions import Coalesce
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Cast, Coalesce
 from django.shortcuts import get_object_or_404
+from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiParameter,
@@ -13,7 +15,7 @@ from drf_spectacular.utils import (
     extend_schema_view,
     inline_serializer,
 )
-from rest_framework import mixins, status, viewsets
+from rest_framework import filters, mixins, status, viewsets
 from rest_framework import serializers as drf_serializers
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, PermissionDenied
@@ -26,6 +28,12 @@ from overbae.api.filters import (
     SessionFilter,
     SpanFilter,
 )
+from overbae.api.finetuning_runs import FinetuningRunOrderingSerializer
+from overbae.api.native_evaluation import (
+    NativeEvaluationRequestSerializer,
+    NativeEvaluationSerializer,
+)
+from overbae.api.ordering import TableOrderingFilter
 from overbae.api.scoping import project_ids_for
 from overbae.api.serializers import (
     ConnectorCapabilityMappingResponseSerializer,
@@ -39,6 +47,7 @@ from overbae.api.serializers import (
     ConnectorSyncRunSerializer,
     ConnectorVerifyResponseSerializer,
     DatasetOverlapResponseSerializer,
+    DatasetValidateRequestSerializer,
     DatasetValidationResponseSerializer,
     DeployedModelSerializer,
     FeedbackCreateSerializer,
@@ -70,19 +79,23 @@ from overbae.api.serializers import (
     SpanSerializer,
     TraceDetailSerializer,
     conversation_usage_totals,
-    eligible_scoring_capabilities,
     trace_status,
     trace_usage_totals,
-    traces_with_finished_scoring_pass,
 )
 from overbae.api.span_ordering import (
     annotate_sessions_for_ordering,
     annotate_spans_for_ordering,
     llm_model_sql,
 )
+from overbae.api.training_monitoring import (
+    TrainingEvidenceSerializer,
+    TrainingMonitoringQuerySerializer,
+    TrainingMonitoringSerializer,
+)
 from overbae.core.errors import InputValidationError
 from overbae.models import (
     APIToken,
+    Cell,
     ConnectorCredential,
     Conversation,
     Dataset,
@@ -90,18 +103,33 @@ from overbae.models import (
     Feedback,
     FinetuningJob,
     FinetuningJobEvent,
-    InferenceCall,
     Project,
     ProjectInvite,
     ProjectMembership,
     Span,
-    TaskExecution,
     User,
 )
+from overbae.services import native_evaluation as native_evaluation_service
+from overbae.services import training_monitoring
+from overbae.services.datasets.lifecycle import DatasetError
 from overbae.services.deployment import ensure_training_deployment, retry_deployment
+from overbae.services.finetuning_checkpoints import (
+    CheckpointArchiveError,
+    get_checkpoint_download_url,
+)
+from overbae.services.finetuning_runs import ordered_training_runs
 from overbae.services.inference_live import live_worker_stats
-from overbae.services.inference_metrics import model_activity, model_metrics, percentile
-from overbae.services.training_preparation import retry_for_job as retry_training_preparation
+from overbae.services.inference_metrics import Median, model_activity, model_metrics
+from overbae.services.training_cancellation import cancel as cancel_training
+from overbae.services.training_preparation import (
+    live_progress_for_job,
+    retry_preparation,
+    sync_setup_jobs,
+)
+from overbae.services.training_preparation import (
+    retry_for_job as retry_training_preparation,
+)
+from overbae.tasks.training_preparation import inspect_preparation
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +399,7 @@ class SpanViewSet(
     filterset_class = SpanFilter
     search_fields = ["name", "service_name", "trace_id", "span_id"]
     ordering_fields = [
+        "source",
         "start_time_ns",
         "end_time_ns",
         "duration_ns",
@@ -387,7 +416,7 @@ class SpanViewSet(
         "total_tokens",
         "total_cost",
         "model",
-        "trace_scores",
+        "eval_score",
     ]
     # ``retrieve`` keys off ``trace_id`` (URL says /traces/{trace_id}/) — the
     # row's UUID PK is never user-visible.
@@ -435,12 +464,6 @@ class SpanViewSet(
         trace_usage = getattr(self, "_trace_usage", None)
         if trace_usage is not None:
             context["trace_usage"] = trace_usage
-        eligible_capabilities = getattr(self, "_eligible_scoring_capabilities", None)
-        if eligible_capabilities is not None:
-            context["eligible_scoring_capabilities"] = eligible_capabilities
-        finished_passes = getattr(self, "_traces_with_finished_pass", None)
-        if finished_passes is not None:
-            context["traces_with_finished_pass"] = finished_passes
         return context
 
     def list(self, request, *args, **kwargs):
@@ -459,12 +482,6 @@ class SpanViewSet(
         if not all_spans:
             project_ids = _user_project_ids(request.user)
             self._trace_usage = trace_usage_totals(project_ids, [span.trace_id for span in rows])
-            self._eligible_scoring_capabilities = eligible_scoring_capabilities(
-                project_ids, [span.capability_id for span in rows if span.capability_id]
-            )
-            self._traces_with_finished_pass = traces_with_finished_scoring_pass(
-                project_ids, [span.trace_id for span in rows]
-            )
         serializer = self.get_serializer(rows, many=True)
         if page is not None:
             return self.get_paginated_response(serializer.data)
@@ -607,18 +624,22 @@ class SessionViewSet(
                 span_count=Count("spans"),
                 first_span_ns=Min("spans__start_time_ns"),
                 last_span_ns=Max("spans__end_time_ns"),
-                # The ledger fold writes the same session score to every
-                # execution of the conversation; the newest row is current.
                 session_score=Subquery(
-                    TaskExecution.objects.filter(
-                        project_id=OuterRef("project_id"),
-                        conversation_id=OuterRef("external_id"),
+                    Span.objects.filter(conversation_id=OuterRef("pk"), parent_span_id__isnull=True)
+                    .order_by()
+                    .values("conversation_id")
+                    .annotate(
+                        mean=Avg(
+                            Coalesce(
+                                Cast(
+                                    KeyTextTransform("score", "eval_attributes__trajectory"),
+                                    FloatField(),
+                                ),
+                                Cast(KeyTextTransform("score", "eval_attributes"), FloatField()),
+                            )
+                        )
                     )
-                    # A blank external_id must not join the executions that
-                    # simply have no conversation.
-                    .exclude(conversation_id="")
-                    .order_by("-started_at")
-                    .values("session_score")[:1]
+                    .values("mean")[:1]
                 ),
             )
         )
@@ -681,6 +702,28 @@ _FINETUNING_FACET_PARAMETERS = [
     destroy=extend_schema(summary="Delete finetuning job"),
 )
 class FinetuningJobViewSet(viewsets.ModelViewSet):
+    @extend_schema(
+        request=NativeEvaluationRequestSerializer, responses={202: NativeEvaluationSerializer}
+    )
+    @action(detail=True, methods=["post"], url_path="native-evaluation")
+    def native_evaluation(self, request, id=None):
+        from overbae.api.credit_gate import require_credits
+
+        require_credits(request.user)
+        job = self.get_object()
+        body = NativeEvaluationRequestSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        cells = Cell.objects.select_related("dataset").filter(dataset__project_id=job.project_id)
+        calibration = get_object_or_404(cells, pk=body.validated_data["calibration_cell"])
+        final = get_object_or_404(cells, pk=body.validated_data["final_cell"])
+        try:
+            plan = native_evaluation_service.schedule(
+                job, calibration_cell=calibration, final_cell=final
+            )
+        except (ValueError, DatasetError) as exc:
+            raise drf_serializers.ValidationError(str(exc)) from exc
+        return Response(NativeEvaluationSerializer(plan).data, status=202)
+
     queryset = FinetuningJob.objects.all()
     filterset_class = FinetuningJobFilter
     search_fields = ["name", "use_case", "base_model"]
@@ -703,9 +746,15 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
             "capability",
             "dataset",
             "cell__dataset",
+            "eval_cell__dataset",
+            "eval_set",
+            "native_evaluation",
+            "native_evaluation__final_cell__dataset__capability",
+            "native_evaluation__calibration_cell__dataset__capability",
             "validation_cell__dataset",
             "triggered_by",
             "deployed_model",
+            "decision_job",
         )
 
     def perform_create(self, serializer):
@@ -713,10 +762,14 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         from overbae.services.plan_limits import require_plan_quota
         from overbae.tasks.finetuning import run_finetuning
 
-        require_credits(self.request.user)
-        require_plan_quota(self.request.user, "training_jobs")
+        def admit_new_training():
+            require_credits(self.request.user)
+            require_plan_quota(self.request.user, "training_jobs")
 
+        serializer.context["admit_new_training"] = admit_new_training
         job = serializer.save(triggered_by=self.request.user)
+        if getattr(job, "launch_reused", False):
+            return
         try:
             result = run_finetuning.apply_async(kwargs={"job_id": str(job.id)})
         except Exception:  # noqa: BLE001 — broker hiccup shouldn't 500 post-create
@@ -729,7 +782,7 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         FinetuningJob.objects.filter(pk=job.pk).update(celery_task_id=result.id)
 
     @extend_schema(
-        summary="List training runs — whole runs per page, newest first",
+        summary="List training runs — whole runs per page",
         description=(
             "The training history lists *runs*, not jobs: the wizard launches one "
             "job per experiment and stamps them with a shared `group_id`. Paging "
@@ -741,11 +794,12 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
             "entry per run — `{run_id, group_id, jobs}` — where `run_id` is the "
             "`group_id` when there is one and the lone job's id otherwise, and "
             "`jobs` is every job of that run so client-side aggregation is always "
-            "complete. Runs are ordered by their most recent job; `?ordering=` is "
-            "accepted for compatibility but does not reorder runs.\n\n"
+            "complete. Ordering applies to whole-run values before pagination. "
+            "By default, the most recently created job places its run first.\n\n"
             "Every filter of the jobs list applies (`project`, `capability`, `dataset`, "
             "`base_model`, `status`, `provider`, `group_id`, `search`)."
         ),
+        parameters=[FinetuningRunOrderingSerializer],
         responses={200: FinetuningJobRunSerializer(many=True)},
     )
     @action(detail=False, methods=["get"], url_path="runs")
@@ -761,17 +815,10 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         endpoint exists to keep intact.
         """
         base = self.get_queryset()
-        # Distinct run keys, most-recently-active first. ``order_by()`` first:
-        # the model's default ``-created_at`` would otherwise join the GROUP BY
-        # and split every run into one row per job.
-        runs = (
-            self.filter_queryset(base)
-            .order_by()
-            .annotate(run_key=Coalesce("group_id", "id"))
-            .values("run_key")
-            .annotate(latest_at=Max("created_at"))
-            .order_by("-latest_at")
-        )
+        query = FinetuningRunOrderingSerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        ordering = query.validated_data.get("ordering")
+        runs = ordered_training_runs(base, self.filter_queryset(base), ordering)
         page = self.paginate_queryset(runs)
         run_keys = [row["run_key"] for row in (page if page is not None else runs)]
         # Refetched from the project-scoped base, NOT the filtered queryset, so a
@@ -859,16 +906,59 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         return Response(list(base_model_ids))
 
     @extend_schema(
+        parameters=[TrainingMonitoringQuerySerializer], responses=TrainingMonitoringSerializer
+    )
+    @action(detail=True, methods=["get"], url_path="monitoring")
+    def monitoring(self, request, id=None):
+        query = TrainingMonitoringQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        detail = training_monitoring.snapshot(
+            self.get_object(),
+            offset=query.validated_data["offset"],
+            limit=query.validated_data["limit"],
+        )
+        return Response(TrainingMonitoringSerializer(detail).data)
+
+    @extend_schema(
+        parameters=[TrainingMonitoringQuerySerializer], responses=TrainingEvidenceSerializer
+    )
+    @action(detail=True, methods=["get"], url_path="monitoring-evidence")
+    def monitoring_evidence(self, request, id=None):
+        query = TrainingMonitoringQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        data = query.validated_data
+        if sum(key in data for key in ("check", "probe", "field")) != 1:
+            raise drf_serializers.ValidationError(
+                {"check": "Select a training check, frozen probe or retained receipt field"}
+            )
+        try:
+            detail = (
+                training_monitoring.field_page(
+                    self.get_object(), data["field"], offset=data["offset"], limit=data["limit"]
+                )
+                if "field" in data
+                else training_monitoring.probe_rows(
+                    self.get_object(), data["probe"], offset=data["offset"], limit=data["limit"]
+                )
+                if "probe" in data
+                else training_monitoring.examples(
+                    self.get_object(), data["check"], offset=data["offset"], limit=data["limit"]
+                )
+            )
+        except (ValueError, training_monitoring.TrainingValidationRun.DoesNotExist) as exc:
+            raise drf_serializers.ValidationError(
+                "The requested training evidence is unavailable"
+            ) from exc
+        return Response(TrainingEvidenceSerializer(detail).data)
+
+    @extend_schema(
         summary="Cancel a finetuning job",
         request=None,
         responses={200: FinetuningJobSerializer},
     )
     @action(detail=True, methods=["post"], url_path="cancel")
     def cancel(self, request, id=None):
-        from overbae.tasks.finetuning import cancel_finetuning_job
-
-        job = self.get_object()
-        cancel_finetuning_job(job)
+        job = cancel_training(self.get_object())
         return Response(FinetuningJobSerializer(job).data)
 
     @extend_schema(
@@ -888,6 +978,21 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
             FinetuningJob.Status.CANCELLED,
         }:
             raise drf_serializers.ValidationError("Only failed/cancelled jobs can be retried.")
+        if job.preparation_id and not job.requested_configuration:
+            prep = job.preparation
+            if prep.state in {"failed", "incompatible"}:
+                try:
+                    prep = retry_preparation(prep)
+                except InputValidationError as exc:
+                    raise drf_serializers.ValidationError(exc.detail) from exc
+            FinetuningJob.objects.filter(pk=job.pk).update(
+                status=FinetuningJob.Status.PREPROCESSING
+            )
+            sync_setup_jobs(prep)
+            if prep.state == "queued":
+                inspect_preparation.delay(str(prep.pk))
+            job.refresh_from_db()
+            return Response(FinetuningJobSerializer(job).data)
         require_credits(request.user)
         try:
             retry_training_preparation(job)
@@ -976,7 +1081,7 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         learning_rate, grad_norm = [], []
         checkpoints = []
 
-        progress = job.progress if isinstance(job.progress, dict) else {}
+        progress = live_progress_for_job(job)
         metrics = (progress.get("metrics") or {}) if isinstance(progress, dict) else {}
         loss_points = metrics.get("loss") or []
         if loss_points:
@@ -1054,6 +1159,7 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
                     "total_steps": progress.get("total_steps"),
                     "percent": progress.get("percent"),
                     "eta_seconds": progress.get("eta_seconds"),
+                    "eta_range_seconds": progress.get("eta_range_seconds"),
                     "elapsed_seconds": progress.get("elapsed_seconds"),
                     "estimated_finish": progress.get("estimated_finish"),
                     "tokens_processed": progress.get("tokens_processed"),
@@ -1069,6 +1175,8 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
                     "current_epoch": progress.get("current_epoch"),
                     "phase": progress.get("phase"),
                     "stage": progress.get("stage"),
+                    "preparation": progress.get("preparation"),
+                    "diagnostics": progress.get("diagnostics") or {},
                     "download": progress.get("download"),
                     "lifecycle_stage": current_lifecycle,
                     "judge_evals": judge_evals,
@@ -1126,16 +1234,7 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="Validate a dataset for fine-tuning",
-        request=inline_serializer(
-            "DatasetValidateRequest",
-            fields={
-                "dataset_id": drf_serializers.UUIDField(),
-                "validation_enabled": drf_serializers.BooleanField(required=False),
-                "validation_split_ratio": drf_serializers.FloatField(required=False),
-                "validation_dataset_id": drf_serializers.UUIDField(required=False, allow_null=True),
-                "split_method": drf_serializers.CharField(required=False),
-            },
-        ),
+        request=DatasetValidateRequestSerializer,
         responses={200: DatasetValidationResponseSerializer},
     )
     @action(detail=False, methods=["post"], url_path="validate-dataset")
@@ -1143,49 +1242,45 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         """Check whether a dataset's datapoints conform to Together AI's format."""
         from overbae.services.finetuning_validator import validate_dataset
 
-        dataset_id = request.data.get("dataset_id")
-        if not dataset_id:
-            return Response({"detail": "dataset_id is required."}, status=400)
-
-        project_ids = _user_project_ids(request.user)
-
-        try:
-            dataset = Dataset.objects.get(
-                pk=dataset_id,
-                project_id__in=project_ids,
+        body = DatasetValidateRequestSerializer(data=request.data)
+        body.is_valid(raise_exception=True)
+        data = body.validated_data
+        dataset = get_object_or_404(
+            Dataset, pk=data["dataset_id"], project_id__in=_user_project_ids(request.user)
+        )
+        cell = (
+            get_object_or_404(dataset.cells, pk=data["cell_id"])
+            if data.get("cell_id")
+            else dataset.active_cell
+        )
+        validation = (
+            get_object_or_404(
+                Dataset, pk=data["validation_dataset_id"], project_id=dataset.project_id
             )
-        except (Dataset.DoesNotExist, ValidationError, ValueError):
-            return Response({"detail": "Dataset not found."}, status=404)
-
-        validation_dataset_id = request.data.get("validation_dataset_id")
-        if validation_dataset_id:
-            try:
-                Dataset.objects.get(
-                    pk=validation_dataset_id,
-                    project_id__in=project_ids,
-                )
-            except (Dataset.DoesNotExist, ValidationError, ValueError):
-                return Response({"detail": "Validation dataset not found."}, status=404)
-
-        validation_enabled = request.data.get("validation_enabled", True)
-        if isinstance(validation_enabled, str):
-            validation_enabled = validation_enabled.lower() in {"true", "1", "yes"}
-
-        try:
-            split_ratio = float(request.data.get("validation_split_ratio", 0.2) or 0.2)
-        except (TypeError, ValueError):
-            return Response(
-                {"detail": "validation_split_ratio must be a number."},
-                status=status.HTTP_400_BAD_REQUEST,
+            if data.get("validation_dataset_id")
+            else None
+        )
+        validation_cell = (
+            get_object_or_404(validation.cells, pk=data["validation_cell_id"])
+            if validation and data.get("validation_cell_id")
+            else validation.active_cell
+            if validation
+            else None
+        )
+        if data.get("validation_cell_id") and not validation:
+            raise drf_serializers.ValidationError(
+                {"validation_cell_id": "Select its validation dataset."}
             )
         result = validate_dataset(
             str(dataset.id),
-            validation_enabled=validation_enabled,
-            validation_split_ratio=split_ratio,
-            validation_dataset_id=str(validation_dataset_id) if validation_dataset_id else None,
-            split_method=request.data.get("split_method", "random"),
+            cell_id=str(cell.id) if cell else None,
+            validation_cell_id=str(validation_cell.id) if validation_cell else None,
+            validation_enabled=data["validation_enabled"],
+            validation_split_ratio=data["validation_split_ratio"],
+            validation_dataset_id=str(validation.id) if validation else None,
+            split_method=data["split_method"],
         )
-        return Response(result.as_dict())
+        return Response(DatasetValidationResponseSerializer(result.as_dict()).data)
 
     @extend_schema(
         summary="Rank trainable models for a dataset + capability",
@@ -1227,22 +1322,16 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
                 return Response({"detail": "Capability not found."}, status=404)
 
         eval_dataset_id = request.data.get("eval_dataset_id") or None
-        eval_cell = None
         if eval_dataset_id:
             try:
-                evaluation = Dataset.objects.select_related("active").get(
+                Dataset.objects.get(
                     pk=eval_dataset_id, project_id=dataset.project_id, intent=Dataset.Intent.EVAL
                 )
             except (Dataset.DoesNotExist, ValidationError, ValueError):
                 return Response({"detail": "Eval dataset not found."}, status=404)
-            eval_cell = evaluation.active_cell
-            if eval_cell is None:
-                raise drf_serializers.ValidationError(
-                    {"detail": "The evaluation dataset has no readable version."}
-                )
         try:
             analysis = get_recommendation(
-                str(dataset.id), capability_id=capability_id, eval_cell=eval_cell
+                str(dataset.id), capability_id=capability_id, eval_dataset_id=eval_dataset_id
             )
         except InputValidationError as exc:
             raise drf_serializers.ValidationError({"detail": exc.detail}) from exc
@@ -1272,7 +1361,7 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
         data = ser.validated_data
 
         try:
-            Dataset.objects.get(
+            selected_dataset = Dataset.objects.get(
                 pk=data["dataset_id"],
                 project_id__in=_user_project_ids(request.user),
             )
@@ -1285,6 +1374,20 @@ class FinetuningJobViewSet(viewsets.ModelViewSet):
                 base_model=data["base_model"],
                 n_epochs=data["n_epochs"],
                 use_lora=data["use_lora"],
+                cell=get_object_or_404(selected_dataset.cells, pk=data["cell"])
+                if data.get("cell")
+                else selected_dataset.active_cell,
+                validation_cell=get_object_or_404(
+                    Cell.objects.select_related("dataset"),
+                    pk=data["validation_cell"],
+                    dataset__project=selected_dataset.project,
+                )
+                if data.get("validation_cell")
+                else None,
+                validation_enabled=data["validation_enabled"],
+                validation_split_ratio=data["validation_split_ratio"],
+                split_method=data["split_method"],
+                hyperparameters=data["hyperparameters"],
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=400)
@@ -1830,12 +1933,14 @@ class DeployedModelViewSet(
     viewsets.GenericViewSet,
 ):
     serializer_class = DeployedModelSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, TableOrderingFilter]
     filterset_class = DeployedModelFilter
     search_fields = ["model_id", "base_model_id", "finetuning_job__name"]
-    # ``avg_latency_ms`` / ``avg_tokens_per_second`` are deliberately absent: the
-    # SQL means they are annotated with are replaced by medians in ``list()``, so
-    # sorting on them would order the page by numbers it does not display.
     ordering_fields = [
+        "avg_latency_ms",
+        "avg_tokens_per_second",
+        "finetuning_job__name",
+        "finetuning_job__capability__name",
         "created_at",
         "status",
         "model_id",
@@ -1864,9 +1969,12 @@ class DeployedModelViewSet(
                 last_active_at=Max("inference_calls__created_at"),
                 total_tokens=Sum("inference_calls__prompt_tokens")
                 + Sum("inference_calls__completion_tokens"),
-                avg_tokens_per_second=Avg("inference_calls__tokens_per_second"),
+                avg_tokens_per_second=Median(
+                    "inference_calls__tokens_per_second",
+                    filter=Q(inference_calls__is_cold=False, inference_calls__outcome="succeeded"),
+                ),
                 # Warm calls only, to match the detail page's headline latency.
-                avg_latency_ms=Avg(
+                avg_latency_ms=Median(
                     "inference_calls__latency_ms",
                     filter=Q(inference_calls__is_cold=False, inference_calls__outcome="succeeded"),
                 ),
@@ -1878,38 +1986,6 @@ class DeployedModelViewSet(
             )
             .order_by("-created_at")
         )
-
-    def list(self, request, *args, **kwargs):
-        """Overlay robust (median) latency/throughput onto each row.
-
-        The queryset annotates SQL means for these two, but a few slow-client or
-        very-long-generation outliers skew a mean badly; the median is computed
-        per model in Python here so the table stays comparable across models
-        with very different baselines.
-        """
-        response = super().list(request, *args, **kwargs)
-        items = response.data.get("results") if isinstance(response.data, dict) else response.data
-        if not items:
-            return response
-        lat: dict = defaultdict(list)
-        tps: dict = defaultdict(list)
-        ids = [it["id"] for it in items]
-        for mid, latency, t in (
-            InferenceCall.objects.filter(
-                deployed_model_id__in=ids, is_cold=False, outcome="succeeded"
-            )
-            .order_by("-created_at")
-            .values_list("deployed_model_id", "latency_ms", "tokens_per_second")
-        ):
-            if latency is not None:
-                lat[str(mid)].append(latency)
-            if t is not None:
-                tps[str(mid)].append(t)
-        for it in items:
-            mid = str(it["id"])
-            it["avg_latency_ms"] = percentile(sorted(lat[mid]), 0.5)
-            it["avg_tokens_per_second"] = percentile(sorted(tps[mid]), 0.5)
-        return response
 
     def perform_destroy(self, instance):
         from overbae.services.inference_client import get_inference_client
@@ -2049,11 +2125,6 @@ class DeployedModelViewSet(
     )
     @action(detail=True, methods=["get"], url_path="checkpoints")
     def checkpoints(self, request, id=None):
-        from overbae.services.finetuning_checkpoints import (
-            CheckpointArchiveError,
-            get_checkpoint_download_url,
-        )
-
         instance = self.get_object()
         if instance.finetuning_job_id is None:
             return Response(
@@ -2063,13 +2134,9 @@ class DeployedModelViewSet(
         try:
             file = get_checkpoint_download_url(instance.finetuning_job)
         except CheckpointArchiveError as exc:
-            code = {
-                "not_configured": status.HTTP_503_SERVICE_UNAVAILABLE,
-                "no_weights": status.HTTP_404_NOT_FOUND,
-                "not_ready": status.HTTP_409_CONFLICT,
-            }.get(exc.code, status.HTTP_502_BAD_GATEWAY)
-            return Response({"detail": str(exc)}, status=code)
-        return Response(ModelCheckpointsSerializer({"files": [file]}).data)
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        files = [file] if file is not None else []
+        return Response(ModelCheckpointsSerializer({"files": files}).data)
 
     @extend_schema(
         summary="Live serving stats (backlog / running / workers)",

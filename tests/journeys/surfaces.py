@@ -106,7 +106,10 @@ class CliSurface:
 
         with contextlib.chdir(cwd or Path.cwd()):
             result = CliRunner().invoke(
-                app, list(args), catch_exceptions=False, env={"OVERMIND_API_URL": self.api_url}
+                app,
+                list(args),
+                catch_exceptions=False,
+                env={"OVERMIND_API_URL": self.api_url, "OVERMIND_API_KEY": ""},
             )
         if result.exit_code != 0:
             raise AssertionError(
@@ -115,11 +118,16 @@ class CliSurface:
         return result.output
 
     def scan(self, agent: SampleAgent, *, without: tuple[str, ...] = ()) -> None:
+        from overmind.config import dump, load
+
         from overmind.utils import convert_json_to_toml
 
         self.run("chassis", "--root", str(agent.repo))
         agent.scan_output(without=without)
         convert_json_to_toml(agent.analysis, agent.toml)
+        config = load(agent.toml)
+        config.base_url = self.api_url
+        dump(config, agent.toml)
         agent.analysis.unlink()
 
     def sync(self, agent: SampleAgent) -> str:
@@ -152,11 +160,11 @@ class McpSurface:
             streamable_http_client(self.url, http_client=client) as (read, write, _),
             ClientSession(read, write) as session,
         ):
-            await session.initialize()
-            return await action(session)
+            initialized = await session.initialize()
+            return await action(session, initialized)
 
     def read(self, uri: str) -> dict[str, Any]:
-        async def action(session: ClientSession):
+        async def action(session: ClientSession, _initialized):
             return await session.read_resource(uri)
 
         from mcp.shared.exceptions import McpError
@@ -167,8 +175,18 @@ class McpSurface:
             raise LookupError(str(group.exceptions[0])) from None
         return json.loads(result.contents[0].text)
 
+    def discover(self) -> dict[str, Any]:
+        async def action(session: ClientSession, initialized):
+            tools = await session.list_tools()
+            return {
+                "version": initialized.serverInfo.version,
+                "tools": [tool.name for tool in tools.tools],
+            }
+
+        return asyncio.run(self._session(action))
+
     def call(self, tool: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        async def action(session: ClientSession):
+        async def action(session: ClientSession, _initialized):
             return await session.call_tool(tool, arguments or {})
 
         result = asyncio.run(self._session(action))

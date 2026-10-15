@@ -1,4 +1,4 @@
-"""Pick a readable version and freeze it."""
+"""Pick a readable version and freeze it; quality findings do not prevent use."""
 
 from __future__ import annotations
 
@@ -16,58 +16,53 @@ from overbae.services.datasets.lifecycle import DatasetError
 logger = logging.getLogger(__name__)
 
 
-def _article(word: str) -> str:
-    return "an" if word[:1] in "aeiou" else "a"
-
-
-def check(
-    dataset: Dataset, intent: str, *, cell: Cell | None = None, decision: bool = False
-) -> Cell:
+def check(dataset: Dataset, intent: str, *, cell: Cell | None = None, verify: bool = True) -> Cell:
     if cell is not None and cell.dataset_id != dataset.id:
         raise DatasetError("That version belongs to another dataset.", code="cell_mismatch")
     stored = public_intent(dataset.intent)
     if stored != intent:
         raise DatasetError(
-            f"{dataset.name} is {_article(stored)} {stored} dataset; this needs {intent}.",
-            code="intent",
+            f"{dataset.name} is a {stored} dataset; this needs {intent}.", code="intent"
         )
     if cell is None:
         cell = dataset.active_cell
     else:
         cell.refresh_from_db()
     if cell is None:
-        if dataset.state == Dataset.State.LANDING:
-            raise DatasetError(f"{dataset.name} is still landing.", code="landing")
         if dataset.state == Dataset.State.ERROR:
             raise DatasetError(
-                f"The source of {dataset.name} did not land: {dataset.error}", code="land_failed"
+                f"The last run of {dataset.name} failed. Run it again in the data workshop.",
+                code="run_failed",
             )
-        if dataset.state == Dataset.State.STOPPED:
-            raise DatasetError(f"The import of {dataset.name} was stopped.", code="land_stopped")
-        raise DatasetError(f"{dataset.name} has no version.", code="no_version")
-    ok, reason = cell.fits_decision() if decision else cell.fits(intent)
+        if dataset.state == Dataset.State.RUNNING:
+            raise DatasetError(f"{dataset.name} is running. Wait for it to finish.", code="running")
+        raise DatasetError(f"{dataset.name} has no version that ran.", code="no_version")
+    ok, reason = cell.fits(intent)
     if not ok:
-        raise DatasetError(f"{dataset.name} · {cell.label}: {reason}", code="contract")
+        raise DatasetError(f"{dataset.name} · {label(dataset, cell)}: {reason}", code="contract")
     try:
-        rows.verify(cell)
+        if verify:
+            rows.verify(cell)
     except (ValueError, rows.RowStoreError) as exc:
         logger.exception("Could not verify dataset cell %s", cell.pk)
         raise DatasetError(
-            f"{dataset.name} · {cell.label} is unreadable or has changed.",
+            f"{dataset.name}: this version is unreadable or has changed. Run it again in the data workshop.",
             code="workshop_validation",
         ) from exc
     return cell
 
 
 @transaction.atomic
-def use(dataset: Dataset, intent: str, *, cell: Cell | None = None, decision: bool = False) -> Cell:
+def use(dataset: Dataset, intent: str, *, cell: Cell | None = None, verify: bool = True) -> Cell:
+    """``check``, then set ``used_at`` the first time, which freezes the cell
+    and every cell it reads and starts a new major version."""
     # Share generation's lock so a consumed version cannot change between batches.
     dataset = (
         Dataset.objects.select_for_update(of=("self",))
         .select_related("capability")
         .get(pk=dataset.pk)
     )
-    cell = check(dataset, intent, cell=cell, decision=decision)
+    cell = check(dataset, intent, cell=cell, verify=verify)
     freeze(cell)
     return cell
 
@@ -79,12 +74,16 @@ def freeze(*cells: Cell | None) -> None:
             cell.refresh_from_db()
 
 
+def label(dataset: Dataset, cell: Cell) -> str:
+    return dataset.versions().get(cell.id, cell.title)
+
+
 def describe(cell: Cell | None) -> dict[str, Any] | None:
     if cell is None:
         return None
     return {
         "id": str(cell.id),
-        "version": cell.label,
+        "version": cell.dataset.versions().get(cell.id, ""),
         "title": cell.title,
         "rows": cell.rows,
         "fingerprint": cell.fingerprint,

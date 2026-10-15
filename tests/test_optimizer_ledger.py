@@ -1,14 +1,14 @@
-"""Client-write ledger: template, candidates, outputs, scores — no cursor_sdk."""
-
 from __future__ import annotations
 
 import uuid
 
 import pytest
 from conftest import frozen_dataset
+from factories import make_matrix_row
 
 from overbae.models import (
     Capability,
+    EvalMatrix,
     OptimizerCommand,
     OptimizerExperiment,
     Project,
@@ -31,12 +31,22 @@ def _capability_with_eval_dataset():
         project=project, name="a", slug=f"a-{uuid.uuid4().hex[:6]}"
     )
     dataset = frozen_dataset(
-        project, [{"input": {"q": 1}, "expected_output": "one"}], capability=capability
+        project,
+        [{"input": {"q": 1}, "expected_output": "one"}],
+        capability=capability,
+        contract="eval",
+    )
+    make_matrix_row(
+        project,
+        "Exact match",
+        capability=capability,
+        type=EvalMatrix.Type.DETERMINISTIC,
+        source="def evaluate(span):\n    return span.output == span.expected\n",
     )
     return capability, dataset
 
 
-def test_post_candidate_outputs_and_stub_score():
+def test_posted_candidate_outputs_are_scored(eager):
     capability, dataset = _capability_with_eval_dataset()
     exp = create_optimizer_experiment(user=None, capability=capability, dataset=dataset)
     set_command_template(exp, "echo __DATAPOINT_INPUT__")
@@ -85,7 +95,7 @@ def test_order_zero_model_candidate_defaults_to_challenger():
     assert model_bearing.is_baseline is False
 
 
-def test_model_comparison_stub_accumulates_by_model(fake_llm):
+def test_model_comparison_accumulates_scores_by_model(eager, fake_llm):
     models = ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]
     fake_llm.extra_models = models
     capability, dataset = _capability_with_eval_dataset()

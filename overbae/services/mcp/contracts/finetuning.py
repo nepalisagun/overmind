@@ -8,41 +8,79 @@ from uuid import UUID
 from pydantic import Field
 
 from overbae.services.mcp.contracts.common import (
-    DatasetVersionContract,
+    DatasetCellContract,
     JobReceipt,
     MCPModel,
-    PinnedVersions,
     ResourceLinkContract,
-    request_key_field,
-    version_field,
 )
+from overbae.services.mcp.contracts.training_monitoring import TrainingMonitoringPolicy
 
-TrainingType = Literal["lora", "full"]
+
+class FinetuneSelectionInput(MCPModel):
+    monitoring: TrainingMonitoringPolicy | None = None
+    validation_dataset: str | None = None
+    validation_cell: str | None = None
+    validation_version: str | None = None
+    validation_enabled: bool = True
+    validation_split_ratio: float = Field(default=0.2, ge=0.05, le=0.5)
+    split_method: Literal["random", "ordered"] = "random"
+    eval_dataset: str | None = None
+    eval_cell: str | None = None
+    eval_version: str | None = None
+    eval_set: str | None = None
+    eval_incumbent_before: bool = False
+    eval_incumbent_after: bool = False
+    eval_model_before: bool | None = None
+    eval_model_after: bool | None = None
 
 
-def _capability_field():
-    return Field(
-        default=None,
-        min_length=1,
-        max_length=255,
-        description="Omit for the train dataset's capability; null for none.",
+class InspectTrainingProgressInput(MCPModel):
+    job: UUID
+    probe: Literal["development", "training_reference", "generation"] | None = None
+    check: UUID | None = Field(
+        default=None, description="Optional check ID for retained example evidence"
     )
+    field: str | None = Field(
+        default=None,
+        max_length=4096,
+        description="Retained receipt JSON Pointer from collections; page objects as key/value entries or arrays as items. Append escaped keys or indices to inspect nested values. Exclusive with check/probe.",
+    )
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=25, ge=1, le=100)
 
 
-class CheckFinetuneReadinessInput(MCPModel):
+class InspectTrainingProgressOutput(MCPModel):
+    summary: str
+    progress: dict[str, Any]
+    resource: ResourceLinkContract
+
+
+class CancelFinetuneInput(MCPModel):
+    job: UUID
+
+
+class CancelFinetuneOutput(MCPModel):
+    summary: str
+    id: UUID
+    status: str
+    warning: str
+    resource: ResourceLinkContract
+
+
+class CheckFinetuneReadinessInput(FinetuneSelectionInput):
     dataset: str = Field(min_length=1, max_length=255)
-    version: str | None = version_field()
-    capability: str | None = _capability_field()
-    eval_dataset: str | None = Field(default=None, min_length=1, max_length=255)
-    eval_version: str | None = version_field()
-    eval_set: str | None = Field(default=None, min_length=1, max_length=255)
+    capability: str | None = Field(
+        default=None, max_length=255, description="Optional capability; omit or null for none."
+    )
+    cell: str | None = Field(default=None, max_length=255)
+    version: str | None = Field(default=None, max_length=32)
 
 
 class FineTuneDatasetReadiness(MCPModel):
     id: str
     name: str
     intent: Literal["train"] | None
-    version: DatasetVersionContract | None = None
+    cell: DatasetCellContract | None = None
     validation: dict[str, Any]
 
 
@@ -50,7 +88,7 @@ class FineTuneEvalDatasetReadiness(MCPModel):
     id: str
     name: str
     intent: Literal["eval"]
-    version: DatasetVersionContract | None = None
+    cell: DatasetCellContract | None = None
 
 
 class FineTuneCapabilityReadiness(MCPModel):
@@ -64,13 +102,13 @@ class FineTuneEvalSetReadiness(MCPModel):
     name: str
     capability: str | None
     active: bool
-    member_count: int = Field(ge=0)
+    row_count: int = Field(ge=0)
 
 
-class FineTuneEvaluatorReadiness(MCPModel):
+class FineTuneMatrixReadiness(MCPModel):
     ready: bool
     eval_set: FineTuneEvalSetReadiness | None = None
-    evaluators: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=200)
 
 
 class FineTuneCreditReadiness(MCPModel):
@@ -78,9 +116,20 @@ class FineTuneCreditReadiness(MCPModel):
     available: bool
 
 
+class FineTuneAssessment(MCPModel):
+    technical: Literal["pass", "blocked"]
+    task_suitability: Literal["unmeasured"] = "unmeasured"
+    capability_linked: bool | None = None
+    validation: Literal["separate_dataset", "automatic_split", "disabled"]
+
+
 class CheckFinetuneReadinessOutput(MCPModel):
+    monitoring: dict[str, Any] = Field(default_factory=dict)
+    selection: dict[str, Any] = Field(default_factory=dict)
+    training_contract: dict[str, Any] = Field(default_factory=dict)
     summary: str = Field(min_length=1, max_length=240)
     ready: bool
+    assessment: FineTuneAssessment
     missing: list[str] = Field(default_factory=list, max_length=20)
     warnings: list[str] = Field(default_factory=list)
     dataset: FineTuneDatasetReadiness
@@ -96,45 +145,63 @@ class CheckFinetuneReadinessOutput(MCPModel):
     task_type_source: str | None = None
     excluded: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     recommendation_error: str | None = Field(default=None, max_length=500)
-    evaluator_readiness: FineTuneEvaluatorReadiness
+    matrix_readiness: FineTuneMatrixReadiness
     credits: FineTuneCreditReadiness
     resource_links: list[ResourceLinkContract] = Field(max_length=4)
 
 
-class EstimateFinetuneInput(MCPModel):
+class EstimateFinetuneInput(FinetuneSelectionInput):
+    hyperparameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Model recipe. batch_size is the effective optimizer batch; do not supply gradient_accumulation_steps or per_device_train_batch_size.",
+    )
     dataset: str = Field(min_length=1, max_length=255)
     base_model: str = Field(min_length=1, max_length=255)
     n_epochs: int = Field(default=3, ge=1, le=20)
     use_lora: bool = True
-    version: str | None = version_field()
+    cell: str | None = Field(default=None, max_length=255)
+    version: str | None = Field(default=None, max_length=32)
 
 
 class FineTuneTimeEstimate(MCPModel):
-    seconds: int = Field(ge=0)
+    seconds: int | None = Field(default=None, ge=0)
     human: str = Field(min_length=1, max_length=80)
 
 
 class EstimateFinetuneOutput(MCPModel):
+    monitoring: dict[str, Any] = Field(default_factory=dict)
+    forecast: dict[str, Any] | None = None
+    selection: dict[str, Any] = Field(default_factory=dict)
+    training_contract: dict[str, Any] = Field(default_factory=dict)
     summary: str = Field(min_length=1, max_length=240)
     cost_estimate: dict[str, Any] | None = None
     time_estimate: FineTuneTimeEstimate
     trained_tokens: int = Field(ge=0)
-    version: DatasetVersionContract | None = None
+    cell: DatasetCellContract | None = None
     resource_links: list[ResourceLinkContract] = Field(max_length=1)
 
 
 class PrepareTrainingInput(MCPModel):
+    monitoring: TrainingMonitoringPolicy | None = None
     retry_failed: bool = False
-    training_type: TrainingType = "lora"
+    validation_cell: str | None = None
+    training_type: Literal["lora", "full"] = "lora"
     dataset: str = Field(min_length=1, max_length=255)
-    version: str | None = version_field()
     base_model: str = Field(min_length=1, max_length=255)
     context_length: int = Field(ge=128, le=2_000_000)
-    validation_dataset: str | None = Field(default=None, min_length=1, max_length=255)
-    validation_version: str | None = version_field()
+    validation_dataset: str | None = None
+    cell: str | None = None
+
+
+class FineTuneJobReference(JobReceipt):
+    kind: Literal["finetune_job"] = "finetune_job"
+    name: str
 
 
 class PrepareTrainingOutput(MCPModel):
+    training_job: FineTuneJobReference
+    decision_job: JobReceipt | None = None
+    monitoring: dict[str, Any] = Field(default_factory=dict)
     job: JobReceipt
     id: str
     state: str
@@ -144,6 +211,15 @@ class PrepareTrainingOutput(MCPModel):
 
 
 class StartFinetuneInput(MCPModel):
+    monitoring: TrainingMonitoringPolicy | None = None
+    request_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Stable client launch identity. Repeat the same request to recover its job; changed recipes are rejected.",
+    )
+    accepted_findings: list[str] = Field(default_factory=list, max_length=100)
+
     dataset: str = Field(min_length=1, max_length=255)
     base_model: str = Field(min_length=1, max_length=255)
     baseline_model: str | None = Field(
@@ -152,14 +228,19 @@ class StartFinetuneInput(MCPModel):
         max_length=255,
         description="Run-specific benchmark: codebase incumbent or ready trained serving model ID in this project. Omit for capability default.",
     )
-    capability: str | None = _capability_field()
-    eval_dataset: str | None = Field(default=None, min_length=1, max_length=255)
-    eval_set: str | None = Field(default=None, min_length=1, max_length=255)
+    capability: str | None = Field(
+        default=None, max_length=255, description="Optional capability; omit or null for none."
+    )
+    eval_dataset: str | None = Field(default=None, max_length=255)
+    eval_set: str | None = Field(default=None, max_length=255)
     eval_judge_model: str = Field(default="", max_length=255)
-    validation_dataset: str | None = Field(default=None, min_length=1, max_length=255)
-    version: str | None = version_field()
-    eval_version: str | None = version_field()
-    validation_version: str | None = version_field()
+    validation_dataset: str | None = Field(default=None, max_length=255)
+    cell: str | None = Field(default=None, max_length=255)
+    version: str | None = Field(default=None, max_length=32)
+    eval_cell: str | None = Field(default=None, max_length=255)
+    eval_version: str | None = Field(default=None, max_length=32)
+    validation_cell: str | None = Field(default=None, max_length=255)
+    validation_version: str | None = Field(default=None, max_length=32)
     validation_enabled: bool = True
     eval_incumbent_before: bool | None = Field(
         default=None,
@@ -170,40 +251,67 @@ class StartFinetuneInput(MCPModel):
         default=None,
         description="Evaluate the untouched training base model for a matched comparison; defaults on.",
     )
-    eval_model_after: bool = True
+    eval_model_after: bool | None = None
     validation_split_ratio: float = Field(default=0.2, ge=0.05, le=0.5)
     split_method: Literal["random", "ordered"] = "random"
     name: str | None = Field(default=None, max_length=255)
     use_case: str = Field(default="", max_length=10_000)
-    training_type: TrainingType | None = None
     hyperparameters: dict[str, Any] | None = Field(
-        default=None, description="Keys override the derived defaults one by one."
+        default=None,
+        description="Model recipe. batch_size is the effective optimizer batch; do not supply gradient_accumulation_steps or per_device_train_batch_size. Native decisions accept pre_training_baseline (boolean, default true); false skips only the initial development evaluation.",
     )
     group_id: UUID | None = None
-    request_key: str | None = request_key_field()
-
-
-class FineTuneJobReference(JobReceipt):
-    kind: Literal["finetune_job"] = "finetune_job"
-    name: str
 
 
 class StartFinetuneOutput(MCPModel):
     summary: str = Field(min_length=1, max_length=240)
     finetune: FineTuneJobReference
+    decision_job: JobReceipt | None = None
     job: FineTuneJobReference
-    versions: PinnedVersions
+    cell: DatasetCellContract | None = None
     resource_links: list[ResourceLinkContract] = Field(max_length=3)
+
+
+class StartDecisionJobOutput(MCPModel):
+    summary: str = Field(min_length=1, max_length=240)
+    decision_job: JobReceipt
+    training_run: FineTuneJobReference
+    cell: DatasetCellContract | None = None
+    resource_links: list[ResourceLinkContract] = Field(max_length=3)
+
+
+class DecisionModelsInput(MCPModel):
+    pass
+
+
+class DecisionTrainingModel(MCPModel):
+    id: str
+    name: str
+    family: Literal["clef", "d3", "d1"]
+    training_available: bool
+    unavailable_reason: str | None
+    max_context_length: int
+    limits: dict[str, int]
+    decision_index: float | None
+
+
+class DecisionModelsOutput(MCPModel):
+    models: list[DecisionTrainingModel]
 
 
 class RetryDeploymentInput(MCPModel):
     deployment: str = Field(min_length=1, max_length=255)
 
 
+class DeployFinetuneInput(MCPModel):
+    finetune: str = Field(min_length=1, max_length=255)
+
+
 class DeploymentReference(MCPModel):
     id: str
     model_id: str
     status: str
+    inference_contract: str = "chat"
     inference_url: str | None = None
     resource: ResourceLinkContract
 
@@ -212,6 +320,13 @@ class RetryDeploymentOutput(MCPModel):
     summary: str = Field(min_length=1, max_length=240)
     deployment: DeploymentReference
     retry: JobReceipt
+    resource_links: list[ResourceLinkContract] = Field(max_length=2)
+
+
+class DeployFinetuneOutput(MCPModel):
+    summary: str = Field(min_length=1, max_length=240)
+    deployment: DeploymentReference
+    job: JobReceipt
     resource_links: list[ResourceLinkContract] = Field(max_length=2)
 
 
@@ -241,3 +356,15 @@ class SetBenchmarkModelOutput(MCPModel):
     model_id: str
     source: Literal["codebase", "trained"]
     resource_links: list[ResourceLinkContract] = Field(max_length=2)
+
+
+class ScheduleNativeEvaluationInput(MCPModel):
+    job: UUID
+    calibration_cell: UUID
+    final_cell: UUID
+
+
+class NativeEvaluationOutput(MCPModel):
+    summary: str
+    plan: dict[str, Any]
+    resource_links: list[ResourceLinkContract]

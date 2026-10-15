@@ -15,7 +15,12 @@ import {
 } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icons";
 import { useCapabilityDetailQuery } from "@/hooks/use-query";
-import { buildCurlSnippet, buildPythonSnippet, inferenceBaseUrl } from "@/lib/inference-snippets";
+import {
+  buildCurlSnippet,
+  buildDecisionSnippets,
+  buildPythonSnippet,
+  inferenceBaseUrl,
+} from "@/lib/inference-snippets";
 
 function SnippetBlock({ label, text }: { label: string; text: string }) {
   const { copied, copy } = useCopy(text);
@@ -50,20 +55,23 @@ export function ApiSnippetDialog({
   modelId,
   capabilityId,
   projectId,
+  decisionDeploymentId,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   modelId: string;
   capabilityId?: string | null;
   projectId?: string;
+  decisionDeploymentId?: string;
 }) {
   const [pin, setPin] = useState(false);
   const [keyOpen, setKeyOpen] = useState(false);
   const capability = useCapabilityDetailQuery(open ? (capabilityId ?? "") : "").data;
   const routedModelId = capabilityId && !pin ? `overmind/${capabilityId}` : modelId;
   const baseUrl = inferenceBaseUrl();
-  const curl = buildCurlSnippet({ baseUrl, modelId: routedModelId });
-  const python = buildPythonSnippet({ baseUrl, modelId: routedModelId });
+  const decision = decisionDeploymentId ? buildDecisionSnippets(decisionDeploymentId) : null;
+  const curl = decision?.curl ?? buildCurlSnippet({ baseUrl, modelId: routedModelId });
+  const python = decision?.python ?? buildPythonSnippet({ baseUrl, modelId: routedModelId });
 
   return (
     <>
@@ -78,7 +86,9 @@ export function ApiSnippetDialog({
           <DialogHeader>
             <DialogTitle>Call this model</DialogTitle>
             <DialogDescription>
-              OpenAI-compatible chat completions at the project API base URL.
+              {decision
+                ? "Typed decision probabilities."
+                : "OpenAI-compatible chat completions at the project API base URL."}
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="space-y-4">
@@ -111,7 +121,7 @@ export function ApiSnippetDialog({
               </div>
             ) : null}
             <SnippetBlock label="cURL" text={curl} />
-            <SnippetBlock label="Python (OpenAI SDK)" text={python} />
+            <SnippetBlock label={decision ? "Python" : "Python (OpenAI SDK)"} text={python} />
           </DialogBody>
         </DialogContent>
       </Dialog>

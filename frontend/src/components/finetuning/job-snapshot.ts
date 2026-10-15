@@ -33,7 +33,7 @@ export function jobElapsedSeconds(job: FinetuningJobList): number | null {
 
 export interface ExperimentProgress {
   elapsed_seconds: number | null;
-  eta_seconds: number | null;
+  eta_range_seconds: [number, number] | null;
   percent: number | null;
   tokens_processed: number | null;
   total_steps: number | null;
@@ -60,6 +60,7 @@ export interface ExperimentSnapshot {
 }
 
 export function experimentLabel(job: FinetuningJobList): string {
+  if (job.name?.trim()) return job.name.trim();
   const info = getModelProviderInfo(job.baseModel);
   return info.modelLabel || job.baseModel;
 }
@@ -71,13 +72,16 @@ export function buildExperimentSnapshot(
 ): ExperimentSnapshot {
   const progressFromJob = (job.progress ?? {}) as Record<string, unknown>;
   const live = curves?.progress;
+  const jobLiveProgress = parseFinetuningProgress(job.progress);
+  const liveProgress = parseFinetuningProgress(live);
   const progress: ExperimentProgress = {
     elapsed_seconds:
       live?.elapsed_seconds ??
       (progressFromJob.elapsed_seconds as number | null | undefined) ??
       jobElapsedSeconds(job),
-    eta_seconds:
-      live?.eta_seconds ?? (progressFromJob.eta_seconds as number | null | undefined) ?? null,
+    eta_range_seconds: live
+      ? (live.eta_range_seconds ?? null)
+      : ((progressFromJob.eta_range_seconds as [number, number] | null | undefined) ?? null),
     percent: live?.percent ?? (progressFromJob.percent as number | null | undefined) ?? null,
     tokens_processed:
       live?.tokens_processed ??
@@ -122,12 +126,13 @@ export function buildExperimentSnapshot(
     latestScored:
       [...judgeEvals].reverse().find((e) => e.kind === "final" && e.aggregate_score != null) ??
       null,
-    liveProgress:
-      (live?.metrics_history?.length ?? 0) > 0 ||
-      (live?.eval_history?.length ?? 0) > 0 ||
-      (live?.activity?.length ?? 0) > 0
-        ? parseFinetuningProgress(live)
-        : parseFinetuningProgress(job.progress),
+    liveProgress: liveProgress
+      ? {
+          ...jobLiveProgress,
+          ...liveProgress,
+          preparation: liveProgress.preparation ?? jobLiveProgress?.preparation,
+        }
+      : jobLiveProgress,
     lrPoints: (curves?.learning_rate ?? [])
       .filter((p): p is { step: number; value: number } => p.step != null && p.value != null)
       .map((p) => ({ step: p.step, value: p.value })),

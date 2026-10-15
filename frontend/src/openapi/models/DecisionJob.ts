@@ -13,20 +13,13 @@
  */
 
 import { mapValues } from '../runtime';
-import type { DecisionJobStatusEnum } from './DecisionJobStatusEnum';
+import type { FinetuningJob } from './FinetuningJob';
 import {
-    DecisionJobStatusEnumFromJSON,
-    DecisionJobStatusEnumFromJSONTyped,
-    DecisionJobStatusEnumToJSON,
-    DecisionJobStatusEnumToJSONTyped,
-} from './DecisionJobStatusEnum';
-import type { DecisionVersion } from './DecisionVersion';
-import {
-    DecisionVersionFromJSON,
-    DecisionVersionFromJSONTyped,
-    DecisionVersionToJSON,
-    DecisionVersionToJSONTyped,
-} from './DecisionVersion';
+    FinetuningJobFromJSON,
+    FinetuningJobFromJSONTyped,
+    FinetuningJobToJSON,
+    FinetuningJobToJSONTyped,
+} from './FinetuningJob';
 
 /**
  *
@@ -45,119 +38,36 @@ export interface DecisionJob {
      * @type {string}
      * @memberof DecisionJob
      */
-    readonly project: string;
+    readonly model: string;
     /**
      *
      * @type {string}
      * @memberof DecisionJob
      */
-    readonly modelId: string;
+    readonly status: string;
     /**
      *
-     * @type {DecisionJobStatusEnum}
+     * @type {FinetuningJob}
      * @memberof DecisionJob
      */
-    readonly status: DecisionJobStatusEnum;
-    /**
-     *
-     * @type {DecisionVersion}
-     * @memberof DecisionJob
-     */
-    training: DecisionVersion;
-    /**
-     *
-     * @type {DecisionVersion}
-     * @memberof DecisionJob
-     */
-    evaluationData: DecisionVersion | null;
-    /**
-     *
-     * @type {any}
-     * @memberof DecisionJob
-     */
-    readonly result: any | null;
-    /**
-     *
-     * @type {any}
-     * @memberof DecisionJob
-     */
-    readonly evaluation: any | null;
-    /**
-     *
-     * @type {string}
-     * @memberof DecisionJob
-     */
-    readonly evaluationStatus: DecisionJobEvaluationStatusEnum | null;
-    /**
-     *
-     * @type {string}
-     * @memberof DecisionJob
-     */
-    readonly error: string;
-    /**
-     *
-     * @type {string}
-     * @memberof DecisionJob
-     */
-    readonly costUsd: string | null;
-    /**
-     *
-     * @type {boolean}
-     * @memberof DecisionJob
-     */
-    readonly checkpointReady: boolean;
+    readonly trainingRun: FinetuningJob;
     /**
      *
      * @type {Date}
      * @memberof DecisionJob
      */
     readonly createdAt: Date;
-    /**
-     *
-     * @type {Date}
-     * @memberof DecisionJob
-     */
-    readonly startedAt: Date | null;
-    /**
-     *
-     * @type {Date}
-     * @memberof DecisionJob
-     */
-    readonly completedAt: Date | null;
 }
-
-
-/**
- * @export
- */
-export const DecisionJobEvaluationStatusEnum = {
-    none: 'none',
-    complete: 'complete',
-    partial: 'partial',
-    failed: 'failed'
-} as const;
-export type DecisionJobEvaluationStatusEnum = typeof DecisionJobEvaluationStatusEnum[keyof typeof DecisionJobEvaluationStatusEnum];
-
 
 /**
  * Check if a given object implements the DecisionJob interface.
  */
 export function instanceOfDecisionJob(value: object): value is DecisionJob {
     if (!('id' in value) || value['id'] === undefined) return false;
-    if (!('project' in value) || value['project'] === undefined) return false;
-    if (!('modelId' in value) || value['modelId'] === undefined) return false;
+    if (!('model' in value) || value['model'] === undefined) return false;
     if (!('status' in value) || value['status'] === undefined) return false;
-    if (!('training' in value) || value['training'] === undefined) return false;
-    if (!('evaluationData' in value) || value['evaluationData'] === undefined) return false;
-    if (!('result' in value) || value['result'] === undefined) return false;
-    if (!('evaluation' in value) || value['evaluation'] === undefined) return false;
-    if (!('evaluationStatus' in value) || value['evaluationStatus'] === undefined) return false;
-    if (!('error' in value) || value['error'] === undefined) return false;
-    if (!('costUsd' in value) || value['costUsd'] === undefined) return false;
-    if (!('checkpointReady' in value) || value['checkpointReady'] === undefined) return false;
+    if (!('trainingRun' in value) || value['trainingRun'] === undefined) return false;
     if (!('createdAt' in value) || value['createdAt'] === undefined) return false;
-    if (!('startedAt' in value) || value['startedAt'] === undefined) return false;
-    if (!('completedAt' in value) || value['completedAt'] === undefined) return false;
     return true;
 }
 
@@ -172,20 +82,10 @@ export function DecisionJobFromJSONTyped(json: any, ignoreDiscriminator: boolean
     return {
 
         'id': json['id'],
-        'project': json['project'],
-        'modelId': json['model_id'],
-        'status': DecisionJobStatusEnumFromJSON(json['status']),
-        'training': DecisionVersionFromJSON(json['training']),
-        'evaluationData': DecisionVersionFromJSON(json['evaluation_data']),
-        'result': json['result'],
-        'evaluation': json['evaluation'],
-        'evaluationStatus': json['evaluation_status'],
-        'error': json['error'],
-        'costUsd': json['cost_usd'],
-        'checkpointReady': json['checkpoint_ready'],
+        'model': json['model'],
+        'status': json['status'],
+        'trainingRun': FinetuningJobFromJSON(json['training_run']),
         'createdAt': (new Date(json['created_at'])),
-        'startedAt': (json['started_at'] == null ? null : new Date(json['started_at'])),
-        'completedAt': (json['completed_at'] == null ? null : new Date(json['completed_at'])),
     };
 }
 
@@ -193,14 +93,12 @@ export function DecisionJobToJSON(json: any): DecisionJob {
     return DecisionJobToJSONTyped(json, false);
 }
 
-export function DecisionJobToJSONTyped(value?: Omit<DecisionJob, 'id'|'project'|'model_id'|'status'|'result'|'evaluation'|'evaluation_status'|'error'|'cost_usd'|'checkpoint_ready'|'created_at'|'started_at'|'completed_at'> | null, ignoreDiscriminator: boolean = false): any {
+export function DecisionJobToJSONTyped(value?: Omit<DecisionJob, 'id'|'model'|'status'|'training_run'|'created_at'> | null, ignoreDiscriminator: boolean = false): any {
     if (value == null) {
         return value;
     }
 
     return {
 
-        'training': DecisionVersionToJSON(value['training']),
-        'evaluation_data': DecisionVersionToJSON(value['evaluationData']),
     };
 }

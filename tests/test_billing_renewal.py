@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from django.contrib.auth import get_user_model
 from django.urls import reverse
-from factories import auth_client
+from factories import auth_client, make_project, make_user
 from rest_framework.test import APIClient
 
 from overbae.models import BillingService, BillingTelemetry, Subscription, SubscriptionStatus
@@ -459,3 +459,20 @@ def test_ledger_lists_own_entries_newest_first():
     assert results[0]["amount"] == "-1.2500000"
     assert results[1]["service"] == BillingService.FREE_CREDITS
     assert results[1]["amount"] == "50.0000000"
+
+
+@pytest.mark.parametrize("ordering", ["service", "-service", "project__name", "-project__name"])
+def test_ledger_sorts_visible_labels_and_keeps_missing_projects_last(ordering):
+    user = make_user()
+    BillingTelemetry.objects.filter(user=user).delete()
+    project = make_project(name="Alpha")
+    first = BillingTelemetry.objects.create(
+        user=user, project=project, amount=-1, service=BillingService.INFERENCE_FT_MODEL
+    )
+    second = BillingTelemetry.objects.create(user=user, amount=-2, service=BillingService.INFERENCE)
+    response = auth_client(user).get(
+        reverse("billing-ledger"), {"ordering": ordering, "page_size": 1}
+    )
+    assert response.status_code == 200, response.content
+    expected = second if ordering == "-service" else first
+    assert response.data["results"][0]["id"] == str(expected.id)

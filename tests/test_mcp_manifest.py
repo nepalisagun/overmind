@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 
-from mcp_fixtures import EXPECTED_TOOL_NAMES
+from mcp_fixtures import EXPECTED_TOOL_NAMES, MAX_MANIFEST_BYTES
 
 from overbae.services.mcp.catalog import CATALOG
 
-MAX_MANIFEST_BYTES = 50 * 1024
 SECRET_INPUT_PARTS = {
     "access_token",
     "api_key",
@@ -20,7 +19,15 @@ SECRET_INPUT_PARTS = {
     "token",
 }
 FORBIDDEN_NAME_PARTS = ("delete", "remove", "cancel", "retry", "undeploy")
-ALLOWED_LIFECYCLE_TOOLS = {"retry_deployment", "cancel_dataset_job"}
+ALLOWED_LIFECYCLE_TOOLS = {
+    "retry_deployment",
+    "delete_eval_matrix_row",
+    "cancel_dataset",
+    "retry_data_partition",
+    "cancel_dataset_pipeline_run",
+    "cancel_finetune",
+}
+DESTRUCTIVE_TOOLS = {"cancel_dataset", "delete_eval_matrix_row"}
 
 
 def _serialized_tools(permissions: frozenset[str]) -> bytes:
@@ -35,20 +42,6 @@ def _serialized_tools(permissions: frozenset[str]) -> bytes:
         },
     }
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-
-
-def _annotation_keys(value):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key == "properties":
-                for prop in child.values():
-                    yield from _annotation_keys(prop)
-            else:
-                yield key
-                yield from _annotation_keys(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _annotation_keys(child)
 
 
 def _property_names(value):
@@ -98,7 +91,7 @@ def test_input_schemas_keep_strict_validation_without_secret_fields():
         schema = definition.as_mcp_tool().inputSchema
         assert schema["type"] == "object"
         assert schema["additionalProperties"] is False
-        assert "title" not in _annotation_keys(schema)
+        assert "title" not in json.dumps(schema)
         assert '"default":' not in json.dumps(schema)
         for name in _property_names(schema):
             parts = name.casefold().replace("-", "_").split("_")
@@ -110,18 +103,30 @@ def test_manifest_annotations_cover_read_only_world_and_cost_metadata():
         "run_evaluation": (False, False, True, "llm", "job"),
         "start_finetune": (False, False, True, "gpu", "job"),
         "retry_deployment": (False, False, True, "gpu", "job"),
-        "cancel_dataset_job": (False, True, False, "free", "sync"),
-        "run_inference": (False, False, True, "llm", "sync"),
+        "run_inference": (False, True, True, "llm", "job"),
+        "inspect_operation": (True, True, False, "free", "sync"),
+        "inspect_native_evaluation": (True, True, False, "free", "sync"),
         "get_model_swap_prompt": (True, True, False, "free", "sync"),
         "inspect_connectors": (True, True, True, "compute", "sync"),
         "configure_connector": (False, False, False, "free", "sync"),
         "sync_connector": (False, False, True, "free", "task"),
         "get_model_catalog": (True, True, False, "free", "sync"),
         "set_benchmark_model": (False, True, False, "free", "sync"),
+        "list_decision_models": (True, True, False, "free", "sync"),
+        "create_data_partition": (False, True, False, "compute", "job"),
+        "retry_data_partition": (False, True, False, "compute", "job"),
+        "create_native_evaluation": (False, True, False, "compute", "job"),
+        "resume_native_evaluation": (False, False, True, "gpu", "job"),
+        "create_training_experiment": (False, True, False, "compute", "job"),
+        "launch_training_experiment": (False, True, True, "gpu", "job"),
+        "measure_decision_performance": (False, True, True, "gpu", "job"),
+        "resume_decision_performance": (False, True, True, "gpu", "job"),
     }
     definitions = {definition.name: definition for definition in CATALOG.definitions()}
 
-    assert all(not definition.destructive for definition in definitions.values())
+    assert {name for name, definition in definitions.items() if definition.destructive} == (
+        DESTRUCTIVE_TOOLS
+    )
     assert all(
         definition.name in ALLOWED_LIFECYCLE_TOOLS
         or not any(part in definition.name for part in FORBIDDEN_NAME_PARTS)

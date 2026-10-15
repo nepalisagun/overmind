@@ -17,6 +17,11 @@ Use the native `optimize-capability` prompt for prompt/code optimization. Use
 1. **No manual baseline eval run.** The experiment scores its own baseline
    iteration (`order=0`) — that is what the improvement delta and the landing
    gate use.
+1. **Grade with the active eval set.** Every iteration is scored with the
+   rows of the experiment's first run, by default the capability's active set.
+   Confirm it holds the code's expectations and toml checks (`eval_preload` on
+   `overmind://capabilities/{capability}`; run `overmind sync` after changing
+   either) before starting. See [evals.md](evals.md#configure).
 1. **Not model comparison.** For swapping models follow
    [backtest.md](backtest.md) (`/overmind backtest`). Do not use this loop
    for `mode=model_comparison`.
@@ -24,8 +29,8 @@ Use the native `optimize-capability` prompt for prompt/code optimization. Use
 ## Main MCP path
 
 1. Call `list_datasets`, inspect the candidate by UUID, and use
-   `query_dataset` to verify the chosen `eval` version and capability.
-1. Call `check_optimizer_readiness` with the dataset UUID, `version`, optional
+   `query_dataset` to verify the chosen `eval` cell and capability.
+1. Call `check_optimizer_readiness` with the dataset UUID, cell UUID, optional
    eval set, mode, and model ids.
    Modes are exactly `optimize`, `model_comparison`, and `hybrid`.
 1. Fix reported dataset, eval-set, executioner, model, credit, and quota gaps.

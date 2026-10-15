@@ -13,19 +13,10 @@
  */
 
 import { mapValues } from '../runtime';
-import type { VersionSourceRequest } from './VersionSourceRequest';
-import {
-    VersionSourceRequestFromJSON,
-    VersionSourceRequestFromJSONTyped,
-    VersionSourceRequestToJSON,
-    VersionSourceRequestToJSONTyped,
-} from './VersionSourceRequest';
-
 /**
- * Exactly one of ``uploads``, ``upload_id``, ``text``, ``rows``, ``traces``,
- * ``llm_calls`` or ``version``. ``traces`` is a traces-list selection or
- * ``{"trace_ids": [...]}``. ``llm_calls`` is ``{capability_id, since, until?, model?,
- * limit?}``. ``version`` is a version of another dataset in the project.
+ * Exactly one of ``uploads``, ``upload_id``, ``text``, ``rows``, ``traces`` or ``llm_calls``.
+ * ``traces`` is a traces-list selection or ``{"trace_ids": [...]}``.
+ * ``llm_calls`` is ``{capability_id, since, until?, model?, limit?}``.
  * @export
  * @interface SourceRequest
  */
@@ -61,7 +52,7 @@ export interface SourceRequest {
      */
     rows?: Array<any>;
     /**
-     *
+     * Trace IDs or trace-list filters. A capability filter selects its unique invocation and descendants per trace. Otherwise the destination capability is preferred when present. Repeated invocations fail; unmatched traces retain original evidence.
      * @type {any}
      * @memberof SourceRequest
      */
@@ -72,18 +63,6 @@ export interface SourceRequest {
      * @memberof SourceRequest
      */
     llmCalls?: any | null;
-    /**
-     *
-     * @type {VersionSourceRequest}
-     * @memberof SourceRequest
-     */
-    version?: VersionSourceRequest;
-    /**
-     * Top-level JSON array to import from a .json upload.
-     * @type {string}
-     * @memberof SourceRequest
-     */
-    jsonRowsField?: string;
 }
 
 /**
@@ -110,8 +89,6 @@ export function SourceRequestFromJSONTyped(json: any, ignoreDiscriminator: boole
         'rows': json['rows'] == null ? undefined : json['rows'],
         'traces': json['traces'] == null ? undefined : json['traces'],
         'llmCalls': json['llm_calls'] == null ? undefined : json['llm_calls'],
-        'version': json['version'] == null ? undefined : VersionSourceRequestFromJSON(json['version']),
-        'jsonRowsField': json['json_rows_field'] == null ? undefined : json['json_rows_field'],
     };
 }
 
@@ -133,7 +110,5 @@ export function SourceRequestToJSONTyped(value?: SourceRequest | null, ignoreDis
         'rows': value['rows'],
         'traces': value['traces'],
         'llm_calls': value['llmCalls'],
-        'version': VersionSourceRequestToJSON(value['version']),
-        'json_rows_field': value['jsonRowsField'],
     };
 }

@@ -13,7 +13,6 @@ from rest_framework.routers import DefaultRouter
 from overbae.api.auth_keys import APITokenCurrentView, APITokenDestroyView, APITokenListCreateView
 from overbae.api.auth_registration import LocalSessionView, OnboardingView, UserMeView
 from overbae.api.auth_token_views import PublicTokenObtainPairView, PublicTokenRefreshView
-from overbae.api.behaviours import BehaviourViewSet, TaskExecutionViewSet
 from overbae.api.billing import (
     BillingLedgerView,
     CancelSubscriptionView,
@@ -25,24 +24,32 @@ from overbae.api.billing import (
 )
 from overbae.api.capabilities import AgentGraphView, CapabilityViewSet
 from overbae.api.completions import chat_completions, model_detail, models_list
+from overbae.api.data_exploration import DataExplorationViewSet
+from overbae.api.data_partitions import DataPartitionViewSet
+from overbae.api.dataset_transfers import DatasetTransferViewSet
 from overbae.api.datasets import DatasetViewSet
-from overbae.api.decision import DecisionJobViewSet, DecisionModelListView, DecisionSystemOneView
+from overbae.api.decision import DecisionJobViewSet, DecisionModelListView
+from overbae.api.decision_performance import DecisionPerformanceViewSet
 from overbae.api.eval_views import (
+    EvalMatrixViewSet,
+    EvalRunRowViewSet,
     EvalRunViewSet,
-    EvalSampleViewSet,
+    EvalScoreViewSet,
     EvalSetViewSet,
-    EvaluatorViewSet,
     ModelCatalogView,
-    ScoreViewSet,
-    VerdictViewSet,
 )
 from overbae.api.guest import GuestClaimView, GuestStartView
 from overbae.api.health import health_check
+from overbae.api.inference_requests import DeploymentInferenceView, InferenceRequestView
 from overbae.api.mcp_oauth import MCPConsentView
+from overbae.api.native_evaluation import NativeEvaluationViewSet
 from overbae.api.optimizer import OptimizerCandidateViewSet, OptimizerExperimentViewSet
 from overbae.api.otlp import otlp_traces
 from overbae.api.public_models import PublicModelLibraryDetailView, PublicModelLibraryListView
+from overbae.api.signal_views import SignalEventViewSet, SignalSubscriptionViewSet
 from overbae.api.sync import SyncView
+from overbae.api.training_experiments import TrainingExperimentViewSet
+from overbae.api.training_plans import TrainingPlanViewSet
 from overbae.api.training_preparation import TrainingPreparationViewSet
 from overbae.api.uploads import UploadViewSet
 from overbae.api.views import (
@@ -56,9 +63,31 @@ from overbae.api.views import (
     SessionViewSet,
     SpanViewSet,
 )
+from overbae.api.workbench import (
+    DatasetPipelineBindingViewSet,
+    DatasetPipelinePackageViewSet,
+    DatasetPipelineViewSet,
+)
 
 router = DefaultRouter()
+router.register("dataset-transfers", DatasetTransferViewSet, basename="dataset-transfer")
+router.register(
+    "dataset-pipeline-packages", DatasetPipelinePackageViewSet, basename="dataset-pipeline-package"
+)
+router.register("dataset-pipelines", DatasetPipelineViewSet, basename="dataset-pipeline")
+router.register(
+    "dataset-pipeline-bindings", DatasetPipelineBindingViewSet, basename="dataset-pipeline-binding"
+)
 # Must precede ``projects`` so ``…/memberships`` is not captured as a project id.
+router.register("data-explorations", DataExplorationViewSet, basename="data-exploration")
+router.register(r"training-experiments", TrainingExperimentViewSet, basename="training-experiment")
+router.register(r"decision-jobs", DecisionJobViewSet, basename="decision-job")
+router.register("training-plans", TrainingPlanViewSet, basename="training-plan")
+router.register(
+    r"decision-performance", DecisionPerformanceViewSet, basename="decision-performance"
+)
+router.register(r"native-evaluations", NativeEvaluationViewSet, basename="native-evaluation")
+router.register(r"data-partitions", DataPartitionViewSet, basename="data-partition")
 router.register(
     r"projects/(?P<project_id>[0-9a-f-]{36})/memberships",
     ProjectMembershipViewSet,
@@ -90,18 +119,27 @@ router.register(
 )
 router.register(r"optimizer-candidates", OptimizerCandidateViewSet, basename="optimizer-candidate")
 router.register(r"finetuning-jobs", FinetuningJobViewSet, basename="finetuningjob")
-router.register(r"decision-jobs", DecisionJobViewSet, basename="decision-job")
 router.register(r"deployed-models", DeployedModelViewSet, basename="deployedmodel")
-router.register(r"evaluators", EvaluatorViewSet, basename="evaluator")
+router.register(r"eval-matrix", EvalMatrixViewSet, basename="evalmatrix")
 router.register(r"eval-sets", EvalSetViewSet, basename="evalset")
 router.register(r"eval-runs", EvalRunViewSet, basename="evalrun")
-router.register(r"eval-samples", EvalSampleViewSet, basename="evalsample")
-router.register(r"eval-scores", ScoreViewSet, basename="evalscore")
-router.register(r"verdicts", VerdictViewSet, basename="verdict")
-router.register(r"behaviours", BehaviourViewSet, basename="behaviour")
-router.register(r"task-executions", TaskExecutionViewSet, basename="taskexecution")
+router.register(r"eval-run-rows", EvalRunRowViewSet, basename="evalrunrow")
+router.register(r"eval-scores", EvalScoreViewSet, basename="evalscore")
+router.register(r"signal-subscriptions", SignalSubscriptionViewSet, basename="signalsubscription")
+router.register(r"signal-events", SignalEventViewSet, basename="signalevent")
 
 urlpatterns = [
+    path("api/decision-models/", DecisionModelListView.as_view(), name="decision-model-list"),
+    path(
+        "api/deployed-models/<uuid:deployment_id>/inference/",
+        DeploymentInferenceView.as_view(),
+        name="deployment-inference",
+    ),
+    path(
+        "api/inference-requests/<uuid:request_id>/",
+        InferenceRequestView.as_view(),
+        name="inference-request",
+    ),
     path("api/mcp-oauth/consent/", MCPConsentView.as_view(), name="mcp-oauth-consent"),
     path(settings.ADMIN_URL_PATH, admin.site.urls),
     path("health", health_check, name="health"),
@@ -112,12 +150,6 @@ urlpatterns = [
     path("api/v1/models", models_list, name="v1-models"),
     path("api/v1/models/<path:model_id>", model_detail, name="v1-model-detail"),
     path("api/", include(router.urls)),
-    path("api/decision-models/", DecisionModelListView.as_view(), name="decision-model-list"),
-    path(
-        "api/decision-models/<path:model_id>/systemone",
-        DecisionSystemOneView.as_view(),
-        name="decision-systemone",
-    ),
     path("api/agent/", AgentGraphView.as_view(), name="agent-graph"),
     path("api/v1/sync", SyncView.as_view(), name="toml-sync"),
     path("api/models/catalog/", ModelCatalogView.as_view(), name="model-catalog"),

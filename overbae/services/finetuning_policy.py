@@ -11,7 +11,11 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from modal_shared.decisions import DECISION_OBJECTIVES
+from modal_shared.modelfam import resolve
+from overbae.core.errors import InputValidationError
 from overbae.modal.model_registry import context_headroom, get_training_context_policy
+from overbae.services.training_contract import baseline_evaluation_enabled, validate_effective_batch
 
 # Epochs when unset: enough example-visits that tiny datasets get real optimizer-step
 # counts (49 rows × 2 epochs still improved on every batch when the LR hit zero).
@@ -23,8 +27,7 @@ MAX_EPOCHS = 10
 LARGE_DATASET_ROWS = 10_000  # ≥ this → 2 epochs
 HUGE_DATASET_ROWS = 50_000  # ≥ this → 1 epoch
 
-# Fixed training seed so re-runs are reproducible (matches finetuning_split's
-# deterministic corpus split).
+# The default matches the deterministic corpus split; explicit experiment seeds override it.
 TRAINING_SEED = 42
 
 # Packing pays off when padding waste is large AND the dataset is big enough
@@ -194,6 +197,23 @@ def baseten_context_length(
     return chosen
 
 
+def validate_requested_context_length(context_length: int, *, model_max: int | None):
+    if type(context_length) is not int:
+        raise InputValidationError("Context length must be an integer.")
+    if model_max is not None and context_length > model_max:
+        raise InputValidationError(
+            f"This training configuration supports at most {model_max} context tokens."
+        )
+    if not 128 <= context_length <= 2_000_000:
+        raise InputValidationError("Context length must be between 128 and 2,000,000 tokens.")
+    supported = baseten_context_length(model_max=model_max, requested=context_length)
+    if supported != context_length:
+        raise InputValidationError(
+            f"context_length={context_length} is unsupported; choose {supported} "
+            "or another supported context length."
+        )
+
+
 def estimated_training_context_length(
     estimated_tokens: int = 0,
     *,
@@ -249,6 +269,7 @@ class BasetenTrainingPlan:
     # Max per_device_batch × context_length that fits one GPU; 0 = not computed.
     token_budget: int = 0
     seed: int = TRAINING_SEED
+    pre_training_baseline: bool = True
     notes: list[str] = field(default_factory=list)
 
 
@@ -260,7 +281,6 @@ def _default_lora_target_modules(model_id: str | None) -> str | None:
     """
     if not model_id:
         return None
-    from modal_shared.modelfam import resolve
 
     return resolve(model_id).lora_target_modules
 
@@ -365,7 +385,7 @@ def derive_baseten_training_plan(
 ) -> BasetenTrainingPlan:
     """Derive the full Baseten training plan from data + catalog context.
 
-    Explicit hyperparameters are honoured verbatim after safety clamps; anything absent
+    Explicit hyperparameters are preserved or rejected; anything absent
     is gap-filled from the same heuristics the recommender uses, never a hardcoded
     constant. Raises :class:`TrainingPlanError` when the combination cannot work, so a
     job fails pre-submission instead of mid-run on Baseten.
@@ -373,8 +393,16 @@ def derive_baseten_training_plan(
     ``hidden_size`` enables the activation token budget (0 = weight-only checks).
     """
     hp = dict(hyperparameters or {})
+    try:
+        validate_effective_batch(hp)
+        baseline = baseline_evaluation_enabled(hp)
+    except ValueError as exc:
+        raise TrainingPlanError(str(exc)) from exc
     stats = dict(dataset_stats or {})
     notes: list[str] = []
+    seed = hp.get("seed", TRAINING_SEED)
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise TrainingPlanError("seed must be an integer between 0 and 4,294,967,295.")
 
     if num_train_examples <= 0:
         raise TrainingPlanError("Dataset produced 0 training examples.")
@@ -404,6 +432,11 @@ def derive_baseten_training_plan(
     context_length = baseten_context_length(
         max_row_tokens, model_max=model_max_context, requested=requested_ctx
     )
+
+    if requested_ctx is not None and context_length != requested_ctx:
+        raise TrainingPlanError(
+            f"context_length={requested_ctx} is unsupported; choose {context_length} or another model."
+        )
 
     load_in_4bit, token_budget = _resolve_memory_plan(
         params_b=params_b,
@@ -437,7 +470,8 @@ def derive_baseten_training_plan(
     weight_decay = float(hp["weight_decay"]) if hp.get("weight_decay") is not None else 0.01
 
     # Never larger than the corpus — an over-sized batch degenerates to 1 step.
-    hard_max = model_max_batch if model_max_batch else 256
+    native_decisions = hp.get("objective") in DECISION_OBJECTIVES
+    hard_max = 256 if native_decisions else model_max_batch or 256
     hard_max = min(hard_max, num_train_examples)
     hard_max = max(hard_max, model_min_batch)
     raw_batch = hp.get("batch_size")
@@ -445,8 +479,9 @@ def derive_baseten_training_plan(
         batch_size = int(raw_batch)
         clamped = min(max(batch_size, model_min_batch), hard_max)
         if clamped != batch_size:
-            notes.append(f"batch_size clamped {batch_size} → {clamped} (model/dataset bounds)")
-            batch_size = clamped
+            raise TrainingPlanError(
+                f"batch_size={batch_size} is outside model/dataset bounds; choose {model_min_batch}–{hard_max}."
+            )
     else:
         batch_size = openai_batch_size(
             num_train_examples, min_batch=model_min_batch, max_batch=hard_max, use_lora=use_lora
@@ -457,7 +492,17 @@ def derive_baseten_training_plan(
     # parallel) — effective batch is per_device × grad_accum regardless of GPU
     # count. Micro-batch grows to whatever the activation budget allows.
     per_device_batch, grad_accum = split_batch(batch_size, context_length, token_budget)
-    if per_device_batch > 1:
+    if native_decisions:
+        token_budget = max(context_length, min(token_budget or context_length, 32768))
+        per_device_batch = next(
+            size for size in range(min(64, batch_size), 0, -1) if batch_size % size == 0
+        )
+        grad_accum = batch_size // per_device_batch
+        notes.append(
+            f"Decision micro-batches use at most {per_device_batch} rows and "
+            f"{token_budget:,} padded tokens; each optimizer batch retains {batch_size} rows"
+        )
+    elif per_device_batch > 1:
         notes.append(
             f"micro-batch {per_device_batch}×{grad_accum} "
             f"(budget ≈{token_budget:,} tokens ≥ {per_device_batch}×{context_length:,})"
@@ -474,7 +519,9 @@ def derive_baseten_training_plan(
         lora_dropout = float(qlora["lora_dropout"])
     # Gemma4 MoE (26B-A4B): PEFT ParamWrapper on expert params rejects dropout ≠ 0.
     if model_id and lora_dropout and "a4b" in model_id.lower():
-        notes.append(f"lora_dropout forced to 0 for Gemma4 MoE (was {lora_dropout})")
+        if "lora_dropout" in training_type or "lora_dropout" in hp:
+            raise TrainingPlanError("lora_dropout must be 0 for Gemma4 MoE.")
+        notes.append("lora_dropout=0 required for Gemma4 MoE")
         lora_dropout = 0.0
     lora_target_modules = str(
         training_type.get("lora_trainable_modules")
@@ -494,7 +541,16 @@ def derive_baseten_training_plan(
     avg_row_tokens = approx_tokens_from_chars(
         int(stats.get("avg_input_chars") or 0) + int(stats.get("avg_output_chars") or 0)
     )
-    packing = should_pack(num_train_examples, avg_row_tokens, context_length)
+    packing = (
+        bool(hp["packing"])
+        if "packing" in hp
+        else hp.get("objective") not in DECISION_OBJECTIVES
+        and should_pack(num_train_examples, avg_row_tokens, context_length)
+    )
+    if packing and native_decisions:
+        raise TrainingPlanError(
+            "packing is unsupported for native decision training; choose packing=false."
+        )
     # Gemma4/Muse: Unsloth forces GC off + flex_attention. Nemotron 3.5: hybrid mamba.
     # Packing fills every step to MAX_LENGTH → OOM on 1×H100.
     if packing and model_id:
@@ -502,6 +558,8 @@ def derive_baseten_training_plan(
 
         fam = family_key(model_id)
         if fam in ("gemma4", "muse_glimmer", "nemotron35"):
+            if hp.get("packing"):
+                raise TrainingPlanError(f"packing is unsupported for {fam}; choose packing=false.")
             packing = False
             notes.append(
                 "packing disabled for Gemma4/Muse/Nemotron 3.5 (hybrid / no gradient checkpointing)"
@@ -533,5 +591,7 @@ def derive_baseten_training_plan(
         training_type=tt_name,
         load_in_4bit=load_in_4bit,
         token_budget=token_budget,
+        seed=seed,
+        pre_training_baseline=baseline,
         notes=notes,
     )

@@ -3,23 +3,19 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, Outlet, useMatches } from "@tanstack/react-router";
 import type { OnChangeFn, RowSelectionState, VisibilityState } from "@tanstack/react-table";
 
 import { NewDatasetDialog } from "@/components/datasets/new-dataset-dialog";
 import { ObservabilitySetupDialog } from "@/components/observability-setup-dialog";
 import { ProjectRequiredEmptyState } from "@/components/project-required-empty-state";
-import { ConversationDetailSheet } from "@/components/traces/conversation-detail-sheet";
-import { ExecutionDetailSheet } from "@/components/traces/execution-detail-sheet";
-import { buildExecutionsColumns } from "@/components/traces/executions-columns";
 import {
   parseFiltersFromSearchParams,
   serializeFiltersToSearchParams,
   useRecentFilterParams,
 } from "@/components/traces/filters";
 import { sessionsColumns } from "@/components/traces/sessions-columns";
-import { TraceGroupHeader } from "@/components/traces/trace-execution-flow";
+import { SignalEvents } from "@/components/traces/signal-events";
 import { TraceSelectionBar } from "@/components/traces/trace-selection-bar";
 import { tracesColumns } from "@/components/traces/traces-columns";
 import {
@@ -41,20 +37,10 @@ import {
   SheetDescription,
   SheetTitle,
 } from "@/components/ui/sheet";
-import { useBehavioursQuery } from "@/hooks/use-behaviours";
-import { fetchAllCapabilities } from "@/hooks/use-capabilities";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { TraceSelectionSpec } from "@/hooks/use-datasets";
 import { usePersistedState } from "@/hooks/use-persisted-state";
 import { type SessionRow, useSessionDetail, useSessionsList } from "@/hooks/use-sessions";
-import {
-  conversationGroupCaption,
-  executionConversationId,
-  executionSessionScore,
-  groupExecutionsByTrace,
-  handoffTraceIds,
-  shortConversationId,
-  useTaskExecutionsList,
-} from "@/hooks/use-task-executions";
 import {
   type TraceRef,
   type TraceRow,
@@ -63,24 +49,9 @@ import {
 } from "@/hooks/use-traces";
 import { featureFlags } from "@/lib/feature-flags";
 import { tracesSearchSchema } from "@/lib/schemas";
-import type { TaskExecutionList } from "@/openapi";
 
 const DEFAULT_TRACES_ORDERING = "-start_time_ns";
 const DEFAULT_SESSIONS_ORDERING = "-last_span_ns";
-const DEFAULT_EXECUTIONS_ORDERING = "-started_at";
-
-// The shared `ordering` param can carry trace fields this view rejects.
-const EXECUTION_ORDERING_FIELDS = new Set([
-  "behaviour__key",
-  "binding_source",
-  "conversation_id",
-  "duration_ms",
-  "started_at",
-  "status",
-  "success_score",
-  "terminal_kind",
-  "trace_id",
-]);
 
 // The shared `ordering` param can carry trace fields this view rejects.
 const SESSION_ORDERING_FIELDS = new Set([
@@ -130,10 +101,11 @@ function TracesPage() {
     error__isnull,
     view,
     session,
+    signal_event: signalEvent,
   } = search;
   const isSessionsView = view === "sessions";
-  const isExecutionsView = view === "executions";
-  const tracesView: TracesViewMode = view;
+  const isSignalsView = featureFlags.signals && view === "signals";
+  const tracesView: TracesViewMode = isSessionsView ? "sessions" : "roots";
 
   const status: "all" | "success" | "error" =
     error__isnull === "true" ? "error" : error__isnull === "false" ? "success" : "all";
@@ -150,7 +122,8 @@ function TracesPage() {
     !!searchTerm ||
     timeRange !== "all" ||
     status !== "all" ||
-    !!session;
+    !!session ||
+    (featureFlags.signals && !!signalEvent);
 
   const [searchInput, setSearchInput] = useState(searchTerm ?? "");
 
@@ -215,28 +188,11 @@ function TracesPage() {
     [setSearch]
   );
 
-  // Ordering fields differ per view, so switching resets sort + page.
-  const handleViewChange = useCallback(
-    (v: TracesViewMode) => {
-      setSearch({
-        ordering: undefined,
-        page: 1,
-        session: v === "sessions" ? undefined : session,
-        view: v,
-      });
-    },
-    [setSearch, session]
-  );
-
   const handleResetAll = useCallback(() => {
     navigate({
       search: {
         detailExpanded: false,
-        ordering: isExecutionsView
-          ? DEFAULT_EXECUTIONS_ORDERING
-          : isSessionsView
-            ? DEFAULT_SESSIONS_ORDERING
-            : DEFAULT_TRACES_ORDERING,
+        ordering: isSessionsView ? DEFAULT_SESSIONS_ORDERING : DEFAULT_TRACES_ORDERING,
         page: 1,
         page_size: pageSize,
         projectId: projectId!,
@@ -246,7 +202,7 @@ function TracesPage() {
       to: "/observability",
     });
     setSearchInput("");
-  }, [isExecutionsView, isSessionsView, navigate, pageSize, projectId, tracesView]);
+  }, [isSessionsView, navigate, pageSize, projectId, tracesView]);
 
   const apiFilters = useMemo(() => {
     const f: Record<string, string | undefined> = {};
@@ -264,8 +220,16 @@ function TracesPage() {
     }
     f.all_spans = "false";
     if (session) f.session = session;
+    if (featureFlags.signals && signalEvent) f.signal_event = signalEvent;
     return f;
-  }, [advancedFilters, error__isnull, search.received_at__gte, search.received_at__lte, session]);
+  }, [
+    advancedFilters,
+    error__isnull,
+    search.received_at__gte,
+    search.received_at__lte,
+    session,
+    signalEvent,
+  ]);
 
   const activeCapabilityId = useMemo(() => {
     const entry = advancedFilters.find(
@@ -273,8 +237,7 @@ function TracesPage() {
     );
     return entry?.value;
   }, [advancedFilters]);
-  // The Unbound sentinel is not a UUID: executions translate it to
-  // binding_source=unbound, sessions have no unbound axis.
+  // The Unbound sentinel is not a UUID; sessions have no unbound axis.
   const unboundOnly = activeCapabilityId === UNBOUND_CAPABILITY;
   const capabilityUuidFilter = unboundOnly ? undefined : activeCapabilityId;
 
@@ -282,7 +245,7 @@ function TracesPage() {
 
   const { data, isFetched, isFetching, isRefetching, error, refetch, dataUpdatedAt } =
     useTracesList({
-      enabled: !isSessionsView && !isExecutionsView,
+      enabled: !isSessionsView && !isSignalsView,
       filters: apiFilters,
       ordering: tracesOrdering,
       page,
@@ -316,154 +279,8 @@ function TracesPage() {
 
   const { data: sessionDetail } = useSessionDetail(!isSessionsView ? session : undefined);
 
-  const executionsOrdering = useMemo(() => {
-    const raw = ordering ?? DEFAULT_EXECUTIONS_ORDERING;
-    return EXECUTION_ORDERING_FIELDS.has(raw.replace(/^-/, "")) ? raw : DEFAULT_EXECUTIONS_ORDERING;
-  }, [ordering]);
-
-  const executionFilters = useMemo(() => {
-    const f: Record<string, string | undefined> = {};
-    Object.assign(f, serializeFiltersToSearchParams(advancedFilters));
-    if (error__isnull === "true") f.has_error = "true";
-    if (error__isnull === "false") f.has_error = "false";
-    if (search.received_at__gte) f.received_at__gte = search.received_at__gte;
-    if (search.received_at__lte) f.received_at__lte = search.received_at__lte;
-    delete f.capability;
-    if (unboundOnly) f.binding_source = "unbound";
-    return f;
-  }, [
-    advancedFilters,
-    error__isnull,
-    search.received_at__gte,
-    search.received_at__lte,
-    unboundOnly,
-  ]);
-
-  const [groupByConversation, setGroupByConversation] = usePersistedState(
-    "executions:groupByConversation",
-    true
-  );
-  const {
-    data: executionsData,
-    isFetched: executionsFetched,
-    isFetching: executionsFetching,
-    isRefetching: executionsRefetching,
-    error: executionsError,
-    refetch: refetchExecutions,
-    dataUpdatedAt: executionsDataUpdatedAt,
-  } = useTaskExecutionsList({
-    capability: capabilityUuidFilter,
-    enabled: isExecutionsView && !!projectId,
-    filters: executionFilters,
-    // Grouped pages hold whole conversations; the server orders them by
-    // latest activity and ignores `ordering`.
-    group: groupByConversation ? "conversation" : undefined,
-    ordering: executionsOrdering,
-    page,
-    pageSize,
-    // Without it the API returns executions from every project the user belongs to.
-    project: projectId,
-    search: searchTerm || undefined,
-  });
-
-  const { data: behavioursData } = useBehavioursQuery(isExecutionsView);
-  const behaviourNameById = useMemo(
-    () => new Map((behavioursData?.results ?? []).map((b) => [b.id, b.displayName || b.key])),
-    [behavioursData]
-  );
-
-  const { data: capabilitiesData } = useQuery({
-    enabled: isExecutionsView && !!projectId,
-    queryFn: () => fetchAllCapabilities(projectId!),
-    queryKey: ["capabilities", projectId],
-  });
-  const capabilityNameById = useMemo(
-    () => new Map((capabilitiesData?.results ?? []).map((a) => [a.id, a.name])),
-    [capabilitiesData]
-  );
-
-  const [selectedExecutionId, setSelectedExecutionId] = useState<string | null>(null);
-  // Trace-flow picks can point outside the current page, so the row itself is kept.
-  const [flowExecution, setFlowExecution] = useState<TaskExecutionList | null>(null);
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
-  const [focusedTurnId, setFocusedTurnId] = useState<string | null>(null);
-  const toggleExecution = useCallback(
-    (row: TaskExecutionList) => {
-      const cid = executionConversationId(row);
-      if (groupByConversation && cid) {
-        if (selectedConversationId === cid && focusedTurnId === row.id) {
-          setSelectedConversationId(null);
-          setFocusedTurnId(null);
-          return;
-        }
-        setSelectedExecutionId(null);
-        setSelectedConversationId(cid);
-        setFocusedTurnId(row.id);
-        return;
-      }
-      setSelectedConversationId(null);
-      setFocusedTurnId(null);
-      setSelectedExecutionId((prev) => (prev === row.id ? null : row.id));
-    },
-    [focusedTurnId, groupByConversation, selectedConversationId]
-  );
-  const selectedExecution = useMemo(() => {
-    if (!isExecutionsView || !selectedExecutionId) return null;
-    return (
-      executionsData?.results.find((r) => r.id === selectedExecutionId) ??
-      (flowExecution?.id === selectedExecutionId ? flowExecution : null)
-    );
-  }, [isExecutionsView, selectedExecutionId, executionsData, flowExecution]);
-  const handleSelectFlowExecution = useCallback((row: TaskExecutionList) => {
-    setFlowExecution(row);
-    setSelectedConversationId(null);
-    setFocusedTurnId(null);
-    setSelectedExecutionId(row.id);
-  }, []);
-  const executionsColumns = useMemo(
-    () => buildExecutionsColumns({ behaviourNameById, capabilityNameById, projectId: projectId! }),
-    [capabilityNameById, behaviourNameById, projectId]
-  );
-
-  const handoffTraces = useMemo(
-    () => handoffTraceIds(executionsData?.results ?? []),
-    [executionsData]
-  );
-  const groupedExecutionsData = useMemo(() => {
-    if (!executionsData || groupByConversation) return executionsData;
-    return {
-      ...executionsData,
-      results: groupExecutionsByTrace(executionsData.results, handoffTraces),
-    };
-  }, [executionsData, groupByConversation, handoffTraces]);
-  const sessionByConversation = useMemo(() => {
-    const map = new Map<string, { rationale: string; score: number | null }>();
-    for (const row of groupedExecutionsData?.results ?? []) {
-      const cid = executionConversationId(row);
-      if (!cid || map.has(cid)) continue;
-      map.set(cid, {
-        rationale: String(
-          (row as { sessionRationale?: string | null }).sessionRationale ?? ""
-        ).trim(),
-        score: executionSessionScore(row),
-      });
-    }
-    return map;
-  }, [groupedExecutionsData]);
-  const conversationTurns = useMemo(() => {
-    if (!selectedConversationId) return [];
-    return (groupedExecutionsData?.results ?? []).filter(
-      (row) => executionConversationId(row) === selectedConversationId
-    );
-  }, [groupedExecutionsData, selectedConversationId]);
-
   const rows = useMemo(() => data?.results ?? [], [data]);
-  const activeCount =
-    (isExecutionsView
-      ? executionsData?.count
-      : isSessionsView
-        ? sessionsData?.count
-        : data?.count) ?? 0;
+  const activeCount = (isSessionsView ? sessionsData?.count : data?.count) ?? 0;
 
   const [columnVisibility, setColumnVisibility] = usePersistedState<VisibilityState>(
     "traces:columnVisibility",
@@ -475,8 +292,6 @@ function TracesPage() {
       trace_id: false,
     }
   );
-  const [executionsColumnVisibility, setExecutionsColumnVisibility] =
-    usePersistedState<VisibilityState>("executions:columnVisibility", {});
 
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   // tanstack's `rowSelection` only resolves rows on the current page, so picks
@@ -585,7 +400,11 @@ function TracesPage() {
           </Link>
         </Button>
       }
-      description="Search, score and explore production traces."
+      description={
+        featureFlags.signals
+          ? "Explore sessions, investigate signals and inspect their traces."
+          : "Explore sessions and inspect their traces."
+      }
       icon={
         <Icon.observabilityTitle
           aria-hidden
@@ -606,49 +425,29 @@ function TracesPage() {
 
   // Gate on a poll/refetch, not the initial load — that one is already
   // covered by the table's own skeleton.
-  const isPolling = isExecutionsView
-    ? executionsFetching && executionsFetched
-    : isSessionsView
-      ? sessionsFetching && sessionsFetched
-      : isFetching && isFetched;
+  const isPolling = isSessionsView ? sessionsFetching && sessionsFetched : isFetching && isFetched;
 
   // `useSessionsList` polls at a fixed cadence; `useTracesList` backs off to
   // 5s while the list is empty (faster first-trace feedback) and 10s once it
   // isn't — mirror that here so "next" doesn't drift from the real interval.
-  const lastUpdatedAt = isExecutionsView
-    ? executionsDataUpdatedAt
-    : isSessionsView
-      ? sessionsDataUpdatedAt
-      : dataUpdatedAt;
-  const listCount = isExecutionsView ? executionsData?.count : data?.count;
+  const lastUpdatedAt = isSessionsView ? sessionsDataUpdatedAt : dataUpdatedAt;
+  const listCount = data?.count;
   const pollIntervalMs = isSessionsView ? 10_000 : (listCount ?? 0) > 0 ? 10_000 : 5_000;
   const nextPollAt = lastUpdatedAt ? lastUpdatedAt + pollIntervalMs : undefined;
 
   const toolbarProps = {
     customTimeRange,
     filters: advancedFilters,
-    groupByConversation,
     isFetching: isPolling,
-    isRefetching: isExecutionsView
-      ? executionsRefetching
-      : isSessionsView
-        ? sessionsRefetching
-        : isRefetching,
+    isRefetching: isSessionsView ? sessionsRefetching : isRefetching,
     lastUpdatedAt: lastUpdatedAt || undefined,
     nextPollAt,
     onFiltersChange: handleFiltersChange,
-    onGroupByConversationChange: (next: boolean) => {
-      setGroupByConversation(next);
-      setSelectedConversationId(null);
-      setFocusedTurnId(null);
-    },
-    onRefresh: () =>
-      isExecutionsView ? refetchExecutions() : isSessionsView ? refetchSessions() : refetch(),
+    onRefresh: () => (isSessionsView ? refetchSessions() : refetch()),
     onResetAll: handleResetAll,
     onSearchChange: setSearchInput,
     onStatusChange: handleStatusChange,
     onTimeRangeChange: handleTimeRangeChange,
-    onViewChange: handleViewChange,
     projectId,
     searchValue: searchInput,
     status,
@@ -658,90 +457,46 @@ function TracesPage() {
 
   return (
     <PageShell header={header} variant="full">
-      {isExecutionsView ? (
-        <DataTable<TaskExecutionList>
-          columns={executionsColumns}
-          columnVisibility={executionsColumnVisibility}
-          data={groupedExecutionsData}
-          emptyState={<ExecutionsEmptyState />}
-          error={executionsError}
-          getGroupKey={
-            groupByConversation
-              ? // A multi-agent run has no conversation to key on, so it groups by trace.
-                (row) =>
-                  executionConversationId(row) ||
-                  (handoffTraces.has(row.traceId) ? row.traceId : null)
-              : (row) => (handoffTraces.has(row.traceId) ? row.traceId : null)
-          }
-          getRowId={(row) => row.id}
-          hasActiveFilters={hasActiveFilters}
-          // See the traces table below: settledness is `isFetched`, not `isLoading`.
-          isLoading={!executionsFetched}
-          isRowActive={(row) => row.id === selectedExecutionId || row.id === focusedTurnId}
-          onClearFilters={handleResetAll}
-          onColumnVisibilityChange={setExecutionsColumnVisibility}
-          onGroupHeaderClick={
-            groupByConversation
-              ? (key) => {
-                  if (handoffTraces.has(key)) {
-                    handleTraceClick(key);
-                    return;
-                  }
-                  setSelectedExecutionId(null);
-                  setSelectedConversationId((prev) => {
-                    if (prev === key) {
-                      setFocusedTurnId(null);
-                      return null;
-                    }
-                    const members = (groupedExecutionsData?.results ?? []).filter(
-                      (row) => executionConversationId(row) === key
-                    );
-                    setFocusedTurnId(members.at(-1)?.id ?? null);
-                    return key;
-                  });
-                }
-              : (key) => handleTraceClick(key)
-          }
-          onOrderingChange={(next) =>
-            setSearch({
-              ordering: nextOrdering(next, executionsOrdering, DEFAULT_EXECUTIONS_ORDERING),
-              page: 1,
-            })
-          }
-          onPageChange={(p) => setSearch({ page: p })}
-          onPageSizeChange={(s) => setSearch({ page: 1, page_size: s })}
-          onRowClick={toggleExecution}
-          ordering={executionsOrdering}
-          page={page}
-          pageSize={pageSize}
-          renderGroupHeader={(key, count) => {
-            if (!groupByConversation || handoffTraces.has(key)) {
-              return (
-                <TraceGroupHeader
-                  capabilityNameById={capabilityNameById}
-                  count={count}
-                  executions={(groupedExecutionsData?.results ?? []).filter(
-                    (row) => row.traceId === key
-                  )}
-                  traceId={key}
-                />
-              );
-            }
-            const session = sessionByConversation.get(key);
-            return (
-              <span className="flex items-center gap-2">
-                <Icon.session aria-hidden className="size-3.5 shrink-0" />
-                <span className="font-mono" title={key}>
-                  {shortConversationId(key)}
-                </span>
-                <span title={session?.rationale || undefined}>
-                  {conversationGroupCaption(count, session?.score ?? null)}
-                </span>
-              </span>
-            );
+      <Tabs
+        className="w-fit pb-3"
+        onValueChange={(next) => {
+          navigate({
+            search: { page: 1, projectId, timeRange: "all", view: next as typeof view },
+            to: "/observability",
+          });
+          setSearchInput("");
+          handleClearSelection();
+        }}
+        value={traceId || (view === "signals" && !featureFlags.signals) ? "roots" : view}
+      >
+        <TabsList aria-label="Observability views">
+          <TabsTrigger value="sessions">Sessions</TabsTrigger>
+          {featureFlags.signals && <TabsTrigger value="signals">Signals</TabsTrigger>}
+          <TabsTrigger value="roots">Traces</TabsTrigger>
+        </TabsList>
+      </Tabs>
+      {isSignalsView ? (
+        <SignalEvents
+          onChange={setSearch}
+          onSelect={(id, conversation) => {
+            navigate({
+              search: {
+                page: 1,
+                projectId,
+                session: conversation || undefined,
+                signal_event: id,
+                timeRange: "all",
+                view: "roots",
+              },
+              to: "/observability",
+            });
+            setSearchInput("");
           }}
-          storageKey="executions:table-cols"
-          toolbar={(t) => <TracesTableToolbar {...toolbarProps} table={t} />}
+          page={page}
+          projectId={projectId}
+          session={session}
+          signal={search.signal}
+          unseen={!!search.unseen}
         />
       ) : isSessionsView ? (
         <DataTable<SessionRow>
@@ -765,7 +520,13 @@ function TracesPage() {
           onPageChange={(p) => setSearch({ page: p })}
           onPageSizeChange={(s) => setSearch({ page: 1, page_size: s })}
           onRowClick={(row) =>
-            setSearch({ ordering: undefined, page: 1, session: row.id, view: "roots" })
+            setSearch({
+              ordering: undefined,
+              page: 1,
+              session: row.id,
+              signal_event: undefined,
+              view: "roots",
+            })
           }
           ordering={sessionOrdering}
           page={page}
@@ -776,7 +537,21 @@ function TracesPage() {
       ) : (
         <DataTable<TraceRow>
           banner={
-            session ? (
+            featureFlags.signals && signalEvent ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <span>Traces checked for the selected signal.</span>
+                <Button
+                  aria-label="Clear signal filter"
+                  onClick={() =>
+                    setSearch({ page: 1, session: undefined, signal_event: undefined })
+                  }
+                  size="icon-sm"
+                  variant="ghost"
+                >
+                  <Icon.close />
+                </Button>
+              </div>
+            ) : session ? (
               <div className="flex flex-wrap items-center gap-2">
                 <span className="chip-label inline-flex h-7 max-w-full items-center gap-1.5 whitespace-nowrap rounded-sm border border-primary/40 bg-primary/5 px-2.5 text-xs text-primary">
                   <Icon.session className="size-3.5 shrink-0" />
@@ -829,47 +604,7 @@ function TracesPage() {
         />
       )}
 
-      <ConversationDetailSheet
-        capabilityNameById={capabilityNameById}
-        conversationId={groupByConversation ? selectedConversationId : null}
-        focusedTurnId={focusedTurnId}
-        onClose={() => {
-          setSelectedConversationId(null);
-          setFocusedTurnId(null);
-        }}
-        onFocusTurn={setFocusedTurnId}
-        onOpenTrace={(clickedTraceId) => {
-          setSelectedConversationId(null);
-          setFocusedTurnId(null);
-          handleTraceClick(clickedTraceId);
-        }}
-        turns={conversationTurns}
-      />
-
-      <ExecutionDetailSheet
-        behaviourName={
-          selectedExecution?.behaviour
-            ? behaviourNameById.get(selectedExecution.behaviour)
-            : undefined
-        }
-        capabilityName={
-          selectedExecution?.capability
-            ? capabilityNameById.get(selectedExecution.capability)
-            : undefined
-        }
-        capabilityNameById={capabilityNameById}
-        // toggleExecution keeps this and the conversation sheet mutually exclusive.
-        execution={selectedExecution}
-        onClose={() => setSelectedExecutionId(null)}
-        onOpenTrace={(clickedTraceId) => {
-          setSelectedExecutionId(null);
-          handleTraceClick(clickedTraceId);
-        }}
-        onSelectExecution={handleSelectFlowExecution}
-        projectId={projectId}
-      />
-
-      {!isSessionsView && !isExecutionsView && (
+      {!isSessionsView && !isSignalsView && (
         <TraceSelectionBar
           allPagesSelected={allPagesSelection != null}
           onAddToDataset={featureFlags.datasets ? () => setShowAddToDataset(true) : undefined}
@@ -929,23 +664,6 @@ function TracesPage() {
         </SheetContent>
       </Sheet>
     </PageShell>
-  );
-}
-
-function ExecutionsEmptyState() {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center px-4 py-12">
-      <div className="flex w-full max-w-md flex-col items-center">
-        <EmptyState
-          className="w-full px-0 py-0"
-          description="No executions yet. Traces bind to behaviours minted by /overmind setup."
-          icon={Icon.observability}
-          size="section"
-          title="No task executions"
-        />
-        <SetupActions />
-      </div>
-    </div>
   );
 }
 

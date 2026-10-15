@@ -115,10 +115,10 @@ describe("MatchScore", () => {
     expect(screen.getByLabelText("Match 72.00 out of 100")).toBeTruthy();
   });
 
-  it("marks an ungraded model rather than inventing a match", () => {
-    render(<MatchScore match={null} matchPool={30} matchRank={null} />);
+  it("omits the badge when no match is measured", () => {
+    const { container } = render(<MatchScore match={null} matchPool={30} matchRank={null} />);
 
-    expect(screen.getByLabelText("Not graded")).toBeTruthy();
+    expect(container.textContent).toBe("");
   });
 });
 

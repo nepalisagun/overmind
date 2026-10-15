@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +17,9 @@ class FineTuneDispatchError(RuntimeError):
 def launch_finetune(
     *,
     user,
+    admit_new_training: Callable[[], None],
+    request_key=None,
+    accepted_findings=None,
     project,
     dataset: Dataset,
     capability: Capability | None,
@@ -39,13 +43,16 @@ def launch_finetune(
     eval_model_after: bool = True,
     baseline_model: str | None = None,
     eval_judge_model: str = "",
+    decision_job: bool = False,
 ) -> FinetuningJob:
     payload: dict[str, Any] = {
+        "request_key": request_key,
+        "accepted_findings": accepted_findings or [],
         "project": str(project.id),
         "dataset": str(dataset.id),
         "capability": str(capability.id) if capability else None,
-        "eval_dataset": str(eval_dataset.id),
-        "eval_set": str(eval_set.id),
+        "eval_dataset": str(eval_dataset.id) if eval_dataset else None,
+        "eval_set": str(eval_set.id) if eval_set else None,
         "eval_judge_model": eval_judge_model,
         "base_model": base_model,
         "name": name,
@@ -75,10 +82,16 @@ def launch_finetune(
 
     serializer = FinetuningJobSerializer(
         data=payload,
-        context={"request": SimpleNamespace(user=user)},
+        context={
+            "request": SimpleNamespace(user=user),
+            "admit_new_training": admit_new_training,
+            "create_decision_job": decision_job,
+        },
     )
     serializer.is_valid(raise_exception=True)
     job = serializer.save(triggered_by=user)
+    if getattr(job, "launch_reused", False):
+        return job
 
     from overbae.tasks.finetuning import run_finetuning
 

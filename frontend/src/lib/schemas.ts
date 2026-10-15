@@ -2,7 +2,7 @@ import * as z from "zod";
 
 import {
   DeployedModelsListStatusEnum,
-  EvalRunsListStatusEnum,
+  EvalRunsActivityListStatusEnum,
   FinetuningJobsListStatusEnum,
 } from "@/openapi";
 
@@ -43,7 +43,6 @@ export const tracesSearchSchema = z.object({
   operation: z.string().optional(),
   operation__icontains: z.string().optional(),
   ordering: z.string().optional().default("-start_time_ns"),
-
   page: z.coerce.number().min(1).optional().default(1),
   page_size: z.coerce.number().min(5).max(100).optional().default(25),
   projectId: z.string().optional(),
@@ -58,6 +57,8 @@ export const tracesSearchSchema = z.object({
   service_name__icontains: z.string().optional(),
   /** A Conversation UUID, not a span or trace id. */
   session: z.string().optional(),
+  signal: z.string().optional(),
+  signal_event: z.string().uuid().optional().catch(undefined),
   source: z.string().optional(),
 
   source__in: z.string().optional(),
@@ -79,11 +80,8 @@ export const tracesSearchSchema = z.object({
   trace_group: z.string().optional(),
   trace_group__icontains: z.string().optional(),
   trace_id: z.string().optional(),
-  view: z
-    .enum(["executions", "roots", "sessions"])
-    .optional()
-    .catch("executions")
-    .default("executions"),
+  unseen: z.boolean().optional().catch(undefined),
+  view: z.enum(["roots", "sessions", "signals"]).optional().catch("roots").default("roots"),
 });
 
 /**
@@ -96,24 +94,17 @@ const runFilterShape = {
   run_status: z.string().optional().default("all"),
 };
 
-/** `capability` presets the library's filter and is separate from `run_capability`. */
 export const evaluationsSearchSchema = projectIdSearchSchema.extend({
-  capability: z.string().optional(),
   page: z.coerce.number().min(1).optional().default(1),
   page_size: z.coerce.number().min(5).max(100).optional().default(25),
   ...runFilterShape,
   run_dataset: z.string().optional().default("all"),
-  // Narrower than the shared shape: this list forwards the status to the API,
-  // so it must be one `EvalRun.Status` accepts — not the generic Job statuses,
-  // whose `partially_completed` the eval-runs endpoint rejects with a 400.
-  // `.catch` keeps a stale value from throwing a SearchParamError that would
-  // discard the rest of the search.
   run_status: z
-    .enum(["all", ...Object.values(EvalRunsListStatusEnum)])
+    .enum(["all", ...Object.values(EvalRunsActivityListStatusEnum)])
     .optional()
     .default("all")
     .catch("all"),
-  view: z.enum(["runs", "sets", "library"]).optional().default("runs"),
+  view: z.enum(["runs", "sets", "matrix"]).optional().default("runs").catch("runs"),
 });
 
 export type EvaluationsSearch = z.infer<typeof evaluationsSearchSchema>;
@@ -137,8 +128,6 @@ export const trainingSearchSchema = projectIdSearchSchema.extend({
   capabilityId: z.string().optional(),
   /** `datasetId` preselects the train dataset; `evalDatasetId` the eval one. */
   datasetId: z.string().optional(),
-  decision: z.boolean().optional(),
-  decisionJob: z.string().optional(),
   evalDatasetId: z.string().optional(),
   // Free-form ids: a dataset uuid and a base-model slug.
   ft_dataset: z.string().optional().default("all"),
@@ -155,8 +144,6 @@ export const trainingSearchSchema = projectIdSearchSchema.extend({
   groupId: z.string().optional(),
   job: z.string().optional(),
   jobId: z.string().optional(),
-  /** The decision-model tab, its New decision job dialog and an open decision job. */
-  models: z.enum(["chat", "decision"]).optional().catch(undefined),
   page: z.coerce.number().min(1).optional().default(1),
   page_size: z.coerce.number().min(5).max(100).optional().default(25),
   train: z.boolean().optional(),
@@ -177,11 +164,13 @@ export const datasetsSearchSchema = projectIdSearchSchema.extend({
     .optional(),
   /** A capability id, or the `NO_CAPABILITY` sentinel for datasets attached to none. */
   ds_capability: z.string().optional().default("all"),
-  ds_intent: z.enum(["all", "train", "eval", "pending"]).optional().default("all").catch("all"),
+  ds_intent: z
+    .enum(["all", "train", "eval", "pending", "explore"])
+    .optional()
+    .default("all")
+    .catch("all"),
   ds_search: z.string().optional().default(""),
 });
-
-export type DatasetsSearch = z.infer<typeof datasetsSearchSchema>;
 
 // `inf_capability` is prefixed so it can't collide with the bare `capability` other routes
 // carry through `search: (prev) => …`. The model detail route must share this schema:
@@ -209,3 +198,7 @@ export const projectsSearchSchema = z.object({
 });
 
 export type ProjectsSearch = z.infer<typeof projectsSearchSchema>;
+
+export const evaluationRunSearchSchema = projectIdSearchSchema.extend({
+  format: z.enum(["generative", "decision"]).optional(),
+});

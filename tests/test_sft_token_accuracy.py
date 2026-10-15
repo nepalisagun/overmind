@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from modal_shared.training_telemetry import record_stage
+
 ASSETS = Path(__file__).resolve().parents[1] / "overbae/services/sft_assets"
 
 
@@ -225,6 +227,7 @@ def test_accuracy_logs_reach_persisted_training_and_validation_records(tmp_path)
         "common.py",
         "ProgressCallback",
         {
+            "record_stage": record_stage,
             "TrainerCallback": object,
             "TrainingArguments": object,
             "TrainerState": object,
@@ -251,6 +254,50 @@ def test_accuracy_logs_reach_persisted_training_and_validation_records(tmp_path)
     assert records[0]["token_accuracy"] == 0.6667
     assert records[1]["event"] == "BT_EVAL"
     assert records[1]["eval_token_accuracy"] == 0.75
+
+
+@pytest.mark.parametrize("start_step,start_tokens", [(0, 0), (27, 892733)])
+def test_progress_rates_use_only_work_since_this_attempt_started(
+    tmp_path, start_step, start_tokens, capsys
+):
+    cuda = Mock()
+    cuda.is_available.return_value = False
+    callback_type = load_class(
+        "common.py",
+        "ProgressCallback",
+        {
+            "record_stage": record_stage,
+            "TrainerCallback": object,
+            "TrainingArguments": object,
+            "TrainerState": object,
+            "TrainerControl": object,
+            "Any": object,
+            "Path": Path,
+            "PER_DEVICE_BATCH": 64,
+            "GRAD_ACCUM": 2,
+            "MAX_LENGTH": 32768,
+            "USE_LORA": True,
+            "torch": SimpleNamespace(cuda=cuda),
+            "_vram_gb": lambda *args: 0.0,
+            "_host_rss_gb": lambda: 0.0,
+            "time": SimpleNamespace(monotonic=Mock(side_effect=[100.0, 110.0])),
+            "os": os,
+            "sys": sys,
+            "json": json,
+        },
+    )
+    callback = callback_type(tmp_path)
+    args = SimpleNamespace(num_train_epochs=10)
+    state = SimpleNamespace(global_step=start_step, max_steps=80, epoch=0.0)
+    callback.on_train_begin(args, state, None, tokens_seen=start_tokens)
+    assert 'BT_STAGE {"stage": "training"}' in capsys.readouterr().out
+    state.global_step += 2
+    callback.on_log(args, state, None, {"loss": 0.5, "num_tokens": start_tokens + 400})
+    progress = json.loads((tmp_path / "progress.json").read_text())
+    assert progress["tokens_per_s"] == 40.0
+    assert progress["eta_s"] == 5.0 * (80 - state.global_step)
+    assert progress["num_tokens"] == start_tokens + 400
+    assert progress["step"] == start_step + 2
 
 
 @pytest.mark.parametrize("family", ["qwen3", "qwen3_5"])

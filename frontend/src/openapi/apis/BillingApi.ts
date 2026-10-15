@@ -35,7 +35,6 @@ export interface BillingLedgerListRequest {
     ordering?: string;
     page?: number;
     pageSize?: number;
-    search?: string;
 }
 
 export interface BillingTopupCreateRequest {
@@ -161,10 +160,6 @@ export class BillingApi extends runtime.BaseAPI {
 
         if (requestParameters['pageSize'] != null) {
             queryParameters['page_size'] = requestParameters['pageSize'];
-        }
-
-        if (requestParameters['search'] != null) {
-            queryParameters['search'] = requestParameters['search'];
         }
 
         const headerParameters: runtime.HTTPHeaders = {};

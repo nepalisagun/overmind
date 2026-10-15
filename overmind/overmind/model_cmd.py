@@ -12,8 +12,8 @@ import requests
 import typer
 from rich.console import Console
 
-from overmind.config import DEFAULT_PATH, Config, load
-from overmind.sync import resolve_api_key, resolve_api_url
+from overmind.config import DEFAULT_PATH, load
+from overmind.transfer_connection import resolve_transfer_connection
 
 CHECKPOINTS_PATH = "/api/deployed-models/{deployment_id}/checkpoints/"
 CHECKPOINT_CHUNK_SIZE = 8_192
@@ -96,7 +96,6 @@ def download_checkpoint(
                 f"{api_url.rstrip('/')}{CHECKPOINTS_PATH.format(deployment_id=quote(deployment_id, safe=''))}",
                 headers={"X-Api-Key": api_key},
                 timeout=METADATA_TIMEOUT,
-                # requests keeps custom headers across hosts on redirect, so the key would follow.
                 allow_redirects=False,
             )
         except requests.RequestException as exc:
@@ -130,7 +129,7 @@ def download_checkpoint(
             raise CheckpointDownloadError(f"Output path already exists: {destination}")
 
         try:
-            artifact_response = client.get(download_url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+            artifact_response = client.get(download_url, timeout=DOWNLOAD_TIMEOUT, stream=True, allow_redirects=False)
         except requests.RequestException as exc:
             raise CheckpointDownloadError("Checkpoint artifact request failed.") from exc
 
@@ -198,15 +197,13 @@ def download_checkpoint_command(
 ) -> None:
     """Download a deployed model checkpoint to a new local file."""
     try:
-        config = load(path) if path.exists() else Config()
-        key = resolve_api_key(api_key, config)
-        if not key:
-            raise CheckpointDownloadError("Missing API key. Pass --api-key or set OVERMIND_API_KEY.")
+        config = load(path) if path.exists() else None
+        key, base = resolve_transfer_connection(api_key, api_url, config)
         result = download_checkpoint(
             deployment,
             output=output,
             api_key=key,
-            api_url=resolve_api_url(api_url, config),
+            api_url=base,
         )
     except (CheckpointDownloadError, OSError, ValueError) as exc:
         _emit_error(str(exc), as_json=as_json)

@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
@@ -59,13 +59,20 @@ function detectDynamicResource(segments: string[]): {
   slug: string;
   slugIdx: number;
 } | null {
+  if (segments[0] === "evaluations" && segments[1] === "runs" && segments[2]) {
+    return { kind: "evaluations", slug: segments[2], slugIdx: 2 };
+  }
   if (segments.length >= 2 && DYNAMIC_PARENTS.has(segments[0])) {
     return { kind: segments[0], slug: segments[1], slugIdx: 1 };
   }
   return null;
 }
 
-function useCachedName(kind: string | undefined, slug: string | undefined): string | undefined {
+function useCachedName(
+  kind: string | undefined,
+  slug: string | undefined,
+  evaluationFormat: string | undefined
+): string | undefined {
   const capabilityNameQuery = useQuery({
     enabled: kind === "capabilities" && !!slug,
     queryFn: () => apiClient.capabilities.capabilitiesRetrieve({ id: slug ?? "" }),
@@ -95,6 +102,27 @@ function useCachedName(kind: string | undefined, slug: string | undefined): stri
     select: (experiment) => `${experiment.capabilityName || "Run"} · ${experiment.id.slice(0, 8)}`,
   });
 
+  const evaluationNameQuery = useQuery({
+    enabled: kind === "evaluations" && evaluationFormat !== "decision" && !!slug,
+    queryFn: () => apiClient.evalRuns.evalRunsRetrieve({ id: slug ?? "" }),
+    queryKey: ["eval-run", slug],
+    select: (run) => run.name?.trim(),
+  });
+
+  const decisionEvaluationNameQuery = useQuery({
+    enabled: kind === "evaluations" && evaluationFormat === "decision" && !!slug,
+    queryFn: () => apiClient.nativeEvaluations.nativeEvaluationsRetrieve({ id: slug ?? "" }),
+    queryKey: ["decision-comparison", slug],
+    select: (plan) => plan.name?.trim(),
+  });
+
+  if (kind === "evaluations") {
+    return (
+      (evaluationFormat === "decision"
+        ? decisionEvaluationNameQuery.data
+        : evaluationNameQuery.data) || "Evaluation run"
+    );
+  }
   if (kind === "capabilities") return capabilityNameQuery.data;
   if (kind === "projects") return projectNameQuery.data;
   if (kind === "datasets") return datasetNameQuery.data;
@@ -126,6 +154,7 @@ function useBreadcrumbs(): BreadcrumbInfo {
   const { location } = useRouterState();
   const { pathname } = location;
   const search = location.search as {
+    format?: string;
     groupId?: string;
     jobId?: string;
     projectId?: string;
@@ -134,7 +163,7 @@ function useBreadcrumbs(): BreadcrumbInfo {
   const segments = pathname.split("/").filter(Boolean);
 
   const dynamic = detectDynamicResource(segments);
-  const cachedName = useCachedName(dynamic?.kind, dynamic?.slug);
+  const cachedName = useCachedName(dynamic?.kind, dynamic?.slug, search.format);
 
   const ftGroupId = pathname === "/training" ? search.groupId : undefined;
   const ftMonitorLabel = useTrainingMonitorCrumb(ftGroupId, search.jobId);
@@ -218,7 +247,7 @@ function Breadcrumb() {
 
   return (
     <>
-      <div className="crumb-label flex h-8 min-w-0 flex-1 items-center gap-1.5">
+      <div className="crumb-label flex h-8 w-full min-w-0 items-center gap-1.5 sm:w-auto sm:flex-1">
         <SidebarToggle />
         <nav aria-label="Breadcrumb" className="contents">
           {crumbs.map((crumb, i) => {
@@ -285,7 +314,7 @@ function Breadcrumb() {
 function HeaderActions({ hideProjects }: { hideProjects: boolean }) {
   const { isGuest } = useAuthContext();
   return (
-    <div className="flex h-8 shrink-0 items-center gap-2">
+    <div className="ml-auto flex min-h-8 max-w-full flex-wrap items-center justify-end gap-2 sm:h-8 sm:shrink-0 sm:flex-nowrap">
       {isGuest ? null : <HeaderCredits />}
       {hideProjects ? null : <ProjectSelector />}
       <SettingsMenuButton />
@@ -294,78 +323,69 @@ function HeaderActions({ hideProjects }: { hideProjects: boolean }) {
   );
 }
 
-const WORKSHOP_PATH = /^\/datasets\/[^/]+\/?$/;
-
-function useWorkshopLayout(pathname: string) {
-  const inWorkshop = WORKSHOP_PATH.test(pathname);
-  const isMobile = useIsMobile();
-  const [expanded, setExpanded] = useState(false);
-  const trigger = useRef<HTMLElement | null>(null);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a navigation is the trigger
-  useEffect(() => {
-    if (!inWorkshop || isMobile) setExpanded(false);
-  }, [pathname]);
-  const close = useCallback(() => {
-    setExpanded(false);
-    trigger.current?.focus();
-  }, []);
-  const toggle = useCallback(
-    (element: HTMLElement | null) => {
-      trigger.current = element;
-      if (expanded) close();
-      else setExpanded(true);
-    },
-    [expanded, close]
-  );
-  const open = inWorkshop && expanded;
-  const sidebar = useMemo(() => ({ close, open, toggle }), [close, open, toggle]);
-  return { covered: open && isMobile, inWorkshop, open, sidebar };
-}
-
 function RootLayout() {
   useProjectSearchSync();
   const { open: cmdOpen, setOpen: setCmdOpen } = useCommandPalette();
+  const pathname = useRouterState({
+    select: (s) => s.location.pathname,
+  });
+  const mobile = useIsMobile();
+  const inWorkshop = /^\/datasets(?:\/[^/]+)?\/?$/.test(pathname);
+  const [expandedPath, setExpandedPath] = useState<string | null>(null);
+  const workshopOpen = inWorkshop && expandedPath === pathname;
+  const workshopTrigger = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    setExpandedPath((expanded) => (expanded === pathname ? expanded : null));
+  }, [pathname]);
+  useEffect(() => {
+    if (workshopOpen) return;
+    workshopTrigger.current?.focus();
+    workshopTrigger.current = null;
+  }, [workshopOpen]);
   // `?flowFull=true` hides the header chrome so the flow canvas can fill the card bezel.
   const flowFull = useRouterState({
     select: (s) => (s.location.search as { flowFull?: boolean }).flowFull === true,
   });
-  const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const projectId = useRouterState({
-    select: (s) => (s.location.search as { projectId?: string }).projectId,
-  });
-  const workshop = useWorkshopLayout(pathname);
 
   return (
-    <SidebarProvider>
-      <AppSidebar collapsible="icon" onSearchOpen={() => setCmdOpen(true)} />
-      <CommandPalette onOpenChange={setCmdOpen} open={cmdOpen} />
-      <SidebarInset className="min-w-0 bg-sidebar">
-        <div className="flex h-screen p-2">
-          {/* border-sidebar-border: hairline in the sidebar black family (not --border grey). */}
-          <div
-            className={cn(
-              "grid min-w-0 flex-1 overflow-clip rounded-md border border-sidebar-border bg-card",
-              workshop.inWorkshop &&
-                "transition-[grid-template-columns] duration-300 motion-reduce:transition-none",
-              !workshop.inWorkshop
-                ? "grid-cols-[minmax(0,1fr)]"
-                : workshop.open
-                  ? "grid-cols-[minmax(0,1fr)_0px] md:grid-cols-[248px_minmax(0,1fr)]"
-                  : "grid-cols-[0px_minmax(0,1fr)]"
-            )}
-          >
-            <WorkshopSidebarContext.Provider value={workshop.sidebar}>
-              {workshop.inWorkshop && <WorkshopSidebar projectId={projectId} />}
+    <WorkshopSidebarContext.Provider
+      value={{
+        close: () => setExpandedPath(null),
+        open: workshopOpen,
+        toggle: (trigger) => {
+          if (!workshopOpen) workshopTrigger.current = trigger;
+          setExpandedPath(workshopOpen ? null : pathname);
+        },
+      }}
+    >
+      <SidebarProvider>
+        <AppSidebar collapsible="icon" onSearchOpen={() => setCmdOpen(true)} />
+        <CommandPalette onOpenChange={setCmdOpen} open={cmdOpen} />
+        <SidebarInset className="min-w-0 bg-sidebar">
+          <div className="h-screen p-2">
+            {/* border-sidebar-border: hairline in the sidebar black family (not --border grey). */}
+            <div
+              className={cn(
+                "grid h-full min-w-0 overflow-clip rounded-md border border-sidebar-border transition-[grid-template-columns] ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none",
+                workshopOpen
+                  ? "grid-cols-[minmax(0,1fr)_0px] duration-300 md:grid-cols-[248px_minmax(0,1fr)]"
+                  : "grid-cols-[0px_minmax(0,1fr)] duration-200"
+              )}
+            >
+              <WorkshopSidebar open={workshopOpen} />
               <div
-                aria-hidden={workshop.covered || undefined}
-                className={cn("flex min-h-0 min-w-0 flex-col", workshop.covered && "invisible")}
-                inert={workshop.covered}
+                aria-hidden={mobile && workshopOpen ? true : undefined}
+                className={cn(
+                  "flex min-h-0 min-w-0 flex-col bg-card",
+                  mobile && workshopOpen && "invisible"
+                )}
+                inert={mobile && workshopOpen}
               >
                 <header
                   className={cn(
                     // pr-3 matches the 12px the 32px-tall controls leave above and
                     // below them, so the corner control sits square.
-                    "flex h-14 shrink-0 items-center gap-3 border-b border-border/70 pl-3 pr-3",
+                    "flex shrink-0 flex-wrap items-center gap-1 border-b border-border/70 px-3 py-2 sm:h-14 sm:flex-nowrap sm:gap-3 sm:py-0",
                     flowFull && "hidden"
                   )}
                 >
@@ -384,11 +404,11 @@ function RootLayout() {
                   <Outlet />
                 </div>
               </div>
-            </WorkshopSidebarContext.Provider>
+            </div>
           </div>
-        </div>
-      </SidebarInset>
-    </SidebarProvider>
+        </SidebarInset>
+      </SidebarProvider>
+    </WorkshopSidebarContext.Provider>
   );
 }
 

@@ -4,10 +4,7 @@
  * § Typography for why each face has the job it has.
  */
 
-/**
- * Every title picks exactly one step. Size is the only separator: Mondwest
- * ships a Regular master only, so a weight utility renders synthesised bold.
- */
+/** Mondwest is reserved for the page header; all other headings use Geist Pixel. */
 export const TITLE = {
   /** 18px — card, dialog, sheet and alert titles. */
   card: "title-card",

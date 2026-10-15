@@ -2,6 +2,8 @@ import importlib
 import json
 import os
 import shutil
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -14,6 +16,7 @@ from overbae.modal import modal_vllm_worker as serving
 def test_shared_worker_resolves_family_from_sealed_base(monkeypatch, tmp_path):
     obj = serving._BaseVLLMWorker()
     obj.model_path = "base"
+    obj._journal = Mock()
     obj.model_name = "opaque-deployment-id"
     obj.max_model_len = 512
     obj.enable_lora = True
@@ -65,6 +68,7 @@ def worker():
     obj.model_name = "base--test"
     obj.model_path = ".base_models/org--base"
     obj.base_identity = "base-identity"
+    obj._journal = Mock()
     obj._startup_error = None
     obj._verify_base_identity = Mock()
     obj._start = Mock()
@@ -106,7 +110,11 @@ def test_restore_reloads_before_kv_wake_and_clears_tenant_state(monkeypatch):
     obj._loaded_adapters = {"must-not-survive"}
     calls = []
     obj._control = Mock(side_effect=lambda path: calls.append(path))
-    obj._base_rpc = Mock(side_effect=lambda method: calls.append(method) or {"reload_s": 1})
+    obj._base_rpc = Mock(
+        side_effect=lambda method, *args: (
+            calls.append(method) or {"reload_s": 1, "bytes": 128, "parameters": 2}
+        )
+    )
     monkeypatch.setattr(serving, "weights_vol", Mock())
     monkeypatch.setattr(serving, "artifacts_vol", Mock(reload=lambda: calls.append("refresh")))
     monkeypatch.setattr(
@@ -256,3 +264,21 @@ async def test_adapter_load_leaves_the_weights_mount_closed(monkeypatch, tmp_pat
             assert (staged / "adapter_model.safetensors").read_bytes() == payload
     finally:
         shutil.rmtree("/tmp/overmind-adapters", ignore_errors=True)
+
+
+def test_engine_health_wait_reports_liveness_without_claiming_load_progress(monkeypatch):
+    journal = Mock()
+    process = Mock(poll=Mock(return_value=None))
+    ticks = iter(range(0, 200, 10))
+    monkeypatch.setattr(serving.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(serving.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", Mock(side_effect=urllib.error.URLError("waiting"))
+    )
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        serving._wait_for_vllm(timeout=65, proc=process, journal=journal)
+    assert journal.emit.call_count >= 1
+    for call in journal.emit.call_args_list:
+        assert call.args == ("waiting_for_engine",)
+        assert call.kwargs["process_alive"] is True
+        assert "completed" not in call.kwargs

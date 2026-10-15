@@ -1,329 +1,337 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   Background,
   BackgroundVariant,
+  BaseEdge,
   ControlButton,
   Controls,
   type Edge,
-  Handle,
+  EdgeLabelRenderer,
+  type EdgeProps,
+  getSmoothStepPath,
   MiniMap,
   type Node,
   type NodeProps,
-  Position,
   ReactFlow,
   ReactFlowProvider,
+  useNodesInitialized,
   useNodesState,
   useReactFlow,
+  type XYPosition,
 } from "@xyflow/react";
 import ELK from "elkjs/lib/elk.bundled.js";
 
-import {
-  type Motion,
-  useVersionMotion,
-  VersionMotionFrame,
-} from "@/components/datasets/notebook/cell-motion";
 import { Icon } from "@/components/ui/icons";
 import { usePersistedState } from "@/hooks/use-persisted-state";
 import { notify } from "@/lib/notify";
 import type { Cell } from "@/openapi";
+import { type CellMotion, CellMotionFrame, type CompleteCellMotion } from "./cell-motion";
 
 import "@xyflow/react/dist/style.css";
 
-const GRID = 20;
-const GAP = 80;
-const MIN_WIDTH = 520;
-const MAX_WIDTH = 1200;
-const TOP = 24;
-
-type VersionData = {
-  cell: Cell;
-  width: number;
-  placed: boolean;
-  motion: Motion | undefined;
-  settle: (cellId: string, motionId: number) => void;
-  render: (cell: Cell) => ReactNode;
-};
-type VersionNode = Node<VersionData, "version">;
-type Point = { x: number; y: number };
-
+type CellNode = Node<
+  {
+    content: ReactNode;
+    motion?: CellMotion;
+    ready: boolean;
+    complete: CompleteCellMotion;
+  },
+  "cell"
+>;
+const GRID: [number, number] = [20, 20];
 const elk = new ELK();
-const snap = (value: number) => Math.round(value / GRID) * GRID;
 
-async function layout(cells: Cell[], heights: Map<string, number>, width: number) {
-  const ids = new Set(cells.map((cell) => cell.id));
-  const graph = await elk.layout({
-    children: cells.map((cell) => ({ height: heights.get(cell.id) ?? 400, id: cell.id, width })),
-    edges: cells
-      .filter((cell) => cell.parent && ids.has(cell.parent))
-      .map((cell) => ({
-        id: `${cell.parent}-${cell.id}`,
-        sources: [cell.parent!],
-        targets: [cell.id],
-      })),
-    id: "versions",
-    layoutOptions: {
-      "elk.algorithm": "layered",
-      "elk.direction": "DOWN",
-      "elk.layered.nodePlacement.bk.fixedAlignment": "LEFTUP",
-      "elk.layered.spacing.nodeNodeBetweenLayers": String(GAP),
-      "elk.spacing.nodeNode": String(GAP),
-    },
-  });
-  return new Map(
-    (graph.children ?? []).map((node) => [node.id, { x: snap(node.x ?? 0), y: snap(node.y ?? 0) }])
-  );
-}
-
-function VersionNodeView({ data }: NodeProps<VersionNode>) {
+function CellFrame({ id, data }: NodeProps<CellNode>) {
   return (
-    <div style={{ width: data.width }}>
-      <Handle className="!invisible" isConnectable={false} position={Position.Top} type="target" />
-      <VersionMotionFrame
-        cellId={data.cell.id}
-        motion={data.motion}
-        placed={data.placed}
-        settle={data.settle}
-      >
-        {data.render(data.cell)}
-      </VersionMotionFrame>
-      <Handle
-        className="!invisible"
-        isConnectable={false}
-        position={Position.Bottom}
-        type="source"
-      />
-    </div>
+    <CellMotionFrame complete={data.complete} id={id} motion={data.motion} ready={data.ready}>
+      {data.content}
+    </CellMotionFrame>
   );
 }
 
-const NODE_TYPES = { version: VersionNodeView };
-const EDGE_STYLE = { stroke: "var(--muted-foreground)", strokeWidth: 1.5 };
+const NODE_TYPES = { cell: CellFrame };
 
-export interface FlowFocus {
-  id: string;
-  request: number;
+function CellConnector(props: EdgeProps) {
+  const [path] = getSmoothStepPath({ ...props, borderRadius: 0, offset: 0 });
+  return (
+    <>
+      <BaseEdge id={props.id} path={path} style={props.style} />
+      {props.label && (
+        <EdgeLabelRenderer>
+          <div
+            className="absolute max-w-80 truncate rounded-sm border border-input bg-card px-2 py-1 text-xs text-foreground"
+            style={{
+              transform: `translate(-50%, -100%) translate(${props.targetX}px, ${props.targetY - 32}px)`,
+            }}
+            title={String(props.label)}
+          >
+            {props.label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
 }
+
+const EDGE_TYPES = { cell: CellConnector };
+
+type Props = {
+  cells: Cell[];
+  edges: Edge[];
+  storageKey: string;
+  showMinimap: boolean;
+  focus: { id: string; request: number } | null;
+  renderCell: (cell: Cell) => ReactNode;
+  motions: Map<string, CellMotion>;
+  onMotionComplete: CompleteCellMotion;
+};
 
 function Canvas({
   cells,
+  edges,
   storageKey,
-  focus,
   showMinimap,
-  renderVersion,
-}: {
-  cells: Cell[];
-  storageKey: string;
-  focus: FlowFocus | null;
-  showMinimap: boolean;
-  renderVersion: (cell: Cell) => ReactNode;
-}) {
+  focus,
+  renderCell,
+  motions,
+  onMotionComplete,
+}: Props) {
   const wrapper = useRef<HTMLDivElement>(null);
-  const [width, setWidth] = useState(0);
-  const [dragged, setDragged] = usePersistedState<Record<string, Point>>(storageKey, {});
-  const [laid, setLaid] = useState<Map<string, Point> | null>(null);
-  const [heights, setHeights] = useState<Map<string, number>>(() => new Map());
-  const [nodes, setNodes, onNodesChange] = useNodesState<VersionNode>([]);
-  const { getNodes, getViewport, setViewport } = useReactFlow<VersionNode>();
-  // The card whose size changed last, held in place when the layout moves it.
-  const anchor = useRef<string | null>(null);
-  const previousLaid = useRef<Map<string, Point> | null>(null);
-  // Until the person pans, zooms or clicks, each new layout re-frames the focus; cards
-  // grow as their rows load, so the first layout is not the last.
-  const touched = useRef(false);
-  const { motions, settle } = useVersionMotion(cells);
-  const nodeWidth = Math.min(MAX_WIDTH, Math.max(Math.min(MIN_WIDTH, width - 24), width - 2 * GAP));
+  const [width, setWidth] = useState(960);
+  const [inset, setInset] = useState(16);
+  const [positions, savePositions] = usePersistedState<Record<string, XYPosition>>(storageKey, {});
+  const [nodes, setNodes, onNodesChange] = useNodesState<CellNode>([]);
+  const { getNodes, getViewport, setViewport } = useReactFlow<CellNode>();
+  const initialized = useNodesInitialized();
+  const measurements = nodes.map((node) => `${node.id}:${node.measured?.height ?? 500}`).join(",");
+  const topology = JSON.stringify([
+    cells.map((cell) => cell.id),
+    edges.map((edge) => [edge.source, edge.target]),
+  ]);
+  const positioned = useRef(false);
+  const viewportAnchor = useRef<{
+    id: string;
+    point: XYPosition;
+    width: number;
+    inset: number;
+  } | null>(null);
+  const focusRequest = useRef("");
 
   useEffect(() => {
     const element = wrapper.current;
     if (!element) return;
-    const observer = new ResizeObserver(() => setWidth(element.clientWidth));
+    const observer = new ResizeObserver(() => {
+      const container = Math.min(1280, element.clientWidth);
+      const padding = window.innerWidth >= 640 ? 16 : 8;
+      setWidth(Math.max(1, container - 40 - padding));
+      setInset(padding + (element.clientWidth - container) / 2);
+    });
     observer.observe(element);
-    setWidth(element.clientWidth);
     return () => observer.disconnect();
   }, []);
 
-  const ids = cells.map((cell) => cell.id).join(",");
-  const heightKey = cells.map((cell) => snap(heights.get(cell.id) ?? 0)).join(",");
-  // biome-ignore lint/correctness/useExhaustiveDependencies: ids and heightKey stand for cells and heights
   useEffect(() => {
-    if (!width || cells.some((cell) => !heights.has(cell.id))) return;
+    setNodes((existing) =>
+      cells.map((cell, index) => {
+        const previous = existing.find((node) => node.id === cell.id);
+        return {
+          ...previous,
+          ariaLabel: cell.title,
+          data: {
+            complete: onMotionComplete,
+            content: renderCell(cell),
+            motion: motions.get(cell.id),
+            ready: previous?.data.ready ?? false,
+          },
+          dragHandle: ".workshop-cell-node article > div:first-of-type",
+          id: cell.id,
+          position: previous?.position ?? { x: 0, y: index * 580 },
+          style: { width },
+          type: "cell",
+        };
+      })
+    );
+  }, [cells, width, renderCell, setNodes, motions, onMotionComplete]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: topology and measurements describe layout inputs without refitting for content-only updates.
+  useEffect(() => {
+    if (!initialized) return;
     let cancelled = false;
-    layout(cells, heights, nodeWidth)
-      .then((positions) => !cancelled && setLaid(positions))
-      .catch((error) => notify.error(error, "Flow layout unavailable"));
+    const current = getNodes();
+    const ids = new Set(current.map((node) => node.id));
+    if (cells.some((cell) => !ids.has(cell.id)) || current.some((node) => !node.measured?.height))
+      return;
+    elk
+      .layout({
+        children: current.map((node) => ({
+          height: node.measured?.height ?? 500,
+          id: node.id,
+          width,
+        })),
+        edges: edges
+          .filter((edge) => ids.has(edge.source) && ids.has(edge.target))
+          .map((edge) => ({ id: edge.id, sources: [edge.source], targets: [edge.target] })),
+        id: "workshop",
+        layoutOptions: {
+          "elk.algorithm": "layered",
+          "elk.direction": "DOWN",
+          "elk.layered.nodePlacement.bk.fixedAlignment": "LEFTUP",
+          "elk.layered.spacing.nodeNodeBetweenLayers": "80",
+          "elk.spacing.nodeNode": "80",
+        },
+      })
+      .then((layout) => {
+        if (cancelled) return;
+        const placedPosition = (id: string): XYPosition => {
+          const saved = positions[id];
+          const placed = layout.children?.find((node) => node.id === id);
+          const point =
+            saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) ? saved : placed;
+          return {
+            x: Math.round((point?.x ?? 0) / 20) * 20,
+            y: Math.round((point?.y ?? 0) / 20) * 20,
+          };
+        };
+        setNodes((latest) =>
+          latest.map((node) => ({
+            ...node,
+            data: { ...node.data, ready: ids.has(node.id) },
+            position: placedPosition(node.id),
+          }))
+        );
+        const key = focus ? `${focus.id}:${focus.request}` : "";
+        const requested =
+          focus && focusRequest.current !== key && current.some((node) => node.id === focus.id);
+        const frame = requested ? focus.id : !positioned.current ? current[0]?.id : undefined;
+        if (frame) {
+          positioned.current = true;
+          if (requested) focusRequest.current = key;
+          const point = placedPosition(frame);
+          viewportAnchor.current = { id: frame, inset, point, width };
+          void setViewport(
+            { x: inset - point.x, y: 12 - point.y, zoom: 1 },
+            {
+              duration:
+                !requested || window.matchMedia("(prefers-reduced-motion: reduce)").matches
+                  ? 0
+                  : 180,
+            }
+          );
+        } else if (viewportAnchor.current) {
+          const anchor = viewportAnchor.current;
+          const point = placedPosition(anchor.id);
+          if (anchor.width !== width || anchor.inset !== inset) {
+            const viewport = getViewport();
+            void setViewport({
+              x: viewport.x + (anchor.point.x - point.x) * viewport.zoom + inset - anchor.inset,
+              y: viewport.y + (anchor.point.y - point.y) * viewport.zoom,
+              zoom: viewport.zoom,
+            });
+          }
+          viewportAnchor.current = { ...anchor, inset, point, width };
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) notify.error(error, "Flow layout unavailable");
+      });
     return () => {
       cancelled = true;
     };
-  }, [ids, heightKey, nodeWidth, width]);
+  }, [
+    initialized,
+    topology,
+    measurements,
+    width,
+    inset,
+    positions,
+    focus,
+    getNodes,
+    getViewport,
+    setNodes,
+    setViewport,
+  ]);
 
-  useEffect(() => {
-    setNodes((current) => {
-      const previous = new Map(current.map((node) => [node.id, node]));
-      return cells.map((cell, index) => {
-        const placed = laid?.get(cell.id);
-        return {
-          data: {
-            cell,
-            motion: motions.get(cell.id),
-            placed: !!placed,
-            render: renderVersion,
-            settle,
-            width: nodeWidth,
-          },
-          dragHandle: ".version-drag-handle",
-          id: cell.id,
-          position: dragged[cell.id] ??
-            placed ??
-            previous.get(cell.id)?.position ?? { x: 0, y: index * 600 },
-          style: placed ? undefined : { visibility: "hidden" as const },
-          type: "version" as const,
-        };
-      });
-    });
-  }, [cells, laid, dragged, motions, nodeWidth, renderVersion, settle, setNodes]);
-
-  const edges = useMemo<Edge[]>(() => {
+  const visibleEdges = useMemo(() => {
     const ids = new Set(cells.map((cell) => cell.id));
-    return cells
-      .filter((cell) => cell.parent && ids.has(cell.parent))
-      .map((cell) => ({
-        id: `${cell.parent}-${cell.id}`,
-        pathOptions: { borderRadius: 0 },
-        source: cell.parent!,
-        style: EDGE_STYLE,
-        target: cell.id,
-        type: "smoothstep",
-      }));
-  }, [cells]);
-
-  const frame = useCallback(
-    (id: string | undefined, animate: boolean) => {
-      const node = getNodes().find((candidate) => candidate.id === id);
-      if (!node || !wrapper.current) return;
-      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      void setViewport(
-        {
-          x: wrapper.current.clientWidth / 2 - (node.position.x + nodeWidth / 2),
-          y: TOP - node.position.y,
-          zoom: 1,
-        },
-        { duration: animate && !reduced ? 180 : 0 }
-      );
-    },
-    [getNodes, nodeWidth, setViewport]
-  );
-
-  useEffect(() => {
-    if (!laid || touched.current) return;
-    requestAnimationFrame(() => frame(focus?.id ?? cells[0]?.id, false));
-  }, [laid, focus, cells, frame]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: only a new layout moves the view
-  useEffect(() => {
-    const before = previousLaid.current;
-    previousLaid.current = laid;
-    const id = anchor.current;
-    anchor.current = null;
-    if (!laid || !before || !id || dragged[id] || !touched.current) return;
-    const from = before.get(id);
-    const to = laid.get(id);
-    if (!from || !to || (from.x === to.x && from.y === to.y)) return;
-    const view = getViewport();
-    void setViewport({
-      x: view.x - (to.x - from.x) * view.zoom,
-      y: view.y - (to.y - from.y) * view.zoom,
-      zoom: view.zoom,
-    });
-  }, [laid]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a new request is the trigger
-  useEffect(() => {
-    if (focus && laid) frame(focus.id, true);
-  }, [focus?.request]);
+    return edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target));
+  }, [cells, edges]);
 
   return (
-    <div
-      className="h-full w-full"
-      onPointerDownCapture={() => {
-        touched.current = true;
-      }}
-      onWheelCapture={() => {
-        touched.current = true;
-      }}
-      ref={wrapper}
-    >
-      <ReactFlow<VersionNode>
-        aria-label="Dataset versions"
+    <div className="h-full min-h-0" ref={wrapper}>
+      <ReactFlow<CellNode>
+        aria-label="Dataset transformation flow"
         colorMode="dark"
         deleteKeyCode={null}
-        edges={edges}
-        elementsSelectable={false}
+        edges={visibleEdges}
+        edgesReconnectable={false}
+        edgeTypes={EDGE_TYPES}
         maxZoom={1.4}
         minZoom={0.25}
         nodes={nodes}
         nodesConnectable={false}
         nodeTypes={NODE_TYPES}
-        onNodeDragStop={(_, node) =>
-          setDragged((saved) => ({
-            ...saved,
-            [node.id]: { x: snap(node.position.x), y: snap(node.position.y) },
-          }))
-        }
         onNodesChange={(changes) => {
           onNodesChange(changes);
-          const measured = changes.filter((change) => change.type === "dimensions");
-          if (!measured.length) return;
-          setHeights((current) => {
-            const next = new Map(current);
-            for (const change of measured) {
-              if (change.type !== "dimensions" || !change.dimensions) continue;
-              const before = current.get(change.id);
-              if (before !== undefined && Math.abs(before - change.dimensions.height) > 1)
-                anchor.current = change.id;
-              next.set(change.id, change.dimensions.height);
-            }
-            return next;
-          });
+          const moved = changes.filter(
+            (change) => change.type === "position" && change.position && !change.dragging
+          );
+          if (moved.length)
+            savePositions((previous) => {
+              const next = { ...previous };
+              for (const change of moved)
+                if (change.type === "position" && change.position)
+                  next[change.id] = change.position;
+              return next;
+            });
         }}
         panOnScroll
         proOptions={{ hideAttribution: true }}
+        snapGrid={GRID}
+        snapToGrid
         zoomOnDoubleClick={false}
         zoomOnPinch
-        zoomOnScroll={false}
+        zoomOnScroll
       >
         <Background
           bgColor="var(--card)"
           color="var(--border)"
-          gap={GRID}
-          size={1.5}
+          gap={20}
+          size={1}
           variant={BackgroundVariant.Dots}
         />
         <Controls
-          className="!rounded-sm !border !border-border !bg-card !shadow-none [&>button]:!border-border/60 [&>button]:!bg-card [&>button:hover]:!bg-accent [&_svg]:!fill-foreground"
+          className="!right-1.5 !bottom-3 !m-0 !rounded-sm !border !border-border !bg-card !shadow-none [&>button]:!border-border/60 [&>button]:!bg-card [&>button:hover]:!bg-accent [&_svg]:!fill-foreground"
+          fitViewOptions={{ maxZoom: 1, minZoom: 0.25, padding: 0.18 }}
           position="bottom-right"
           showInteractive={false}
         >
           <ControlButton
-            aria-label="Reset layout"
+            aria-label="Reset view"
             onClick={() => {
-              setDragged({});
-              requestAnimationFrame(() => frame(cells[0]?.id, true));
+              const first = getNodes()[0];
+              if (first) {
+                viewportAnchor.current = { id: first.id, inset, point: first.position, width };
+                void setViewport({
+                  x: inset - first.position.x,
+                  y: 12 - first.position.y,
+                  zoom: 1,
+                });
+              }
             }}
-            title="Reset layout"
+            title="Reset view"
           >
             <Icon.home />
           </ControlButton>
         </Controls>
         {showMinimap && (
           <MiniMap
-            ariaLabel="Dataset versions minimap"
-            className="!rounded-sm !border !border-border !bg-card"
+            ariaLabel="Dataset transformation minimap"
+            className="!mr-12 !rounded-sm !border !border-border !bg-card"
             maskColor="color-mix(in oklab, var(--muted) 70%, transparent)"
             nodeColor="var(--muted-foreground)"
             nodeStrokeWidth={0}
             pannable
-            position="bottom-left"
             zoomable
           />
         )}
@@ -332,13 +340,7 @@ function Canvas({
   );
 }
 
-export function VersionFlow(props: {
-  cells: Cell[];
-  storageKey: string;
-  focus: FlowFocus | null;
-  showMinimap: boolean;
-  renderVersion: (cell: Cell) => ReactNode;
-}) {
+export function CellFlow(props: Props) {
   return (
     <ReactFlowProvider key={props.storageKey}>
       <Canvas {...props} />

@@ -9,22 +9,27 @@ export function NotebookControls({
   showMinimap: boolean;
   onToggleMinimap?: () => void;
 }) {
-  const label = showMinimap ? "Hide minimap" : "Show minimap";
   return (
-    <nav aria-label="Workshop controls" className="flex items-center gap-1">
-      <WorkshopSwitcher />
-      {onToggleMinimap && (
-        <Button
-          aria-label={label}
-          aria-pressed={showMinimap}
-          onClick={onToggleMinimap}
-          size="icon-sm"
-          title={label}
-          variant="ghost"
-        >
-          <Icon.minimap />
-        </Button>
-      )}
+    <nav
+      aria-label="Workshop controls"
+      className="pointer-events-none absolute inset-y-0 right-0 z-10 flex w-10 flex-col items-center pt-3"
+    >
+      <div className="pointer-events-auto flex flex-col items-center rounded-sm border border-border bg-card py-1">
+        <WorkshopSwitcher iconOnly />
+        {onToggleMinimap && (
+          <Button
+            aria-label={showMinimap ? "Hide minimap" : "Show minimap"}
+            aria-pressed={showMinimap}
+            className={showMinimap ? "bg-accent" : undefined}
+            onClick={onToggleMinimap}
+            size="icon-sm"
+            title={showMinimap ? "Hide minimap" : "Show minimap"}
+            variant="ghost"
+          >
+            <Icon.minimap />
+          </Button>
+        )}
+      </div>
     </nav>
   );
 }

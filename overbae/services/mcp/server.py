@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.types import Message, Receive, Scope, Send
 
+from overbae.services.mcp import CONTRACT_VERSION
 from overbae.services.mcp.auth import MCP_PATH, MCPAuthMiddleware
 from overbae.services.mcp.catalog import CATALOG
 from overbae.services.mcp.context import get_context
@@ -41,13 +42,14 @@ from overbae.services.mcp.prompts import list_prompts
 from overbae.services.mcp.resources import read_resource, resource_list, resource_templates
 
 SERVER_NAME = "overmind-platform"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = CONTRACT_VERSION
 
 mcp_server = Server(
     SERVER_NAME,
     version=SERVER_VERSION,
     instructions=(
-        "Overmind is an agent improvement platform. Call list_projects first to find "
+        "Use MCP for Overmind operations and the local CLI for file bytes. Missing tools, credentials or upload failures are not reasons to open a browser; report the connection error. Only open the Console when the user explicitly requests a visual view. "
+        "Overmind is an agent improvement platform. Read overmind://interface/current for connected contract identity and workflow rules. Drafts never submit provider work; use explicit preparation and launch operations. Call list_projects first to find "
         "accessible projects and choose the project relevant to the user's request. "
         "Account connections require project_id on each project tool and resource URI; "
         "there is no shared selected-project state. Follow returned resource links. "
@@ -61,14 +63,14 @@ mcp_server = Server(
         "Tools return the same data as structured content and JSON text. Treat isError and "
         "structured error fields as failures; follow resource links and poll get_job with "
         "the returned kind and id for asynchronous work. Preserve pagination, truncation, "
-        "missing scores, evaluator errors and pinned dataset/model identities in conclusions. "
+        "missing scores, metric errors and pinned dataset/model identities in conclusions. "
         "Inspection does not authorize mutations or paid runs. Check readiness and costs "
-        "before an authorized evaluation or training launch. Shape datasets with "
-        "try_dataset_script and add_dataset_version. Versions are immutable; Overmind runs "
-        "scripts in an isolated sandbox. Name a version with version, eval_version or "
-        "validation_version (a label such as v3, or its id) and pass versions explicitly when "
-        "launching; the active version is only the default. request_key makes a create or "
-        "start call safe to repeat for 24 hours. Benchmark selection and live serving are separate. "
+        "before an authorized evaluation or training launch. The calling coding agent owns dataset interpretation, transformation authoring and semantic work. "
+        "The platform has no Workshop planning agent. Retain scripts automatically with save_dataset_pipeline(dataset=..., package=...); never ask users whether to keep them. Retain scoped uncertainties and their evidence in the script and output; successful formatting and execution do not establish suitability. Discover reusable project revisions with inspect_dataset_workbench; prefer reuse or an attributed derived_from variant. Upload original source bytes once, pin upstream dataset revisions, and retain transformation code before full-data processing. Never upload locally transformed derivatives as unrelated source datasets. New transformations require a retained Python package; package-free historical revisions are read-only. Upload scripts using overmind dataset pipeline-upload, register with save_dataset_pipeline, validate_dataset_pipeline, preview then run_dataset_pipeline. Each successful run replaces the displayed preparation with its selected end-to-end process. Corrections update the same recipe family and rerun from its original source; do not append repair cells or create prepared-v2 datasets. Pinned consumer inputs remain immutable internally. Enable saved source bindings explicitly for repeated snapshot rebuilds. import_dataset_version is for genuine external results, not a substitute for retaining transformation code. "
+        "When asked to prepare data in Overmind, local files alone are not completion: publish and inspect the requested dataset or report an explicit blocker. Inspect the named capability's contract and examples before choosing target semantics; link it explicitly. Preserve unknown meaning rather than inventing task labels. Separate meaningful preparation stages and review branches from final formatting. Use the returned upload argv and identifiers verbatim, replacing only documented placeholders. "
+        "Declare the final step consumer (decision_train, decision_eval, chat_train or model_eval) so previews validate nested targets. Use batch_rows only for row-independent steps; sorting, grouping and deduplication require the full population. Preserve evidenced target semantics and structured provenance; never remove them to bypass a validator. Preview defers absolute min_rows/max_rows bounds to publication; lineage and preserve_rows checks remain enforced. Inspect deferred checks before publishing. Follow poll_after_seconds; queued work alone is not a failure or reason to resubmit. Report format compatibility separately from task suitability, which remains unmeasured without attributable evidence. "
+        "Author explicit step IDs and input dependencies. Converge intended branches with inputs=[earlier IDs]; disjoint rows concatenate in declared order, overlapping source_row identities fail. The last step is the output: inspect flow.unconsumed_steps before publication. Training preparation should end in trainable examples with review metadata, not disconnected inspection tables; never invent targets or treat flags as resolved. Script conditions cite their entrypoint line and describe code, not independently verified semantics. Receipts record actual parent cells, counts and fingerprints. Pin sources and use stable request keys. "
+        "Use author-dataset-transformation for conditional authoring, retrieval and adaptation. inspect_dataset_workbench(pipeline=revision ID) retrieves an exact recipe and its family history. Only retained packages execute in the approved isolated runtime; other code and semantic/provider work stay in the native environment. Technical format checks do not prove semantic quality or exhaustive/exclusive branches. "
         "Local scanning, file transfers, credentials and repository execution use the CLI "
         "handoffs in the relevant resources/prompts. The server does not edit local files. "
         "When a user wants a visual view, open the ordinary Console for this project; "

@@ -81,7 +81,6 @@ export interface DatasetUpload {
   status: "queued" | "uploading" | "counting" | "ready" | "error";
   percent: number;
   uploadId?: string;
-  /** Null for a document: its rows are known only after extraction. */
   rows?: number | null;
   error?: string;
 }
@@ -130,7 +129,7 @@ export function useDatasetUploads() {
           },
           { signal: controller.signal }
         );
-        update({ rows: inspected.rows ?? null, status: "ready", uploadId });
+        update({ rows: inspected.rows, status: "ready", uploadId });
       } catch (err) {
         if (!controller.signal.aborted) {
           const error = await uploadError(err);

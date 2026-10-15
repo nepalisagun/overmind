@@ -7,8 +7,10 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from conftest import EVAL_ROWS, TRAIN_ROWS, add_versions, frozen_dataset
+from conftest import EVAL_ROWS, TRAIN_ROWS, frozen_dataset
 from django.utils import timezone
+from factories import make_matrix_row
+from rest_framework.test import APIClient
 
 from overbae.api.serializers import FinetuningJobSerializer
 from overbae.modal.model_registry import baseten_finetuning_catalog
@@ -17,14 +19,14 @@ from overbae.models import (
     Cell,
     Dataset,
     EvalSet,
-    EvalSetMember,
-    Evaluator,
     Project,
     ProjectMembership,
     User,
 )
 from overbae.models.optimizer import optimizer_dataset_error
-from overbae.services.datasets import imports, lifecycle, use
+from overbae.services.datasets import lifecycle, use
+from overbae.tasks import datasets as dataset_tasks
+from tests.workshop_script_fixtures import retained_package, select_script
 
 pytestmark = pytest.mark.django_db
 
@@ -43,17 +45,7 @@ def _job(project, capability, user, train, evaluation, **fields):
     eval_set = EvalSet.objects.create(
         project=project, capability=capability, name="Test evaluations"
     )
-    evaluator = Evaluator.objects.create(
-        project=project,
-        capability=capability,
-        name="Exact match",
-        kind=Evaluator.Kind.DETERMINISTIC,
-        scope=Evaluator.Scope.FINAL_OUTPUT,
-        config={"check": "exact_match"},
-    )
-    EvalSetMember.objects.create(
-        eval_set=eval_set, evaluator=evaluator, role=EvalSetMember.Role.GENERATIVE
-    )
+    eval_set.rows.add(make_matrix_row(project, capability=capability))
     return FinetuningJobSerializer(
         data={
             "project": str(project.id),
@@ -102,9 +94,15 @@ def test_a_refused_training_launch_leaves_every_version_unused():
 def test_a_training_job_pins_and_freezes_the_versions_it_was_checked_on():
     project, capability, user, train, evaluation = _setup()
     pinned = evaluation.active_cell
-    add_versions(evaluation, [("later", "df = df.head(1)\n")])
-    later = evaluation.active_cell
-    assert later.parent_id == pinned.id
+    from conftest import import_version
+
+    from overbae.services.datasets import paths, store
+
+    later = import_version(
+        evaluation, store.head(paths.cell_path(evaluation.pk, evaluation.source.pk), 1)
+    )
+    evaluation.refresh_from_db()
+    assert evaluation.active_cell == later
     serializer = _job(project, capability, user, train, evaluation, eval_cell=str(pinned.id))
     assert serializer.is_valid(), serializer.errors
     job = serializer.save(triggered_by=user)
@@ -114,17 +112,46 @@ def test_a_training_job_pins_and_freezes_the_versions_it_was_checked_on():
     assert later.used_at is None
 
 
-def test_a_landing_without_an_import_receipt_fails_only_after_the_import_limit():
+def test_a_live_transformation_on_an_old_dataset_is_not_reaped():
+    project, _capability, user, train, _evaluation = _setup()
+    Dataset.objects.filter(pk=train.pk).update(updated_at=timezone.now() - timedelta(days=2))
+    client = APIClient()
+    client.force_authenticate(user)
+    recipe = client.post(
+        f"/api/datasets/{train.pk}/pipelines/",
+        {
+            "name": "Projection",
+            "request_key": "recipe",
+            "package": retained_package(project, user, [select_script(["messages"])]),
+        },
+        format="json",
+    )
+    assert recipe.status_code == 201, recipe.data
+    source = train.active_cell
+    started = client.post(
+        f"/api/datasets/{train.pk}/pipeline-runs/",
+        {
+            "pipeline": recipe.data["id"],
+            "request_key": "run",
+            "source_cell": str(source.pk),
+            "source_fingerprint": source.fingerprint,
+        },
+        format="json",
+    )
+    assert started.status_code == 202, started.data
+    assert dataset_tasks.reap_stuck_runs() == {"reaped": 0}
+    train.refresh_from_db()
+    assert train.state == Dataset.State.RUNNING
+
+
+def test_the_reaper_fails_a_state_only_after_that_state_own_limit():
     project, _capability, _user, train, evaluation = _setup()
-    limit = timedelta(seconds=imports.EXECUTION_SECONDS + imports.LEASE_GRACE_SECONDS)
-    Dataset.objects.filter(pk=train.pk).update(
-        state="landing", updated_at=timezone.now() - limit - timedelta(minutes=1)
-    )
+    age = timedelta(seconds=dataset_tasks.LAND_HARD_LIMIT + dataset_tasks.REAP_GRACE + 60)
+    Dataset.objects.filter(pk=train.pk).update(state="running", updated_at=timezone.now() - age)
     Dataset.objects.filter(pk=evaluation.pk).update(
-        state="landing", updated_at=timezone.now() - limit + timedelta(minutes=1)
+        state="landing", updated_at=timezone.now() - age
     )
-    assert imports.reconcile()["orphaned"] == 1
+    assert dataset_tasks.reap_stuck_runs() == {"reaped": 1}
     train.refresh_from_db()
     evaluation.refresh_from_db()
-    assert (train.state, evaluation.state) == ("error", "landing")
-    assert train.error == "The worker stopped before this finished."
+    assert (train.state, evaluation.state) == ("running", "error")

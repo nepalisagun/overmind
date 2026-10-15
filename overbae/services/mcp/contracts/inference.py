@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
-from overbae.services.mcp.contracts.common import MCPModel, ResourceLinkContract
+from overbae.services.mcp.contracts.common import JobReceipt, MCPModel, ResourceLinkContract
 
 
 class InferenceMessage(MCPModel):
@@ -14,29 +14,34 @@ class InferenceMessage(MCPModel):
     content: str = Field(min_length=1, max_length=32_000)
 
 
+class DecisionInput(MCPModel):
+    state: str = Field(max_length=128_000)
+    question: str = Field(min_length=1, max_length=32_000)
+    kind: Literal["choice", "noul", "score"]
+    options: list[str] = Field(min_length=2, max_length=255)
+
+
 class RunInferenceInput(MCPModel):
+    request_key: str = Field(min_length=1, max_length=128)
     deployment: str = Field(min_length=1, max_length=255)
-    messages: list[InferenceMessage] = Field(min_length=1, max_length=50)
-    temperature: float = Field(default=1.0, ge=0.0, le=2.0)
+    messages: list[InferenceMessage] | None = Field(default=None, min_length=1, max_length=50)
+    decisions: list[DecisionInput] | None = Field(default=None, min_length=1, max_length=16)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, strict=True)
 
-
-class InferenceUsage(MCPModel):
-    prompt_tokens: int = Field(default=0, ge=0)
-    completion_tokens: int = Field(default=0, ge=0)
-    total_tokens: int | None = Field(default=None, ge=0)
+    @model_validator(mode="after")
+    def one_contract(self):
+        if bool(self.messages) == bool(self.decisions):
+            raise ValueError("Supply messages or decisions, not both.")
+        if self.decisions and (self.temperature is not None or self.max_tokens is not None):
+            raise ValueError("Decision inference does not accept generation parameters.")
+        return self
 
 
 class RunInferenceOutput(MCPModel):
     summary: str = Field(min_length=1, max_length=240)
     model_id: str
-    content: str = Field(max_length=32_000)
-    usage: InferenceUsage | None = None
-    latency_ms: float = Field(ge=0)
-    is_cold: bool
-    finish_reason: str | None = None
-    truncated: bool = False
-    content_clipped: bool = False
+    job: JobReceipt
     resource: ResourceLinkContract
 
 

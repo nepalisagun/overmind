@@ -37,6 +37,7 @@ const columns: ColumnDef<BillingTelemetry>[] = [
       </span>
     ),
     header: "When",
+    meta: { orderingField: "timestamp" },
     minSize: 140,
     size: 180,
   },
@@ -46,6 +47,7 @@ const columns: ColumnDef<BillingTelemetry>[] = [
       <span className="font-medium text-foreground">{row.original.serviceLabel}</span>
     ),
     header: "Service",
+    meta: { orderingField: "service" },
     minSize: 120,
     size: 160,
   },
@@ -55,6 +57,7 @@ const columns: ColumnDef<BillingTelemetry>[] = [
       <span className="text-muted-foreground">{row.original.projectName ?? "—"}</span>
     ),
     header: "Project",
+    meta: { orderingField: "project__name" },
     minSize: 120,
     size: 160,
   },
@@ -67,7 +70,7 @@ const columns: ColumnDef<BillingTelemetry>[] = [
       );
     },
     header: "Amount",
-    meta: { noTruncate: true },
+    meta: { noTruncate: true, orderingField: "amount" },
     minSize: 100,
     size: 120,
   },
@@ -76,7 +79,8 @@ const columns: ColumnDef<BillingTelemetry>[] = [
 export function BillingLedgerTable({ className }: { className?: string }) {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(PAGE_SIZE);
-  const query = useBillingLedgerQuery(page, pageSize);
+  const [ordering, setOrdering] = useState<string | undefined>("-timestamp");
+  const query = useBillingLedgerQuery(page, pageSize, ordering);
   const { enabled: commercial } = useCommercialBilling();
 
   const emptyState = useMemo(
@@ -103,7 +107,7 @@ export function BillingLedgerTable({ className }: { className?: string }) {
           Usage history
         </h3>
         <p className={cn(PROSE, "mt-1 text-sm text-muted-foreground")}>
-          {commercial ? "Credits added and spent. Newest first." : "Usage. Newest first."}
+          {commercial ? "Credits added and spent." : "Usage."}
         </p>
       </div>
       <DataTable
@@ -113,11 +117,16 @@ export function BillingLedgerTable({ className }: { className?: string }) {
         error={query.error}
         getRowId={(row) => row.id}
         isLoading={query.isLoading}
+        onOrderingChange={(next) => {
+          setOrdering(next);
+          setPage(1);
+        }}
         onPageChange={setPage}
         onPageSizeChange={(s) => {
           setPage(1);
           setPageSize(s);
         }}
+        ordering={ordering}
         page={page}
         pageSize={pageSize}
         storageKey="billing:ledger-cols"

@@ -1,21 +1,20 @@
-"""Create datasets and resume their imports — the boundary REST and MCP share."""
-
 from __future__ import annotations
 
+import uuid
+
 from django.db import transaction
-from django.db.models import Q
+from django.utils import timezone
 
-from overbae.models import Dataset, DatasetImport
+from overbae.models import Dataset
 from overbae.services.datasets import files, imports, selection
-from overbae.services.datasets.land import SPLIT_POSITIONS, LandError, version_source
-from overbae.services.datasets.lifecycle import DatasetError, refuse_deleted_capability
+from overbae.services.datasets.land import SPLIT_POSITIONS
+from overbae.services.datasets.lifecycle import (
+    DatasetError,
+    refuse_deleted_capability,
+)
 
-_SOURCE_KEYS = ("traces", "rows", "upload_id", "uploads", "llm_calls", "version")
-_SOURCE_KINDS = {
-    "llm_calls": Dataset.SourceKind.LLM_CALLS,
-    "traces": Dataset.SourceKind.TRACES,
-    "version": Dataset.SourceKind.VERSION,
-}
+_SOURCE_KEYS = ("traces", "rows", "upload_id", "uploads", "llm_calls")
+_BUSY = (Dataset.State.LANDING, Dataset.State.RUNNING)
 
 
 def _user_id(user) -> str | None:
@@ -27,33 +26,43 @@ def _check_source(source: dict) -> None:
     keys = [k for k in _SOURCE_KEYS if source.get(k) not in (None, "", [])]
     if len(keys) != 1:
         raise DatasetError(
-            "Give exactly one source: traces, rows, upload_id, uploads, llm_calls or version.",
+            "Give exactly one source: traces, rows, upload_id, uploads or llm_calls.",
             code="source",
         )
 
 
-def _copied(project, source: dict):
-    """The version a ``version`` source reads, or None for any other source."""
-    if source.get("version") is None:
-        return None
-    try:
-        return version_source(project.id, source["version"])
-    except LandError as exc:
-        raise DatasetError(str(exc), code="source") from exc
+def _trace_preference(source: dict, capability_id) -> dict:
+    if source.get("traces") is None or not capability_id:
+        return source
+    traces = source["traces"]
+    if traces.get("preferred_capability_id") or (traces.get("filters") or {}).get("capability"):
+        return source
+    return {
+        **source,
+        "traces": {**source["traces"], "preferred_capability_id": str(capability_id)},
+    }
 
 
-def _new(project, user, name: str, source: dict, intent: str | None, capability) -> Dataset:
+def stage_dataset(
+    project, user, name: str, source: dict, intent: str | None, capability, brief=""
+) -> Dataset:
     refuse_deleted_capability(capability)
     dataset = Dataset.objects.create(
         project=project,
         capability=capability,
         name=(name or "").strip(),
+        brief=brief.strip(),
         intent=intent or Dataset.Intent.PENDING,
-        source_kind=next(
-            (kind for key, kind in _SOURCE_KINDS.items() if source.get(key) is not None),
-            Dataset.SourceKind.FILE,
+        source_kind=(
+            Dataset.SourceKind.LLM_CALLS
+            if source.get("llm_calls") is not None
+            else Dataset.SourceKind.TRACES
+            if source.get("traces") is not None
+            else Dataset.SourceKind.FILE
+            if source
+            else Dataset.SourceKind.PENDING
         ),
-        state=Dataset.State.LANDING,
+        state=Dataset.State.LANDING if source else Dataset.State.IDLE,
         created_by=user if getattr(user, "pk", None) else None,
     )
     dataset.refresh_from_db()
@@ -66,27 +75,27 @@ def create_dataset(
     project,
     user,
     name: str,
-    source: dict,
+    source: dict | None = None,
+    brief: str = "",
     intent: str | None = None,
     capability=None,
     infer_capability: bool = True,
 ) -> Dataset:
-    """Land one trace selection, LLM-call selection, row collection, upload, ordered upload
-    collection or version of another dataset. A version keeps its dataset's intent and
-    capability unless they are given."""
-    _check_source(source)
-    copied = _copied(project, source)
-    if copied is not None:
-        if intent in (None, Dataset.Intent.PENDING):
-            intent = copied.dataset.intent
-        if capability is None and infer_capability:
-            capability = copied.dataset.capability
+    """Land one trace selection, row collection, upload or ordered upload collection."""
+    source = source or {}
+    source = _trace_preference(source, getattr(capability, "pk", None))
+    if not source and not brief.strip():
+        raise DatasetError("Describe what you want to do or add source data.", code="source")
+    if source:
+        _check_source(source)
     if source.get("llm_calls") is not None and intent not in (
         Dataset.Intent.TRAIN,
         Dataset.Intent.EVAL,
     ):
         raise DatasetError("Choose train or eval.", code="intent")
-    dataset = _new(project, user, name, source, intent, capability)
+    dataset = stage_dataset(project, user, name, source, intent, capability, brief)
+    if not source:
+        return dataset
     imports.enqueue(
         dataset,
         {
@@ -96,6 +105,46 @@ def create_dataset(
             "infer_capability": infer_capability,
         },
     )
+    return dataset
+
+
+def stage_attachment(dataset, source: dict) -> str:
+    _check_source(source)
+    with transaction.atomic():
+        locked = Dataset.objects.select_for_update().get(pk=dataset.pk)
+        if locked.state in _BUSY:
+            raise DatasetError("The dataset is busy. Wait for it.", code=locked.state)
+        request_id = str(uuid.uuid4())
+        source_spec = {**locked.source_spec, "attachment_request": request_id}
+        source_spec.pop("landing_progress", None)
+        Dataset.objects.filter(pk=locked.pk).update(
+            state=Dataset.State.LANDING,
+            operation={},
+            error="",
+            source_spec=source_spec,
+            updated_at=timezone.now(),
+        )
+    return request_id
+
+
+def attach_source(dataset, user, source: dict) -> Dataset:
+    source = _trace_preference(source, dataset.capability_id)
+    with transaction.atomic():
+        request_id = stage_attachment(dataset, source)
+        from overbae.tasks.datasets import land
+
+        transaction.on_commit(
+            lambda: land.apply_async(
+                kwargs={
+                    "dataset_id": str(dataset.pk),
+                    "source": source,
+                    "user_id": _user_id(user),
+                    "infer_capability": False,
+                    "attachment_request": request_id,
+                }
+            )
+        )
+    dataset.refresh_from_db()
     return dataset
 
 
@@ -113,12 +162,11 @@ def create_split(
     deduplicate=True,
     capability=None,
     infer_capability: bool = True,
+    brief: str = "",
 ) -> tuple[Dataset, Dataset]:
     """One source, read once, landed as a train dataset and an eval dataset."""
     _check_source(source)
-    copied = _copied(project, source)
-    if copied is not None and capability is None and infer_capability:
-        capability = copied.dataset.capability
+    source = _trace_preference(source, getattr(capability, "pk", None))
     if not 1 <= int(eval_percent) <= 99:
         raise DatasetError("eval_percent must be between 1 and 99.", code="split")
     from overbae.services.datasets.llm_calls import HASH_POSITION, Selection, SelectionError
@@ -134,29 +182,31 @@ def create_split(
             raise DatasetError("Two LLM calls are needed to split.", code="split")
     elif position not in SPLIT_POSITIONS:
         raise DatasetError(f"position must be one of {', '.join(SPLIT_POSITIONS)}.", code="split")
-    if copied is not None:
-        known = copied.rows
-    elif source.get("rows") is not None:
+    if source.get("rows") is not None:
         known = len(source["rows"])
     elif source.get("traces") is not None:
         known = selection.TraceSource.parse(source["traces"]).count(project.id)
     elif source.get("llm_calls") is None:
-        uploads = source.get("uploads") or [source["upload_id"]]
-        # Documents split by document, so one document cannot be split.
-        lone = files.upload_filename(uploads[0]) if len(uploads) == 1 else ""
-        if lone and not group_by and files.is_document(lone):
-            raise DatasetError("Two documents are needed to split.", code="split")
-        inspected = [files.inspection(i) for i in uploads]
-        counts = [record["rows"] if record else None for record in inspected]
-        known = None if None in counts else sum(counts)
+        inspected = [files.inspection(i) for i in source.get("uploads") or [source["upload_id"]]]
+        known = (
+            None
+            if any(record is None or record["rows"] is None for record in inspected)
+            else sum(record["rows"] for record in inspected)
+        )
     else:
         known = None
     if known is not None and known < 2:
         raise DatasetError("Two rows are needed to split.", code="split")
     name = (name or "").strip()
+    if len(name) > 249:
+        raise DatasetError("Split names must be at most 249 characters.", code="split")
     with transaction.atomic():
-        train = _new(project, user, f"{name} train", source, Dataset.Intent.TRAIN, capability)
-        evaluation = _new(project, user, f"{name} eval", source, Dataset.Intent.EVAL, capability)
+        train = stage_dataset(
+            project, user, f"{name} train", source, Dataset.Intent.TRAIN, capability, brief
+        )
+        evaluation = stage_dataset(
+            project, user, f"{name} eval", source, Dataset.Intent.EVAL, capability, brief
+        )
     imports.enqueue(
         train,
         {
@@ -175,34 +225,3 @@ def create_split(
         },
     )
     return train, evaluation
-
-
-@transaction.atomic
-def resume_import(dataset) -> Dataset:
-    pending = (
-        DatasetImport.objects.filter(
-            Q(dataset=dataset) | Q(evaluation=dataset), state=DatasetImport.State.BLOCKED
-        )
-        .order_by("queued_at")
-        .first()
-    )
-    if pending is None:
-        raise DatasetError("The source import is not blocked.", code="import_not_blocked")
-    imports.resume(pending.pk)
-    dataset.refresh_from_db()
-    return dataset
-
-
-def cancel_import(dataset) -> Dataset:
-    pending = (
-        DatasetImport.objects.filter(
-            Q(dataset=dataset) | Q(evaluation=dataset), state__in=imports.OPEN_STATES
-        )
-        .order_by("queued_at")
-        .first()
-    )
-    if pending is None:
-        raise DatasetError("No import is running.", code="import_not_running")
-    imports.cancel(pending.pk)
-    dataset.refresh_from_db()
-    return dataset

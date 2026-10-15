@@ -318,12 +318,6 @@ def run_init(
         configured_url = load(config_path).base_url
     mcp_url, base_url = resolve_mcp_url(env, configured_url)
 
-    if (
-        ide == "codex"
-        and env in {"local", "development", "dev"}
-        and not (api_url or os.environ.get("OVERMIND_API_URL") or os.environ.get("OVERMIND_BASE_URL"))
-    ):
-        raise typer.BadParameter("Codex setup supports production or staging", param_hint="--env")
     sync_skills([skill.slug for skill in skills], ide=ide)
     dest = get_destination_dir(ide)
     console.print(f"Skills → {dest}/skills ({len(skills)})")
@@ -349,7 +343,9 @@ def run_init(
         console.print(f"{DEFAULT_PATH.name} already present — left unchanged")
 
     if saved_key:
-        console.print("\nReady. MCP authentication uses the saved project credential.")
+        console.print(
+            "\nMCP configured with the saved project credential. Run overmind connection check --project-id PROJECT --json in this coding environment to verify MCP and local transfer readiness."
+        )
     else:
         console.print(
             "\nMCP authentication pending. Run [bold]overmind sync[/bold] to create the console project "

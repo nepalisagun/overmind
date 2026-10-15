@@ -6,26 +6,37 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from contextlib import suppress
+from threading import Event
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from asgiref.sync import sync_to_async
 from django.db import connection, transaction
-from factories import make_user
-from mcp_fixtures import EXPECTED_TOOL_NAMES
+from mcp_fixtures import EXPECTED_TOOL_NAMES, MAX_MANIFEST_BYTES
 from starlette.testclient import TestClient
 
-from overbae.models import APIToken, Capability, Project, ProjectMembership, Span
+from overbae.models import APIToken, Capability, Project, ProjectMembership, Span, User
 from overbae.services.mcp.server import create_mcp_application
+from overbae.services.mcp.tools_projects import accessible_projects
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
 MCP_URL = "/api/mcp/"
 
 
+def _user() -> User:
+    return User.objects.create_user(
+        email=f"mcp-{uuid.uuid4().hex[:8]}@test.com",
+        password="pw",
+        clerk_user_id=f"clerk_{uuid.uuid4().hex}",
+    )
+
+
 def _token(*, permission: list[str] | None = None) -> tuple[str, APIToken]:
-    user = make_user()
+    user = _user()
     project = Project.objects.create(name="MCP", slug=f"mcp-{uuid.uuid4().hex[:8]}")
     ProjectMembership.objects.create(user=user, project=project)
     return APIToken.create_for_user(user, project=project, permission=permission)
@@ -101,6 +112,39 @@ def test_ping_is_protocol_level_and_catalog_lists_curated_tools():
     assert ping.json()["result"] == {}
 
 
+def test_slow_tool_does_not_block_another_callers_authenticated_request(monkeypatch):
+    slow_key, slow_token = _token()
+    other_key, other_token = _token()
+    entered, release = Event(), Event()
+
+    def delayed_projects(context):
+        if context.token.pk == slow_token.pk:
+            entered.set()
+            assert release.wait(10), "The test did not release the slow request"
+        return accessible_projects(context)
+
+    monkeypatch.setattr("overbae.services.mcp.tools_projects.accessible_projects", delayed_projects)
+    body = _rpc("tools/call", {"name": "list_projects", "arguments": {}})
+    with TestClient(_application()) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(_post, client, slow_key, body)
+        other_response = None
+        try:
+            assert entered.wait(5), "The slow request did not reach its domain operation"
+            other = pool.submit(_post, client, other_key, body)
+            with suppress(TimeoutError):
+                other_response = other.result(timeout=3)
+        finally:
+            release.set()
+        slow_response = slow.result(timeout=5)
+
+    assert other_response is not None, "An independent authenticated request was blocked"
+    for response, token in [(slow_response, slow_token), (other_response, other_token)]:
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert not result.get("isError"), result
+        assert [p["id"] for p in result["structuredContent"]["projects"]] == [str(token.project_id)]
+
+
 def test_tools_list_is_permission_filtered_and_stays_within_manifest_budget():
     read_raw, _ = _token(permission=["read"])
     full_raw, _ = _token()
@@ -115,7 +159,7 @@ def test_tools_list_is_permission_filtered_and_stays_within_manifest_budget():
     assert full_response.status_code == 200
     assert read_names < {tool["name"] for tool in full_tools}
     assert len(full_tools) == len(EXPECTED_TOOL_NAMES)
-    assert len(full_response.content) <= 50 * 1024
+    assert len(full_response.content) <= MAX_MANIFEST_BYTES
 
 
 def test_resources_and_prompts_list_over_streamable_http():

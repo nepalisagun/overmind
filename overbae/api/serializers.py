@@ -10,10 +10,13 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.validators import UniqueTogetherValidator
 
+from modal_shared.decision_checkpoint_policy import validate_policy
+from modal_shared.decisions import DECISION_OBJECTIVES
 from overbae.api.model_activation import ModelActivationSerializer
+from overbae.api.native_evaluation import NativeEvaluationSerializer
 from overbae.api.scoping import project_ids_for
 from overbae.core.errors import InputValidationError
-from overbae.core.model_registry import judge_picker_models
+from overbae.core.model_registry import CATALOG, judge_picker_models
 from overbae.models import (
     APIToken,
     BillingTelemetry,
@@ -22,9 +25,9 @@ from overbae.models import (
     ConnectorSyncRun,
     Conversation,
     Dataset,
+    DecisionJob,
     DeployedModel,
     EvalSet,
-    EvalSetMember,
     Feedback,
     FinetuningJob,
     FinetuningJobEvent,
@@ -32,7 +35,6 @@ from overbae.models import (
     ProjectInvite,
     ProjectMembership,
     Prompt,
-    ScoringPass,
     Span,
     User,
     UserOnboarding,
@@ -46,9 +48,18 @@ from overbae.services.codebase.flow import (
 from overbae.services.datasets import use as dataset_use
 from overbae.services.datasets.lifecycle import DatasetError
 from overbae.services.deployment import deployment_progress
-from overbae.services.eval.trace_scoring import STATUS_ERROR
 from overbae.services.model_activation import start_activation
 from overbae.services.serving_context import evaluation_budget, serving_plan
+from overbae.services.training_contract import (
+    baseline_evaluation_enabled,
+    contract,
+    dataset_objective,
+    validate_effective_batch,
+)
+from overbae.services.training_monitoring import resolve as resolve_monitoring_policy
+from overbae.services.training_policies import profile_options
+from overbae.services.training_preparation import setup_job_for_launch
+from overbae.services.training_record import requested_configuration, run_record
 
 logger = logging.getLogger(__name__)
 
@@ -237,37 +248,6 @@ def trace_usage_totals(project_ids, trace_ids: list[str]) -> dict[str, dict]:
         if bucket["model"] is None:
             bucket["model"] = _model_from_span_attributes(attrs)
     return totals
-
-
-def eligible_scoring_capabilities(project_ids, capability_ids: list) -> set[str]:
-    """The set ``score_trace`` would attempt; backs ``scoring_pending`` so the
-    list doesn't reimplement its skip rules."""
-    if not capability_ids:
-        return set()
-    rows = (
-        Capability.objects.filter(
-            project_id__in=project_ids,
-            id__in=capability_ids,
-            active_eval_set__members__role=EvalSetMember.Role.TRACE_SCORING,
-            active_eval_set__members__enabled=True,
-            active_eval_set__members__evaluator__is_archived=False,
-        )
-        .values_list("id", flat=True)
-        .distinct()
-    )
-    return {str(capability_id) for capability_id in rows}
-
-
-def traces_with_finished_scoring_pass(project_ids, trace_ids: list) -> set[str]:
-    """Pending means "no finished pass", never "no score yet": a pass whose judges
-    all abstained is done, and a null-score row must not spin forever."""
-    if not trace_ids:
-        return set()
-    return set(
-        ScoringPass.objects.filter(
-            project_id__in=project_ids, trace_id__in=trace_ids, finished__isnull=False
-        ).values_list("trace_id", flat=True)
-    )
 
 
 def conversation_usage_totals(project_ids, conversation_ids: list) -> dict:
@@ -531,6 +511,21 @@ class CapabilityFlowToolArgumentSerializer(serializers.Serializer):
     description = serializers.CharField(allow_blank=True, required=False, default="")
 
 
+class CapabilityFlowTransitionSerializer(serializers.Serializer):
+    target = serializers.CharField()
+    condition = serializers.CharField()
+
+
+class CapabilityFlowToolBranchSerializer(serializers.Serializer):
+    transitions = CapabilityFlowTransitionSerializer(many=True, required=False, default=list)
+    condition = serializers.CharField()
+    basis = serializers.CharField()
+    action = serializers.CharField(allow_blank=True)
+    outcome = serializers.CharField(allow_blank=True)
+    next = serializers.CharField(allow_blank=True)
+    provenance = serializers.ListField(child=serializers.CharField())
+
+
 class CapabilityFlowToolSerializer(serializers.Serializer):
     name = serializers.CharField()
     purpose = serializers.CharField(allow_blank=True)
@@ -539,6 +534,7 @@ class CapabilityFlowToolSerializer(serializers.Serializer):
     side_effect = serializers.CharField(allow_blank=True, required=False, default="none")
     returns = serializers.CharField(allow_blank=True, required=False, default="")
     arguments = CapabilityFlowToolArgumentSerializer(many=True, required=False, default=list)
+    branches = CapabilityFlowToolBranchSerializer(many=True, required=False, default=list)
     integration = serializers.CharField(allow_blank=True, required=False, default="")
     cluster = serializers.CharField(allow_blank=True, required=False, default="")
     provenance = serializers.ListField(child=serializers.CharField(), required=False, default=list)
@@ -589,10 +585,11 @@ class CapabilityFlowTrajectoryToolUseSerializer(serializers.Serializer):
 
 
 class CapabilityFlowTrajectoryStepSerializer(serializers.Serializer):
+    transitions = CapabilityFlowTransitionSerializer(many=True, required=False, default=list)
     step = serializers.CharField()
     kind = serializers.CharField(allow_blank=True, required=False, default="agent_step")
     anchors = serializers.ListField(child=serializers.CharField(), required=False, default=list)
-    # In/Action/Out contract; blank on agent steps.
+    # Source-authored In/Action/Out contract for any execution step.
     input = serializers.CharField(allow_blank=True, required=False, default="")
     action = serializers.CharField(allow_blank=True, required=False, default="")
     output = serializers.CharField(allow_blank=True, required=False, default="")
@@ -614,12 +611,19 @@ class CapabilityFlowTrajectoryPathSerializer(serializers.Serializer):
     provenance = serializers.ListField(child=serializers.CharField())
 
 
+class CapabilityFlowModelResolutionSerializer(serializers.Serializer):
+    default_model = serializers.CharField(allow_blank=True)
+    selection = serializers.CharField(allow_blank=True)
+    provenance = serializers.ListField(child=serializers.CharField())
+
+
 class CapabilityFlowSerializer(serializers.Serializer):
     """Typed execution-graph contract for one capability (see ``build_capability_flow``)."""
 
     has_card = serializers.BooleanField()
     is_fallback = serializers.BooleanField()
     source = serializers.CharField()
+    model_resolution = CapabilityFlowModelResolutionSerializer(required=False)
     task = serializers.CharField(allow_blank=True)
     modality = serializers.CharField(allow_blank=True)
     domain = serializers.CharField(allow_blank=True)
@@ -718,6 +722,10 @@ class CapabilitySerializer(serializers.ModelSerializer):
     def validate_benchmark_model(self, value):
         if value is None:
             return value
+        if value.inference_contract != "chat":
+            raise serializers.ValidationError(
+                "Decision models use native probability comparisons, not chat benchmarks."
+            )
         project_id = self.instance.project_id if self.instance else self.initial_data.get("project")
         if str(value.project_id) != str(project_id):
             raise serializers.ValidationError("The benchmark model must belong to this project.")
@@ -780,6 +788,7 @@ class SpanSerializer(serializers.ModelSerializer):
             "capability",
             "conversation",
             "feedback_score",
+            "eval_attributes",
             "received_at",
         ]
         read_only_fields = fields
@@ -843,7 +852,6 @@ class RootSpanListSerializer(serializers.ModelSerializer):
         source="capability.name", allow_null=True, read_only=True
     )
     source = serializers.SerializerMethodField()
-    scoring_pending = serializers.SerializerMethodField()
     trace_status = serializers.SerializerMethodField()
 
     class Meta:
@@ -872,7 +880,7 @@ class RootSpanListSerializer(serializers.ModelSerializer):
             "feedback_score",
             "received_at",
             "source",
-            "scoring_pending",
+            "eval_attributes",
             "trace_status",
         ]
         read_only_fields = fields
@@ -922,26 +930,6 @@ class RootSpanListSerializer(serializers.ModelSerializer):
         if statuses is None:
             statuses = trace_status_map([obj.project_id], [obj.trace_id])
         return statuses[obj.trace_id]
-
-    # Requires `eligible_scoring_capabilities` context (see `SpanViewSet.list`); a
-    # trace whose root has no capability but a scoreable descendant does errs
-    # toward the dash rather than a per-row eligibility query.
-    def get_scoring_pending(self, obj: Span) -> bool:
-        feedback = obj.feedback_score or {}
-        if "trace_scoring" in feedback:
-            return False
-        if obj.status_code == STATUS_ERROR:
-            return False
-        if obj.capability_id is None:
-            return False
-        # A finished pass is done even when it wrote no block (all members
-        # skipped or abstained) — without this a null result spins forever.
-        if obj.trace_id in (self.context.get("traces_with_finished_pass") or set()):
-            return False
-        eligible = self.context.get("eligible_scoring_capabilities")
-        if eligible is None:
-            return False
-        return str(obj.capability_id) in eligible
 
 
 class SessionSerializer(serializers.ModelSerializer):
@@ -1066,12 +1054,22 @@ def _describe_cell(job: FinetuningJob) -> dict | None:
 
 
 class FinetuningJobListSerializer(serializers.ModelSerializer):
+    native_evaluation = NativeEvaluationSerializer(read_only=True, allow_null=True)
+    training_contract = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.JSONField())
+    def get_training_contract(self, obj):
+        return contract(obj.cell, obj.hyperparameters)
+
     deployed_model_id = serializers.SerializerMethodField()
+    decision_job_id = serializers.SerializerMethodField()
     cell_info = serializers.SerializerMethodField()
 
     class Meta:
         model = FinetuningJob
         fields = [
+            "training_contract",
+            "native_evaluation",
             "id",
             "project",
             "capability",
@@ -1079,6 +1077,7 @@ class FinetuningJobListSerializer(serializers.ModelSerializer):
             "eval_dataset",
             "eval_cell",
             "eval_set",
+            "benchmark_models",
             "eval_incumbent_before",
             "eval_incumbent_after",
             "eval_model_before",
@@ -1099,6 +1098,7 @@ class FinetuningJobListSerializer(serializers.ModelSerializer):
             "provider",
             "output_model_name",
             "deployed_model_id",
+            "decision_job_id",
             "model_weights_location",
             "progress",
             "retry_count",
@@ -1121,6 +1121,11 @@ class FinetuningJobListSerializer(serializers.ModelSerializer):
     def get_deployed_model_id(self, obj: FinetuningJob) -> str | None:
         return _deployed_model_id(obj)
 
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_decision_job_id(self, obj: FinetuningJob) -> str | None:
+        identity = getattr(obj, "decision_job", None)
+        return str(identity.pk) if identity is not None else None
+
 
 class FinetuningJobRunSerializer(serializers.Serializer):
     """Every job the wizard launched together. ``run_id`` is the ``group_id`` when
@@ -1133,17 +1138,49 @@ class FinetuningJobRunSerializer(serializers.Serializer):
 
 
 class FinetuningJobSerializer(serializers.ModelSerializer):
+    native_evaluation = NativeEvaluationSerializer(read_only=True, allow_null=True)
+    record = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.JSONField())
+    def get_record(self, obj):
+        return run_record(obj)
+
+    def validate_accepted_findings(self, value):
+        if (
+            not isinstance(value, list)
+            or len(value) > 100
+            or any(
+                not isinstance(item, str) or not item.strip() or len(item) > 2000 for item in value
+            )
+        ):
+            raise serializers.ValidationError("Provide at most 100 nonblank finding descriptions.")
+        return value
+
     eval_judge_model = serializers.ChoiceField(choices=["", *judge_picker_models()], required=False)
     events = FinetuningJobEventSerializer(many=True, read_only=True)
     deployed_model_id = serializers.SerializerMethodField()
+    decision_job_id = serializers.SerializerMethodField()
     cell_info = serializers.SerializerMethodField()
-    eval_dataset = serializers.PrimaryKeyRelatedField(queryset=Dataset.objects.all())
-    eval_set = serializers.PrimaryKeyRelatedField(queryset=EvalSet.objects.all())
+    eval_dataset = serializers.PrimaryKeyRelatedField(
+        queryset=Dataset.objects.all(), required=False, allow_null=True
+    )
+    eval_set = serializers.PrimaryKeyRelatedField(
+        queryset=EvalSet.objects.all(), required=False, allow_null=True
+    )
     baseline_model = serializers.CharField(required=False, max_length=255)
+    benchmark_models = serializers.ListField(
+        child=serializers.CharField(max_length=255), required=False
+    )
 
     class Meta:
         model = FinetuningJob
+        validators = []
         fields = [
+            "request_key",
+            "requested_configuration",
+            "accepted_findings",
+            "record",
+            "native_evaluation",
             "id",
             "project",
             "capability",
@@ -1152,6 +1189,7 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             "eval_cell",
             "eval_set",
             "eval_judge_model",
+            "benchmark_models",
             "eval_incumbent_before",
             "eval_incumbent_after",
             "eval_model_before",
@@ -1176,6 +1214,7 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             "model_weights_location",
             "output_model_name",
             "deployed_model_id",
+            "decision_job_id",
             "progress",
             "result",
             "error_message",
@@ -1192,6 +1231,9 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             "events",
         ]
         read_only_fields = [
+            "requested_configuration",
+            "record",
+            "native_evaluation",
             "id",
             "triggered_by",
             "status",
@@ -1199,6 +1241,7 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             "model_weights_location",
             "output_model_name",
             "deployed_model_id",
+            "decision_job_id",
             "progress",
             "result",
             "error_message",
@@ -1221,6 +1264,11 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
     def get_deployed_model_id(self, obj: FinetuningJob) -> str | None:
         return _deployed_model_id(obj)
 
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_decision_job_id(self, obj: FinetuningJob) -> str | None:
+        identity = getattr(obj, "decision_job", None)
+        return str(identity.pk) if identity is not None else None
+
     def validate_project(self, value):
         return _validate_project_ownership(self, value)
 
@@ -1232,6 +1280,11 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
     def validate_hyperparameters(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("Use a JSON object for hyperparameters.")
+        if settings.FINETUNING_BACKEND in {"modal", "baseten"}:
+            try:
+                validate_effective_batch(value)
+            except ValueError as exc:
+                raise serializers.ValidationError(str(exc)) from exc
         training_type = value.get("training_type")
         if training_type is not None:
             if not isinstance(training_type, dict):
@@ -1249,12 +1302,52 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
 
     def _check_cell(self, dataset: Dataset, intent: str, *, field: str, explicit=None):
         try:
-            return dataset_use.check(dataset, intent, cell=explicit)
+            return dataset_use.check(
+                dataset, intent, cell=explicit, verify=self.context.get("verify_source_files", True)
+            )
         except DatasetError as exc:
             raise serializers.ValidationError({field: exc.detail}) from exc
 
+    def validate_request_key(self, value):
+        return value.strip() or None if value is not None else None
+
     @transaction.atomic
     def create(self, validated_data):
+        def with_decision_identity(job):
+            from overbae.modal.decision_catalog import get as decision_catalog_model
+
+            if self.context.get("create_decision_job") or decision_catalog_model(job.base_model):
+                DecisionJob.objects.get_or_create(finetuning_job=job)
+            return job
+
+        Project.objects.select_for_update().get(pk=validated_data["project"].pk)
+        key = validated_data.get("request_key")
+        prior = (
+            FinetuningJob.objects.filter(project=validated_data["project"], request_key=key).first()
+            if key
+            else None
+        )
+        requested = requested_configuration(
+            validated_data,
+            training_plan=self.context.get("training_plan"),
+            runtime=(prior.requested_configuration or {}).get("runtime")
+            if prior
+            else self.context.get("training_runtime"),
+        )
+        if key:
+            existing = FinetuningJob.objects.filter(
+                project=validated_data["project"], request_key=key
+            ).first()
+            if existing is not None:
+                if existing.requested_configuration.get("fingerprint") != requested["fingerprint"]:
+                    raise serializers.ValidationError(
+                        {"request_key": "This launch key already belongs to a different recipe."}
+                    )
+                existing.launch_reused = True
+                return with_decision_identity(existing)
+        if admit := self.context.get("admit_new_training"):
+            admit()
+        validated_data["requested_configuration"] = requested
         datasets = [
             validated_data.get(key) for key in ("dataset", "validation_dataset", "eval_dataset")
         ]
@@ -1279,15 +1372,40 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
                     locked[dataset.pk],
                     intent,
                     cell=validated_data.get(cell_field),
+                    verify=self.context.get("verify_source_files", True),
                 )
             except DatasetError as exc:
                 raise serializers.ValidationError({field: exc.detail}) from exc
-        return super().create(validated_data)
+        setup = setup_job_for_launch(validated_data, requested.get("runtime"))
+        if setup is not None:
+            # Launch defaults replace the incomplete setup recipe, preserving its identity.
+            job = FinetuningJob(**validated_data)
+            job.pk = setup.pk
+            job.preparation_id = setup.preparation_id
+            job.created_at = setup.created_at
+            job.provider = setup.provider
+            job.name = job.name or setup.name
+            job.progress = {**setup.progress, "phase": "queued"}
+            job.save(force_update=True)
+            return with_decision_identity(job)
+        return with_decision_identity(super().create(validated_data))
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
         if self.instance is not None:
             for field in (
+                "request_key",
+                "base_model",
+                "hyperparameters",
+                "validation_enabled",
+                "validation_split_ratio",
+                "split_method",
+                "eval_set",
+                "eval_model_before",
+                "eval_model_after",
+                "eval_incumbent_before",
+                "eval_incumbent_after",
+                "accepted_findings",
                 "project",
                 "capability",
                 "dataset",
@@ -1321,6 +1439,26 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             )
         from overbae.services.finetuning_eval import resolve_baseline_model
 
+        benchmark_models = attrs.get("benchmark_models")
+        if benchmark_models is not None:
+            if len(benchmark_models) != len(set(benchmark_models)) or any(
+                not model.strip() or model != model.strip() for model in benchmark_models
+            ):
+                raise serializers.ValidationError(
+                    {"benchmark_models": "Select each named model once."}
+                )
+            if self.instance is not None and benchmark_models != self.instance.benchmark_models:
+                raise serializers.ValidationError(
+                    {"benchmark_models": "Benchmark models are fixed when training starts."}
+                )
+            if self.instance is None and benchmark_models:
+                if attrs.get("baseline_model") not in (None, benchmark_models[0]):
+                    raise serializers.ValidationError(
+                        {"benchmark_models": "The first benchmark must match the baseline model."}
+                    )
+                attrs["baseline_model"] = benchmark_models[0]
+                attrs["eval_incumbent_before"] = True
+
         incumbent = attrs.get(
             "baseline_model",
             resolve_baseline_model(
@@ -1332,8 +1470,11 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
         )
         if self.instance is None and "baseline_model" in attrs and incumbent:
             codebase_model = (getattr(capability, "model", "") or "").strip()
+            available_external = {model.slug for model in CATALOG if model.slug}
             if (
                 incumbent != codebase_model
+                and incumbent not in available_external
+                and not ("/" in incumbent and all(incumbent.split("/", 1)))
                 and not DeployedModel.objects.filter(
                     project=project,
                     model_id=incumbent,
@@ -1343,9 +1484,25 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             ):
                 raise serializers.ValidationError(
                     {
-                        "baseline_model": "Select the codebase incumbent or a ready trained model in this project."
+                        "baseline_model": "Select the codebase incumbent, an OpenRouter model or a ready trained model in this project."
                     }
                 )
+            for model_id in benchmark_models or []:
+                if (
+                    model_id == codebase_model
+                    or model_id in available_external
+                    or ("/" in model_id and all(model_id.split("/", 1)))
+                ):
+                    continue
+                if not DeployedModel.objects.filter(
+                    project=project,
+                    model_id=model_id,
+                    status=DeployedModel.Status.READY,
+                    finetuning_job__isnull=False,
+                ).exists():
+                    raise serializers.ValidationError(
+                        {"benchmark_models": f"{model_id} is not an available benchmark model."}
+                    )
         if self.instance is not None and self.instance.status != FinetuningJob.Status.QUEUED:
             for field in (
                 "eval_incumbent_before",
@@ -1382,14 +1539,92 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
                 dataset, "train", field="dataset", explicit=attrs.get("cell")
             )
 
+        selected_cell = attrs.get("cell") or getattr(self.instance, "cell", None)
+        if selected_cell is not None:
+            objective = dataset_objective(selected_cell)
+            hp = dict(
+                attrs.get("hyperparameters", getattr(self.instance, "hyperparameters", {})) or {}
+            )
+            if hp.get("objective", objective) != objective:
+                raise serializers.ValidationError(
+                    {"hyperparameters": "The objective must match the pinned dataset contract."}
+                )
+            hp["objective"] = objective
+            if objective in DECISION_OBJECTIVES:
+                for choice in ("eval_model_before", "eval_model_after"):
+                    if self.instance is None and choice not in self.initial_data:
+                        attrs[choice] = False
+                if (hp.get("training_type") or {}).get("type", "Lora") != "Lora":
+                    raise serializers.ValidationError(
+                        {
+                            "hyperparameters": "Native decision training currently supports LoRA only."
+                        }
+                    )
+                if settings.FINETUNING_BACKEND != "modal":
+                    raise serializers.ValidationError(
+                        {"hyperparameters": "Decision training requires Modal."}
+                    )
+                if hp.get("packing"):
+                    raise serializers.ValidationError(
+                        {
+                            "hyperparameters": "Decision training uses independent, unpacked examples."
+                        }
+                    )
+                hp["packing"] = False
+                for field in (
+                    "eval_model_before",
+                    "eval_model_after",
+                    "eval_incumbent_before",
+                    "eval_incumbent_after",
+                ):
+                    if attrs.get(field, getattr(self.instance, field, False)):
+                        raise serializers.ValidationError(
+                            {
+                                field: "Decision checkpoints require native probability evaluation, not chat generation."
+                            }
+                        )
+                    attrs[field] = False
+            attrs["hyperparameters"] = hp
+
+        if any(
+            attrs.get(field, getattr(self.instance, field, False))
+            for field in (
+                "eval_model_before",
+                "eval_model_after",
+                "eval_incumbent_before",
+                "eval_incumbent_after",
+            )
+        ):
+            missing = {
+                field: "Select this input when training evaluations are enabled."
+                for field in ("eval_dataset", "eval_set")
+                if not attrs.get(field, getattr(self.instance, field, None))
+            }
+            if missing:
+                raise serializers.ValidationError(missing)
+
         base_model = attrs.get("base_model") or getattr(self.instance, "base_model", None)
         entry = None
         training_kind_field = "lora"
         if base_model:
+            from overbae.modal.decision_catalog import get as decision_catalog_model
             from overbae.modal.training_type import training_enabled
             from overbae.services.recommendation import find_catalog_model
 
-            entry = find_catalog_model(base_model)
+            decision_model = decision_catalog_model(base_model)
+            if decision_model and not decision_model["training_available"]:
+                raise serializers.ValidationError(
+                    {
+                        "base_model": "This decision family does not yet have exact preparation and verified deployment."
+                    }
+                )
+
+            entry = find_catalog_model(
+                base_model,
+                decision=bool(
+                    selected_cell and dataset_objective(selected_cell) in DECISION_OBJECTIVES
+                ),
+            )
             if entry is None:
                 raise serializers.ValidationError(
                     {
@@ -1434,6 +1669,68 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
                     {"validation_dataset": "Validation dataset must differ from training dataset."}
                 )
 
+        hp = attrs.get("hyperparameters", getattr(self.instance, "hyperparameters", {})) or {}
+        try:
+            profile_options(hp)
+            if (
+                hp.get("runtime_limit_seconds") is not None
+                and settings.FINETUNING_BACKEND != "modal"
+            ):
+                raise ValueError("runtime_limit_seconds requires Modal provider enforcement")
+            baseline = baseline_evaluation_enabled(hp)
+            if self.instance is None:
+                monitoring = resolve_monitoring_policy(
+                    hp,
+                    has_development=attrs.get("validation_enabled", True),
+                    provider=settings.FINETUNING_BACKEND,
+                )
+                hp = {**hp, "monitoring": monitoring}
+                attrs["hyperparameters"] = hp
+        except ValueError as exc:
+            raise serializers.ValidationError({"hyperparameters": str(exc)}) from exc
+        if hp.get("objective") in DECISION_OBJECTIVES:
+            hp = {**hp, "pre_training_baseline": baseline}
+            attrs["hyperparameters"] = hp
+        development = attrs.get("validation_cell")
+        if (
+            (hp.get("monitoring") or {}).get("mode", "off") != "off"
+            and development
+            and (
+                development.partition_memberships.filter(role__in=["calibration", "final"]).exists()
+                or development.native_final_plans.exists()
+                or development.native_calibration_plans.exists()
+            )
+        ):
+            raise serializers.ValidationError(
+                {
+                    "validation_cell": "Calibration and final data cannot be used for training monitoring"
+                }
+            )
+        if "checkpoint_policy" in hp:
+            if hp.get("objective") not in DECISION_OBJECTIVES:
+                raise serializers.ValidationError(
+                    {
+                        "hyperparameters": "Retained checkpoint selection currently requires native decision training"
+                    }
+                )
+            try:
+                validate_policy(
+                    hp["checkpoint_policy"], has_development=attrs.get("validation_enabled", True)
+                )
+            except ValueError as exc:
+                raise serializers.ValidationError({"hyperparameters": str(exc)}) from exc
+            development = attrs.get("validation_cell")
+            if development and (
+                development.partition_memberships.filter(role__in=["calibration", "final"]).exists()
+                or development.native_final_plans.exists()
+                or development.native_calibration_plans.exists()
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "validation_cell": "Calibration and final data cannot select training checkpoints"
+                    }
+                )
+
         eval_dataset = attrs.get("eval_dataset") or getattr(self.instance, "eval_dataset", None)
         if eval_dataset:
             if project and eval_dataset.project_id != project.id:
@@ -1462,15 +1759,8 @@ class FinetuningJobSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"eval_set": "Eval set does not belong to this project."}
             )
-        if (
-            eval_set
-            and not eval_set.members.filter(
-                role=EvalSetMember.Role.GENERATIVE, enabled=True, evaluator_id__isnull=False
-            ).exists()
-        ):
-            raise serializers.ValidationError(
-                {"eval_set": "This eval set has no generative evaluators."}
-            )
+        if eval_set and not eval_set.rows.filter(enabled=True).exists():
+            raise serializers.ValidationError({"eval_set": "This eval set has no enabled rows."})
 
         # Baseten/Modal: rows over the *selected training kind's* max fine-tuning
         # context are rejected outright — MAX_LENGTH truncation would corrupt
@@ -1541,7 +1831,7 @@ class FinetuningCostEstimateSerializer(serializers.Serializer):
 
 
 class FinetuningTimeEstimateSerializer(serializers.Serializer):
-    seconds = serializers.IntegerField()
+    seconds = serializers.IntegerField(allow_null=True)
     human = serializers.CharField()
 
 
@@ -1647,13 +1937,13 @@ class FinetuningBenchmarkSnapshotSerializer(serializers.Serializer):
     """Which artifact the grades came from. Each evidence row carries its own benchmark
     reference, so the snapshot only dates them."""
 
-    generated_at = serializers.CharField()
+    generated_at = serializers.CharField(allow_null=True)
 
 
 class FinetuningRecommendationResponseSerializer(serializers.Serializer):
     task_type = serializers.CharField()
     task_type_source = serializers.ChoiceField(
-        choices=["capability", "semantic", "heuristic", "unknown"]
+        choices=["capability", "semantic", "heuristic", "declared_contract", "unknown"]
     )
     capability_context = serializers.DictField(allow_null=True)
     skill_weights = serializers.DictField(child=serializers.FloatField())
@@ -1667,6 +1957,12 @@ class FinetuningRecommendationResponseSerializer(serializers.Serializer):
 
 
 class FinetuningEstimateRequestSerializer(serializers.Serializer):
+    cell = serializers.UUIDField(required=False)
+    validation_cell = serializers.UUIDField(required=False)
+    validation_enabled = serializers.BooleanField(default=True)
+    validation_split_ratio = serializers.FloatField(default=0.2, min_value=0.05, max_value=0.5)
+    split_method = serializers.ChoiceField(choices=["random", "ordered"], default="random")
+    hyperparameters = serializers.JSONField(default=dict)
     dataset_id = serializers.UUIDField()
     base_model = serializers.CharField()
     n_epochs = serializers.IntegerField(min_value=1)
@@ -1679,6 +1975,7 @@ class FinetuningModelDefaultsRequestSerializer(serializers.Serializer):
 
 
 class FinetuningEstimateResponseSerializer(serializers.Serializer):
+    forecast = serializers.JSONField(required=False, allow_null=True)
     cost_estimate = FinetuningCostEstimateSerializer(allow_null=True)
     time_estimate = FinetuningTimeEstimateSerializer()
     trained_tokens = serializers.IntegerField()
@@ -1696,6 +1993,10 @@ class FinetuningModelCatalogEntrySerializer(serializers.Serializer):
     """One model in the fine-tuning catalog (not the OpenRouter one below)."""
 
     id = serializers.CharField()
+    openrouter_id = serializers.CharField(allow_null=True)
+    openrouter_status = serializers.ChoiceField(
+        choices=["available", "not_listed", "catalog_unavailable"]
+    )
     display = serializers.CharField()
     params = serializers.CharField()
     total_params_b = serializers.FloatField()
@@ -1718,11 +2019,23 @@ class FinetuningModelCatalogResponseSerializer(serializers.Serializer):
     models = serializers.DictField(child=FinetuningModelCatalogEntrySerializer(many=True))
     has_tool_calling = serializers.BooleanField()
     max_context = serializers.IntegerField(allow_null=True)
+    monitoring = serializers.JSONField()
+
+
+class DatasetValidateRequestSerializer(serializers.Serializer):
+    dataset_id = serializers.UUIDField()
+    cell_id = serializers.UUIDField(required=False)
+    validation_cell_id = serializers.UUIDField(required=False)
+    validation_dataset_id = serializers.UUIDField(required=False, allow_null=True)
+    validation_enabled = serializers.BooleanField(default=True)
+    validation_split_ratio = serializers.FloatField(default=0.2, min_value=0.05, max_value=0.5)
+    split_method = serializers.ChoiceField(choices=["random", "ordered"], default="random")
 
 
 class DatasetValidationStatsSerializer(serializers.Serializer):
     """``ValidationResult.stats`` — sparse; keys depend on validation path."""
 
+    checkpoint = serializers.UUIDField(required=False)
     total_examples = serializers.IntegerField(required=False)
     trainable_examples = serializers.IntegerField(required=False)
     train_examples = serializers.IntegerField(required=False)
@@ -2116,7 +2429,7 @@ class ConnectorSyncRunSerializer(serializers.ModelSerializer):
 
 
 class CatalogModelSerializer(serializers.Serializer):
-    """``id`` is the OpenRouter slug and exactly what ``EvalVariant.model_name``
+    """``id`` is the OpenRouter slug and exactly what ``EvalRun.model_name``
     carries — ``call_llm`` routes slash-style slugs through OpenRouter verbatim."""
 
     id = serializers.CharField()
@@ -2258,7 +2571,13 @@ class BillingTelemetrySerializer(serializers.ModelSerializer):
 
     project_id = serializers.UUIDField(allow_null=True, read_only=True)
     project_name = serializers.CharField(source="project.name", allow_null=True, read_only=True)
-    service_label = serializers.CharField(source="get_service_display", read_only=True)
+    # Append-only receipts can outlive the service that created them.
+    service = serializers.CharField(read_only=True)
+    service_label = serializers.SerializerMethodField()
+
+    def get_service_label(self, obj) -> str:
+        label = obj.get_service_display()
+        return obj.service.replace("-", " ").capitalize() if label == obj.service else label
 
     class Meta:
         model = BillingTelemetry
@@ -2305,6 +2624,7 @@ class DeployedModelSerializer(serializers.ModelSerializer):
             "project",
             "model_id",
             "deployment_progress",
+            "inference_contract",
             "status",
             "quantization",
             "base_model_id",

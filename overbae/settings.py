@@ -20,6 +20,9 @@ SECRET_KEY = os.environ.get(
 
 DEBUG = os.environ.get("DJANGO_DEBUG", "False") == "True"
 
+WORKSHOP_PROJECT_CONCURRENCY = int(os.environ.get("WORKSHOP_PROJECT_CONCURRENCY", "4"))
+DATASET_QUERY_TIMEOUT_SECONDS = 10
+
 # Deployments set their own path so the admin is not at a guessable URL.
 ADMIN_URL_PATH = os.environ.get("DJANGO_ADMIN_PATH", "admin").strip("/") + "/"
 
@@ -329,11 +332,9 @@ SPECTACULAR_SETTINGS = {
     "COMPONENT_SPLIT_REQUEST": True,
     "SCHEMA_PATH_PREFIX": r"/api/",
     "ENUM_NAME_OVERRIDES": {
-        "DecisionPolicyBackendEnum": [("jev", "jev"), ("generative", "generative")],
         "BackendEnum": [("together", "together"), ("baseten", "baseten"), ("modal", "modal")],
         "IntentEnum": "overbae.models.datasets.Dataset.Intent",
-        "ExecutionModeEnum": "overbae.models.datasets.Execution.Mode",
-        "ExecutionStateEnum": "overbae.models.datasets.Execution.State",
+        "CellStateEnum": "overbae.models.datasets.Cell.State",
         # Lane provenance shares the field name with finetuning evidence; pinned so
         # neither enum is hash-renamed in the generated client.
         "ProvenanceEnum": [("measured", "measured"), ("lab_claimed", "lab_claimed")],
@@ -344,21 +345,15 @@ SPECTACULAR_SETTINGS = {
         ],
         "CapabilityStatusEnum": "overbae.models.capabilities.Capability.Status",
         "SpanTypeEnum": "overbae.models.traces.Span.SpanType",
-        "BacktestRunStatusEnum": "overbae.models.traces.BacktestRun.RunStatus",
         "FinetuningJobStatusEnum": "overbae.models.finetuning.FinetuningJob.Status",
         "SignOnMethodEnum": "overbae.models.iam.SignOnMethod",
-        "ModelRefProviderEnum": "overbae.models.evaluation.ModelRef.Provider",
-        "EvaluatorKindEnum": "overbae.models.evaluation.Evaluator.Kind",
-        "EvaluatorScopeEnum": "overbae.models.evaluation.Evaluator.Scope",
+        "ModelRefProviderEnum": "overbae.models.innermind.ModelRef.Provider",
         # EvalRun.Status is absent on purpose: its members match another status
         # enum and it reuses that component.
-        "EvalRunDataSourceEnum": "overbae.models.evaluation.EvalRun.DataSource",
-        "EvalVariantModeEnum": "overbae.models.evaluation.EvalVariant.Mode",
-        # Evaluator.ScoreType shares members with Score.DataType, so this one
-        # override name covers both.
-        "ScoreDataTypeEnum": "overbae.models.evaluation.Score.DataType",
-        "ScoreFailureRoleEnum": "overbae.models.evaluation.Score.FailureRole",
-        "ScoreSourceEnum": "overbae.models.evaluation.Score.Source",
+        "EvalRunModeEnum": "overbae.models.innermind.EvalRun.Mode",
+        "EvalMatrixTypeEnum": "overbae.models.innermind.EvalMatrix.Type",
+        "EvalRunRowStateEnum": "overbae.models.innermind.EvalRunRow.State",
+        "EvalScoreSourceTypeEnum": "overbae.models.innermind.EvalScore.SourceType",
         "DatasetSourceKindEnum": "overbae.models.datasets.Dataset.SourceKind",
     },
     "APPEND_COMPONENTS": {
@@ -414,40 +409,53 @@ QUEUE_METRICS_CLUSTER = os.environ.get("QUEUE_METRICS_CLUSTER", "")
 EVAL_MAX_IN_FLIGHT = int(os.environ.get("EVAL_MAX_IN_FLIGHT", "12"))
 EVAL_MAX_IN_FLIGHT_PER_RUN = int(os.environ.get("EVAL_MAX_IN_FLIGHT_PER_RUN", "2"))
 DATASET_IMPORT_MAX_QUEUE_SECONDS = int(os.environ.get("DATASET_IMPORT_MAX_QUEUE_SECONDS", "3600"))
-SANDBOX_URL = os.environ.get("SANDBOX_URL", "").rstrip("/")
-SANDBOX_TOKEN = os.environ.get("SANDBOX_TOKEN", "")
-WORKSHOP_PROJECT_CONCURRENCY = int(os.environ.get("WORKSHOP_PROJECT_CONCURRENCY", "4"))
-
 CELERY_TASK_ROUTES = {
+    "overbae.tasks.datasets.check_pipeline_runtime": {"queue": "interactive"},
+    "overbae.tasks.datasets.refresh_pipeline_bindings": {"queue": "batch"},
+    "overbae.tasks.training_experiments.prepare_experiment": {"queue": "batch"},
+    "overbae.tasks.data_exploration.run": {"queue": "batch"},
+    "overbae.tasks.data_partitions.build_plan": {"queue": "batch"},
+    "overbae.tasks.decision_performance.measure": {"queue": "batch"},
+    "overbae.tasks.native_evaluation.advance_plan": {"queue": "batch"},
+    "overbae.tasks.native_evaluation.refresh_monitor": {"queue": "batch"},
     "overbae.tasks.training_preparation.inspect_preparation": {"queue": "io"},
-    "overbae.tasks.decision_jobs.start": {"queue": "batch"},
-    "overbae.tasks.decision_jobs.advance": {"queue": "io"},
-    "overbae.tasks.datasets.execute": {"queue": "interactive"},
-    "overbae.tasks.datasets.measure_analytics": {"queue": "batch"},
-    "overbae.tasks.eval.prepare_sample": {"queue": "batch"},
-    # Model warm-up and judge authoring block for minutes; control stays free for
-    # reconcilers and metrics.
-    "overbae.tasks.eval.run_eval_run": {"queue": "io"},
-    "overbae.tasks.eval.preload_capability_eval_set": {"queue": "io"},
+    "overbae.tasks.innermind.generate_row": {"queue": "batch"},
+    "overbae.tasks.innermind.score_eval_run": {"queue": "batch"},
+    # Model warm-up blocks for minutes; control stays free for reconcilers and metrics.
+    "overbae.tasks.innermind.run_eval_run": {"queue": "io"},
     "overbae.tasks.datasets.land": {"queue": "landing"},
+    "overbae.tasks.datasets.execute_pipeline": {"queue": "interactive"},
     "overbae.tasks.connector_sync.sync_connector_chunk": {"queue": "batch"},
-    "overbae.tasks.eval.execute_evaluator": {"queue": "io"},
     "overbae.tasks.model_deployment.advance_model_deployment": {"queue": "io"},
+    "overbae.tasks.inference_requests.inspect_inference_request": {"queue": "io"},
+    "overbae.tasks.inference_requests.collect_operation_progress": {"queue": "io"},
     "overbae.tasks.connector_sync.poll_connectors": {"queue": "io"},
     "overbae.tasks.connector_sync.sweep_abandoned_drafts": {"queue": "io"},
     "overbae.tasks.capability_rebind.rebind_unbound_spans": {"queue": "io"},
-    "overbae.tasks.behaviour.rebind_parked_executions": {"queue": "io"},
-    "overbae.tasks.trace_scoring.score_trace": {"queue": "io_traces"},
+    "overbae.tasks.innermind.score_spans": {"queue": "io_traces"},
+    "overbae.tasks.innermind.sweep_unscored_spans": {"queue": "io_traces"},
+    "overbae.tasks.innermind.score_trajectories": {"queue": "io_traces"},
+    "overbae.tasks.innermind.run_signals": {"queue": "io_traces"},
 }
 
 CELERY_BEAT_SCHEDULE = {
+    "workshop-bindings": {
+        "task": "overbae.tasks.datasets.refresh_pipeline_bindings",
+        "schedule": 30.0,
+        "options": {"expires": 25.0},
+    },
+    "workshop-runtime-health": {
+        "task": "overbae.tasks.datasets.check_pipeline_runtime",
+        "schedule": 15.0,
+        "options": {"expires": 14.0},
+    },
     "reconcile-dataset-imports": {
         "task": "overbae.tasks.datasets.reconcile_imports",
         "schedule": 30.0,
         "options": {"expires": 25.0},
     },
     "dispatch-evaluation-generation": {
-        "task": "overbae.tasks.eval.dispatch_generation",
+        "task": "overbae.tasks.innermind.dispatch_generation",
         "schedule": 30.0,
         "options": {"expires": 25.0},
     },
@@ -456,14 +464,33 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60.0,
         "options": {"expires": 55.0},
     },
+    "inference-request-reconcile": {
+        "task": "overbae.tasks.inference_requests.reconcile_inference_requests",
+        "schedule": 15.0,
+    },
+    "training-experiment-preparation": {
+        "task": "overbae.tasks.training_experiments.reconcile",
+        "schedule": 30.0,
+    },
+    "data-exploration-reconcile": {
+        "task": "overbae.tasks.data_exploration.reconcile",
+        "schedule": 30.0,
+    },
+    "data-partition-reconciliation": {
+        "task": "overbae.tasks.data_partitions.reconcile",
+        "schedule": 60.0,
+    },
+    "decision-performance-reconcile": {
+        "task": "overbae.tasks.decision_performance.reconcile",
+        "schedule": 60.0,
+    },
+    "native-evaluation-reconciliation": {
+        "task": "overbae.tasks.native_evaluation.reconcile",
+        "schedule": 30.0,
+    },
     "training-preparation": {
         "task": "overbae.tasks.training_preparation.reconcile",
         "schedule": 15.0,
-    },
-    "decision-jobs": {
-        "task": "overbae.tasks.decision_jobs.reconcile",
-        "schedule": 15.0,
-        "options": {"expires": 14.0},
     },
     # Observe remote training independently of its submitting worker.
     "reconcile-finetuning-jobs": {
@@ -475,16 +502,16 @@ CELERY_BEAT_SCHEDULE = {
         "task": "overbae.tasks.baseten_billing_sync.sync_baseten_finetuning_costs",
         "schedule": 3600.0,
     },
-    # Reaps runs stuck in RUNNING with no DB progress, i.e. a lost chord barrier.
+    # Fails runs stuck in RUNNING with no row progress and no healthy generation wait.
     "reap-stalled-eval-runs": {
-        "task": "overbae.tasks.eval_watchdog.reap_stalled_eval_runs",
-        "schedule": 600.0,
-    },
-    # Fails script runs a dead worker left behind and deletes runs after 30 days.
-    "sweep-workshop-executions": {
-        "task": "overbae.tasks.datasets.sweep_executions",
+        "task": "overbae.tasks.innermind.reap_stalled_runs",
         "schedule": 300.0,
-        "options": {"expires": 290.0},
+    },
+    # Reaps notebook runs orphaned by a killed worker.
+    "reap-stuck-dataset-runs": {
+        "task": "overbae.tasks.datasets.reap_stuck_runs",
+        "schedule": 60.0,
+        "options": {"expires": 55.0},
     },
     "cleanup-dataset-uploads": {
         "task": "overbae.tasks.cleanup_tmp.cleanup_uploads",
@@ -510,10 +537,21 @@ CELERY_BEAT_SCHEDULE = {
         "task": "overbae.tasks.inference_controller.reconcile_deployments",
         "schedule": 15.0,
     },
-    # Backstop for stragglers whose live scoring enqueue was lost.
-    "sweep-unscored-traces": {
-        "task": "overbae.tasks.trace_scoring.sweep_unscored_traces",
+    # Re-drives spans still waiting for an ancestor, stale claims and lost enqueues.
+    "sweep-unscored-spans": {
+        "task": "overbae.tasks.innermind.sweep_unscored_spans",
         "schedule": 120.0,
+        "options": {"expires": 110.0},
+    },
+    "score-trajectories": {
+        "task": "overbae.tasks.innermind.score_trajectories",
+        "schedule": 300.0,
+        "options": {"expires": 290.0},
+    },
+    "run-signals": {
+        "task": "overbae.tasks.innermind.run_signals",
+        "schedule": 300.0,
+        "options": {"expires": 290.0},
     },
     # This cadence is only the outer tick: per-credential pacing and backoff are
     # gated by ConnectorCredential.next_poll_at. Kept at 60s so the fastest
@@ -529,6 +567,8 @@ CELERY_BEAT_SCHEDULE = {
 }
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # Feedback-channel incoming webhook; blank disables the notification.
@@ -660,7 +700,6 @@ AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 FINETUNING_BACKEND = os.environ.get("FINETUNING_BACKEND", "modal")
 
 # Must be `modal deploy`-ed before FINETUNING_BACKEND=modal can submit jobs.
-MODAL_SFT_APP_NAME = os.environ.get("MODAL_SFT_APP_NAME", "overmind-sft")
 
 if FINETUNING_BACKEND != "modal":
     raise ImproperlyConfigured("FINETUNING_BACKEND must be modal")
@@ -670,10 +709,13 @@ INFERENCE_API_URL: str = os.environ.get("INFERENCE_API_URL", "")
 # Must match INFERENCE_API_KEY in the Modal overmind-inference secret.
 INFERENCE_API_KEY: str = os.environ.get("INFERENCE_API_KEY", "")
 
+SANDBOX_URL = os.environ.get("SANDBOX_URL", "").rstrip("/")
+SANDBOX_TOKEN = os.environ.get("SANDBOX_TOKEN", "")
+
 _REQUIRED_KEYS = {
-    "OPENROUTER_API_KEY": "judges, evals and trace scoring",
-    "SANDBOX_URL": "the Data Workshop script sandbox",
-    "SANDBOX_TOKEN": "the Data Workshop script sandbox",
+    "SANDBOX_URL": "the isolated Workshop sandbox",
+    "SANDBOX_TOKEN": "the isolated Workshop sandbox",
+    "OPENROUTER_API_KEY": "judges, evals, trace scoring and the Data Workshop",
     "MODAL_TOKEN_ID": "Modal training and serving workers",
     "MODAL_TOKEN_SECRET": "Modal training and serving workers",
     "INFERENCE_API_URL": "the Modal serving endpoint",

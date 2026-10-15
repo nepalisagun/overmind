@@ -4,24 +4,23 @@ from unittest.mock import Mock
 
 import pytest
 from conftest import TRAIN_ROWS, frozen_dataset
-from factories import prepare_training
+from factories import make_matrix_row, prepare_training
 
 from modal_shared.context_budget import DEFAULT_OUTPUT_TOKENS
 from modal_shared.preparation import preparation_failure
 from overbae.api.serializers import FinetuningJobSerializer
+from overbae.innermind import runs
 from overbae.models import (
     Capability,
     DeployedModel,
     EvalSet,
-    EvalSetMember,
-    Evaluator,
     FinetuningJob,
     FinetuningJobEval,
     Project,
     ProjectMembership,
     User,
 )
-from overbae.services import deployment, finetuning_eval, training_preparation
+from overbae.services import deployment, finetuning_eval, training_preparation, training_release
 from overbae.services.finetuning_eval import (
     baseline_needs_base_deploy,
     reset_before_evals_for_retry,
@@ -29,7 +28,6 @@ from overbae.services.finetuning_eval import (
     sync_eval_scores,
     tick_job_evals,
 )
-from overbae.tasks import eval as eval_tasks
 from overbae.tasks.finetuning import run_finetuning
 from overbae.tasks.inference_controller import reconcile_deployments
 
@@ -57,17 +55,9 @@ def job(monkeypatch, sft):
         capability=capability,
     )
     eval_set = EvalSet.objects.create(project=project, name="Quality")
-    evaluator = Evaluator.objects.create(
-        project=project,
-        name="Match",
-        kind=Evaluator.Kind.DETERMINISTIC,
-        config={"check": "exact_match"},
-    )
-    EvalSetMember.objects.create(
-        eval_set=eval_set, evaluator=evaluator, role=EvalSetMember.Role.GENERATIVE
-    )
+    eval_set.rows.add(make_matrix_row(eval_set.project))
     monkeypatch.setattr(
-        "overbae.tasks.eval.run_eval_run.apply_async",
+        "overbae.tasks.innermind.run_eval_run.delay",
         Mock(return_value=SimpleNamespace(id="eval-task")),
     )
     return FinetuningJob.objects.create(
@@ -84,7 +74,8 @@ def job(monkeypatch, sft):
         baseline_model=capability.model,
         eval_incumbent_before=True,
         eval_model_before=False,
-        status=FinetuningJob.Status.QUEUED,
+        status=FinetuningJob.Status.PREPARING,
+        requested_configuration={"runtime": training_release.current()},
     )
 
 
@@ -171,9 +162,9 @@ def test_every_training_evaluation_uses_the_complete_dataset(job, hyperparameter
         assert run.max_items == 0
         assert run.sampling == 1.0
         assert run.cell_id == evaluation.active_cell.id
-        items = eval_tasks._resolve_items(run)
-        assert [item["row_index"] for item in items] == list(range(900))
-        assert [item["input"] for item in items] == [row["input"] for row in source]
+        items = runs.selected_rows(run)
+        assert [item.index for item in items] == list(range(900))
+        assert [item.input for item in items] == [row["input"] for row in source]
 
 
 @pytest.mark.parametrize("max_items,sampling", [(100, 1.0), (0, 0.5)])
@@ -233,7 +224,6 @@ def test_retry_preserves_eval_results_and_resets_failed_before_links(job):
 
 
 def test_evaluation_choices_are_immutable_after_setup_starts(job):
-    job.status = FinetuningJob.Status.PREPARING
     serializer = FinetuningJobSerializer(job, data={"eval_incumbent_before": False}, partial=True)
     assert not serializer.is_valid()
     assert "eval_incumbent_before" in serializer.errors
@@ -268,7 +258,7 @@ def test_an_unavailable_eval_queue_does_not_block_training(job, fake_modal, monk
     from kombu.exceptions import OperationalError
 
     monkeypatch.setattr(
-        "overbae.tasks.eval.run_eval_run.apply_async",
+        "overbae.tasks.innermind.run_eval_run.delay",
         Mock(side_effect=OperationalError("broker down")),
     )
     prepare_training(job, fake_modal)
@@ -293,10 +283,7 @@ def test_launched_modal_job_prepares_data_before_gpu_submission(
     assert submitted["status"] == job.status == "preparing"
     assert submitted["gpu"] == []
     assert inspect.call_count == (1 if state == "queued" else 0)
-    job.refresh_from_db()
-    resume.assert_called_once_with(
-        kwargs={"job_id": str(job.id)}, countdown=15, task_id=job.celery_task_id
-    )
+    resume.assert_called_once_with(kwargs={"job_id": str(job.id)}, countdown=15)
 
 
 def test_preprocessing_worker_failure_preserves_actionable_error_and_never_submits_gpu(
@@ -306,7 +293,11 @@ def test_preprocessing_worker_failure_preserves_actionable_error_and_never_submi
 
     failure = preparation_failure("worker_out_of_date")
     for name in TRAIN_FUNCTION_NAMES.values():
-        fake_modal.deploy("overmind-sft", f"prepare_{name}", lambda *_, **__: failure)
+        fake_modal.deploy(
+            job.requested_configuration["runtime"]["app"],
+            f"prepare_{name}",
+            lambda *_, **__: failure,
+        )
     preparation = training_preparation.for_job(job)
     training_preparation.advance(preparation.id)
     training_preparation.advance(preparation.id)
@@ -354,16 +345,15 @@ def test_unresolved_baseline_does_not_change_running_training(
     baseline.refresh_from_db()
     assert baseline.status == "failed"
     assert baseline.deployment_dispatching
-    assert baseline.deployment_notify
+    assert not baseline.deployment_notify
     assert baseline.deployment_attempts == 0
-    deployment.advance_deployment(baseline.pk)
 
     job.refresh_from_db()
     assert job.job_evals.get(kind="model_before").status == "failed"
     assert job.status == "running"
     assert not job.error_message
     assert [n for n in fake_modal.spawns() if not n.startswith(("sft_", "prepare_"))] == []
-    assert [call for call, _ in fake_modal.cancelled] == (["fc-old"] if cancel_pending else [])
+    assert fake_modal.cancelled == []
 
 
 def test_eval_score_sync_does_not_overwrite_newer_deployment_progress(job):
@@ -378,7 +368,7 @@ def test_eval_score_sync_does_not_overwrite_newer_deployment_progress(job):
     assert job.progress == {**saved, "judge_evals": []}
 
 
-def test_deployment_controller_recovers_baseline_while_training_runs(job, fake_llm):
+def test_deployment_controller_does_not_provision_an_unavailable_baseline(job, fake_llm):
     fake_llm.catalog_models = []
     job.status = FinetuningJob.Status.RUNNING
     job.eval_incumbent_before = False
@@ -388,8 +378,7 @@ def test_deployment_controller_recovers_baseline_while_training_runs(job, fake_l
 
     reconcile_deployments()
 
-    baseline = DeployedModel.objects.get(deployment_waiters=job)
-    assert baseline.model_id.startswith("base--")
+    assert not DeployedModel.objects.filter(deployment_waiters=job).exists()
 
 
 @pytest.mark.parametrize("incumbent", [False, True])
@@ -410,7 +399,7 @@ def test_starting_model_uses_openrouter_without_provisioning_inference(
     with django_capture_on_commit_callbacks(execute=True):
         start_before_evals(job)
     row = job.job_evals.get(kind="baseline" if incumbent else "model_before")
-    ref = row.eval_run.variants.get().model_ref
+    ref = row.eval_run.model_ref
     assert row.model_id == ref.model_id == "qwen/qwen3.5-9b"
     assert ref.base_url == "https://openrouter.ai/api/v1"
     assert ref.api_key_ref == "OPENROUTER_API_KEY"
@@ -429,7 +418,9 @@ def test_starting_model_uses_openrouter_without_provisioning_inference(
     deploy.assert_not_called()
 
 
-def test_missing_openrouter_model_still_prepares_local_base(job, monkeypatch, fake_llm):
+def test_missing_openrouter_model_records_unavailability_without_provisioning(
+    job, monkeypatch, fake_llm
+):
     from django.core.cache import cache
 
     fake_llm.catalog_models = []
@@ -439,15 +430,16 @@ def test_missing_openrouter_model_still_prepares_local_base(job, monkeypatch, fa
     deploy = Mock()
     monkeypatch.setattr("overbae.tasks.model_deployment.deploy_base_model_for_eval.delay", deploy)
     start_before_evals(job)
-    deploy.assert_called_once_with(job_id=str(job.pk))
-    baseline = deployment.ensure_baseline_deployment(str(job.pk))
-    assert baseline.deployment_stage == "base"
-    assert baseline.status == "queued"
-    assert not job.job_evals.exists()
+    deploy.assert_not_called()
+    assert deployment.ensure_baseline_deployment(str(job.pk)) is None
+    assert not DeployedModel.objects.exists()
+    row = job.job_evals.get(kind="model_before")
+    assert row.status == "failed"
+    assert "unavailable" in row.error_message
 
     fake_llm.catalog_models = None
     cache.clear()
-    assert baseline_needs_base_deploy(job)
+    assert not baseline_needs_base_deploy(job)
 
 
 def test_the_chosen_eval_route_survives_a_later_catalog_change(job, fake_llm):
@@ -464,7 +456,7 @@ def test_the_chosen_eval_route_survives_a_later_catalog_change(job, fake_llm):
     finetuning_eval.ensure_target_eval(job, kind="model_before")
 
     [row] = job.job_evals.filter(kind="model_before")
-    ref = row.eval_run.variants.get().model_ref
+    ref = row.eval_run.model_ref
     assert ref.model_id == "qwen/qwen3.5-9b"
     assert ref.api_key_ref == "OPENROUTER_API_KEY"
 
@@ -492,7 +484,7 @@ def test_openrouter_starting_model_does_not_change_trained_checkpoint_route(job)
     job.save()
     tick_job_evals(job)
     before = job.job_evals.get(kind="model_before")
-    assert before.eval_run.variants.get().model_ref.api_key_ref == "OPENROUTER_API_KEY"
+    assert before.eval_run.model_ref.api_key_ref == "OPENROUTER_API_KEY"
     job.status = "succeeded"
     job.output_model_name = "trained-checkpoint"
     job.save()
@@ -508,12 +500,9 @@ def test_openrouter_starting_model_does_not_change_trained_checkpoint_route(job)
     tick_job_evals(job)
     after = job.job_evals.get(kind="final")
     assert after.model_id == deployed.model_id
-    assert after.eval_run.variants.get().model_ref.api_key_ref == "INFERENCE_API_KEY"
+    assert after.eval_run.model_ref.api_key_ref == "INFERENCE_API_KEY"
     assert after.eval_run.cell_id == before.eval_run.cell_id
-    assert (
-        after.eval_run.run_evaluators.get().snapshot
-        == before.eval_run.run_evaluators.get().snapshot
-    )
+    assert after.eval_run.matrix == before.eval_run.matrix
 
 
 def test_base_before_can_supply_the_comparison_without_incumbent_eval(job):
@@ -533,16 +522,14 @@ def test_base_before_can_supply_the_comparison_without_incumbent_eval(job):
 def test_after_evals_reuse_the_pinned_data_and_graders(job):
     tick_job_evals(job)
     before = job.job_evals.get(kind="baseline").eval_run
-    evaluator = job.eval_set.members.get().evaluator
-    evaluator.config = {"check": "contains"}
-    evaluator.save(update_fields=["config"])
+    job.eval_set.rows.update(source="The output names a refund policy.")
     job.status = FinetuningJob.Status.SUCCEEDED
     job.output_model_name = "org/trained-model"
     job.eval_incumbent_after = True
     tick_job_evals(job)
     for row in job.job_evals.exclude(kind="baseline").select_related("eval_run"):
         assert row.eval_run.cell_id == before.cell_id
-        assert row.eval_run.run_evaluators.get().snapshot == before.run_evaluators.get().snapshot
+        assert row.eval_run.matrix == before.matrix
 
 
 def serializer_for(job, **choices):
@@ -573,29 +560,17 @@ def test_selected_judge_is_persisted_and_frozen_without_editing_the_set(job):
     serializer = serializer_for(job, eval_judge_model=selected)
     assert serializer.is_valid(), serializer.errors
     assert serializer.save().eval_judge_model == selected
-    evaluator = Evaluator.objects.create(
-        project=job.project,
-        name="Quality",
-        kind="llm_judge",
-        judge_model="gpt-4.1",
-        checklist=[{"id": "correct", "q": "Correct?"}],
-    )
-    EvalSetMember.objects.create(eval_set=job.eval_set, evaluator=evaluator, role="generative")
     job.eval_judge_model = selected
     job.save(update_fields=["eval_judge_model"])
     tick_job_evals(job)
     before = job.job_evals.get(kind="baseline").eval_run
-    assert before.run_evaluators.get(evaluator=evaluator).snapshot["judge_model"] == selected
-    evaluator.refresh_from_db()
-    assert evaluator.judge_model == "gpt-4.1"
+    assert before.judge_model == selected
     job.status = "succeeded"
     job.output_model_name = "org/trained-model"
     job.eval_incumbent_after = True
     tick_job_evals(job)
     for row in job.job_evals.exclude(kind="baseline").select_related("eval_run"):
-        assert (
-            row.eval_run.run_evaluators.get(evaluator=evaluator).snapshot["judge_model"] == selected
-        )
+        assert row.eval_run.judge_model == selected
 
 
 @pytest.mark.parametrize("same_judge", [True, False])
@@ -819,7 +794,7 @@ def test_before_after_reuses_prompt_snapshot_and_prefers_matched_base(job):
     tick_job_evals(job)
     assert finetuning_eval.comparison_eval(job).kind == "model_before"
     for row in job.job_evals.select_related("eval_run"):
-        assert row.eval_run.variants.get().params["system_prompt"] == "Pinned instruction"
+        assert row.eval_run.params["system_prompt"] == "Pinned instruction"
 
 
 def test_cannot_request_an_incumbent_eval_without_an_incumbent(job):
@@ -840,8 +815,7 @@ def test_all_evaluations_can_be_disabled(job):
 
 
 @pytest.mark.parametrize("field", ["eval_dataset", "eval_set"])
-def test_evaluation_inputs_remain_required_with_all_checks_off(job, field):
+def test_disabled_evaluations_do_not_require_evaluation_inputs(job, field):
     serializer = serializer_for(job, **dict.fromkeys(FIELDS, False))
     serializer.initial_data.pop(field)
-    assert not serializer.is_valid()
-    assert field in serializer.errors
+    assert serializer.is_valid(), serializer.errors

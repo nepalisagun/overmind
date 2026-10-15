@@ -9,6 +9,7 @@ import {
   YAxis,
 } from "recharts";
 
+import { GraphTooltip } from "@/components/ui/graph-tooltip";
 import { seriesColor } from "@/lib/colors";
 import type { FinetuningProgress } from "@/lib/finetuning-progress";
 
@@ -19,96 +20,12 @@ const TRAIN_ACC_COLOR = seriesColor(2);
 const EVAL_ACC_COLOR = seriesColor(3);
 const LR_COLOR = seriesColor(4);
 
-function MiniTooltip({
-  active,
-  payload,
-  label,
-  xLabel = "step",
-  formatValue = (v: number) => v.toFixed(4),
-}: {
-  active?: boolean;
-  payload?: Array<{ name: string; value: number | null; color: string }>;
-  label?: number | string;
-  xLabel?: string;
-  formatValue?: (v: number) => string;
-}) {
-  if (!active || !payload?.length) return null;
-  const entries = payload.filter((e) => e.value != null);
-  if (!entries.length) return null;
-  return (
-    <div className="rounded-md border border-border bg-popover px-3 py-2 text-xs">
-      <p className="mb-1 font-medium text-muted-foreground">
-        {xLabel} {label}
-      </p>
-      {entries.map((entry) => (
-        <div className="flex items-center gap-2" key={entry.name}>
-          <span className="inline-block size-2 rounded-xs" style={{ background: entry.color }} />
-          <span className="text-muted-foreground">{entry.name}</span>
-          <span className="ml-auto font-mono tabular-nums">
-            {formatValue(entry.value as number)}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function MiniChart({
-  title,
-  subtitle,
-  children,
-  height = 110,
-}: {
-  title: string;
-  subtitle?: string;
-  children: React.ReactNode;
-  height?: number;
-}) {
-  return (
-    <div className="space-y-1">
-      <div className="flex items-baseline gap-2">
-        <p className="text-xs font-semibold text-muted-foreground">{title}</p>
-        {subtitle && <p className="text-xs text-muted-foreground/60">{subtitle}</p>}
-      </div>
-      <ResponsiveContainer height={height} width="100%">
-        {children as React.ReactElement}
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-const SHARED_LINE_PROPS = {
-  connectNulls: true as const,
-  dot: false as const,
-  isAnimationActive: false as const,
-  strokeWidth: 1.5,
-  type: "monotone" as const,
-};
-
-function SharedAxes({ xLabel = "step" }: { xLabel?: string }) {
-  return (
-    <>
-      <CartesianGrid className="stroke-border/40" strokeDasharray="3 3" />
-      <XAxis
-        dataKey="x"
-        label={
-          xLabel !== "step"
-            ? { fontSize: 9, offset: -2, position: "insideBottomRight", value: xLabel }
-            : undefined
-        }
-        tick={{ fontSize: 9 }}
-        tickLine={false}
-      />
-      <YAxis domain={["auto", "auto"]} tick={{ fontSize: 9 }} tickLine={false} width={38} />
-    </>
-  );
-}
-
 interface LiveMetricsChartProps {
+  modelName: string;
   progress: FinetuningProgress;
 }
 
-export function LiveMetricsChart({ progress }: LiveMetricsChartProps) {
+export function LiveMetricsChart({ progress, modelName }: LiveMetricsChartProps) {
   const trainHistory = progress.metrics_history ?? [];
   const evalHistory = progress.eval_history ?? [];
 
@@ -173,167 +90,157 @@ export function LiveMetricsChart({ progress }: LiveMetricsChartProps) {
 
   const evalSteps = evalHistory.map((e) => e.step).filter(Boolean);
 
-  const hasStepEvalLoss = stepEvalLoss.length > 0;
-  const hasStepEvalAcc = stepEvalAcc.length > 0;
-  const hasStepAcc = stepTrainAcc.length > 0;
-  const hasLr = stepLr.length > 0;
+  const loss = (value: number) => value.toFixed(4);
+  const accuracy = (value: number) => `${value.toFixed(1)}%`;
+  const charts = [
+    {
+      color: TRAIN_COLOR,
+      data: stepTrainLoss,
+      format: loss,
+      name: "train loss",
+      referenceSteps: evalSteps,
+      subtitle: "per step",
+      title: "Train loss",
+    },
+    {
+      color: EVAL_COLOR,
+      data: stepEvalLoss,
+      dots: true,
+      format: loss,
+      name: "val loss",
+      subtitle: "per eval checkpoint",
+      title: "Val loss",
+    },
+    {
+      color: TRAIN_ACC_COLOR,
+      data: stepTrainAcc,
+      format: accuracy,
+      name: "train acc",
+      referenceSteps: evalSteps,
+      subtitle: "per step",
+      title: "Train accuracy",
+    },
+    {
+      color: EVAL_ACC_COLOR,
+      data: stepEvalAcc,
+      dots: true,
+      format: accuracy,
+      name: "val acc",
+      subtitle: "per eval checkpoint",
+      title: "Val accuracy",
+    },
+    {
+      color: LR_COLOR,
+      data: stepLr,
+      format: (value: number) => value.toExponential(3),
+      height: 90,
+      name: "lr",
+      subtitle: "per step",
+      title: "Learning rate",
+    },
+    {
+      color: TRAIN_COLOR,
+      data: epochTrainLoss,
+      dots: true,
+      epoch: true,
+      format: loss,
+      name: "train loss",
+      subtitle: "epoch avg",
+      title: "Train loss (epoch)",
+    },
+    {
+      color: EVAL_COLOR,
+      data: epochEvalLoss,
+      dots: true,
+      epoch: true,
+      format: loss,
+      name: "val loss",
+      subtitle: "per epoch",
+      title: "Val loss (epoch)",
+    },
+    {
+      color: TRAIN_ACC_COLOR,
+      data: epochTrainAcc,
+      dots: true,
+      epoch: true,
+      format: accuracy,
+      name: "train acc",
+      subtitle: "epoch avg",
+      title: "Train accuracy (epoch)",
+    },
+    {
+      color: EVAL_ACC_COLOR,
+      data: epochEvalAcc,
+      dots: true,
+      epoch: true,
+      format: accuracy,
+      name: "val acc",
+      subtitle: "per epoch",
+      title: "Val accuracy (epoch)",
+    },
+  ];
 
   return (
     <div className="space-y-5">
-      {stepTrainLoss.length > 0 && (
-        <MiniChart subtitle="per step" title="Train loss">
-          <LineChart data={stepTrainLoss} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes />
-            {evalSteps.map((s) => (
-              <ReferenceLine
-                key={s}
-                stroke="color-mix(in srgb, var(--muted-foreground) 20%, transparent)"
-                x={s}
-              />
-            ))}
-            <Tooltip content={<MiniTooltip formatValue={(v) => v.toFixed(4)} xLabel="step" />} />
-            <Line {...SHARED_LINE_PROPS} dataKey="value" name="train loss" stroke={TRAIN_COLOR} />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {hasStepEvalLoss && (
-        <MiniChart subtitle="per eval checkpoint" title="Val loss">
-          <LineChart data={stepEvalLoss} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes />
-            <Tooltip content={<MiniTooltip formatValue={(v) => v.toFixed(4)} xLabel="step" />} />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              dot={{ fill: EVAL_COLOR, r: 4, strokeWidth: 0 }}
-              name="val loss"
-              stroke={EVAL_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {hasStepAcc && (
-        <MiniChart subtitle="per step" title="Train accuracy">
-          <LineChart data={stepTrainAcc} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes />
-            {evalSteps.map((s) => (
-              <ReferenceLine
-                key={s}
-                stroke="color-mix(in srgb, var(--muted-foreground) 20%, transparent)"
-                x={s}
-              />
-            ))}
-            <Tooltip
-              content={<MiniTooltip formatValue={(v) => `${v.toFixed(1)}%`} xLabel="step" />}
-            />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              name="train acc"
-              stroke={TRAIN_ACC_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {hasStepEvalAcc && (
-        <MiniChart subtitle="per eval checkpoint" title="Val accuracy">
-          <LineChart data={stepEvalAcc} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes />
-            <Tooltip
-              content={<MiniTooltip formatValue={(v) => `${v.toFixed(1)}%`} xLabel="step" />}
-            />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              dot={{ fill: EVAL_ACC_COLOR, r: 4, strokeWidth: 0 }}
-              name="val acc"
-              stroke={EVAL_ACC_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {hasLr && (
-        <MiniChart height={90} subtitle="per step" title="Learning rate">
-          <LineChart data={stepLr} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes />
-            <Tooltip
-              content={<MiniTooltip formatValue={(v) => v.toExponential(3)} xLabel="step" />}
-            />
-            <Line {...SHARED_LINE_PROPS} dataKey="value" name="lr" stroke={LR_COLOR} />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {epochTrainLoss.length > 0 && (
-        <MiniChart subtitle="epoch avg" title="Train loss (epoch)">
-          <LineChart data={epochTrainLoss} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes xLabel="epoch" />
-            <Tooltip content={<MiniTooltip formatValue={(v) => v.toFixed(4)} xLabel="epoch" />} />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              dot={{ fill: TRAIN_COLOR, r: 4, strokeWidth: 0 }}
-              name="train loss"
-              stroke={TRAIN_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {epochEvalLoss.length > 0 && (
-        <MiniChart subtitle="per epoch" title="Val loss (epoch)">
-          <LineChart data={epochEvalLoss} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes xLabel="epoch" />
-            <Tooltip content={<MiniTooltip formatValue={(v) => v.toFixed(4)} xLabel="epoch" />} />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              dot={{ fill: EVAL_COLOR, r: 4, strokeWidth: 0 }}
-              name="val loss"
-              stroke={EVAL_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {epochTrainAcc.length > 0 && (
-        <MiniChart subtitle="epoch avg" title="Train accuracy (epoch)">
-          <LineChart data={epochTrainAcc} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes xLabel="epoch" />
-            <Tooltip
-              content={<MiniTooltip formatValue={(v) => `${v.toFixed(1)}%`} xLabel="epoch" />}
-            />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              dot={{ fill: TRAIN_ACC_COLOR, r: 4, strokeWidth: 0 }}
-              name="train acc"
-              stroke={TRAIN_ACC_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
-
-      {epochEvalAcc.length > 0 && (
-        <MiniChart subtitle="per epoch" title="Val accuracy (epoch)">
-          <LineChart data={epochEvalAcc} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
-            <SharedAxes xLabel="epoch" />
-            <Tooltip
-              content={<MiniTooltip formatValue={(v) => `${v.toFixed(1)}%`} xLabel="epoch" />}
-            />
-            <Line
-              {...SHARED_LINE_PROPS}
-              dataKey="value"
-              dot={{ fill: EVAL_ACC_COLOR, r: 4, strokeWidth: 0 }}
-              name="val acc"
-              stroke={EVAL_ACC_COLOR}
-            />
-          </LineChart>
-        </MiniChart>
-      )}
+      {charts
+        .filter((chart) => chart.data.length > 0)
+        .map((chart) => (
+          <div className="space-y-1" key={chart.title}>
+            <div className="flex items-baseline gap-2">
+              <p className="text-xs font-semibold text-muted-foreground">{chart.title}</p>
+              <p className="text-xs text-muted-foreground/60">{chart.subtitle}</p>
+            </div>
+            <ResponsiveContainer height={chart.height ?? 110} width="100%">
+              <LineChart data={chart.data} margin={{ bottom: 0, left: 0, right: 8, top: 4 }}>
+                <CartesianGrid className="stroke-border/40" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="x"
+                  label={
+                    chart.epoch
+                      ? { fontSize: 9, offset: -2, position: "insideBottomRight", value: "epoch" }
+                      : undefined
+                  }
+                  tick={{ fontSize: 9 }}
+                  tickLine={false}
+                />
+                <YAxis
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 9 }}
+                  tickLine={false}
+                  width={38}
+                />
+                {chart.referenceSteps?.map((step) => (
+                  <ReferenceLine
+                    key={step}
+                    stroke="color-mix(in srgb, var(--muted-foreground) 20%, transparent)"
+                    x={step}
+                  />
+                ))}
+                <Tooltip
+                  content={({ active, payload, label }) => (
+                    <GraphTooltip
+                      active={active}
+                      label={`${chart.epoch ? "epoch" : "step"} ${label}`}
+                      nameFormatter={() => modelName}
+                      payload={payload}
+                      valueFormatter={chart.format}
+                    />
+                  )}
+                />
+                <Line
+                  connectNulls
+                  dataKey="value"
+                  dot={chart.dots ? { fill: chart.color, r: 4, strokeWidth: 0 } : false}
+                  isAnimationActive={false}
+                  name={chart.name}
+                  stroke={chart.color}
+                  strokeWidth={1.5}
+                  type="monotone"
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        ))}
     </div>
   );
 }

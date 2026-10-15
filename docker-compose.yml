@@ -5,6 +5,8 @@ x-env-common: &env-common
   DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-change-me-in-production}
   DJANGO_DEBUG: "True"
   DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,api}
+  SANDBOX_URL: http://sandbox:8080
+  SANDBOX_TOKEN: ${SANDBOX_TOKEN:-change-me-in-production}
   DATABASE_URL: postgresql://overbae:overbae@postgres:5432/overbae
   CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/0
@@ -13,9 +15,9 @@ x-env-common: &env-common
   TMPDIR: /data/tmp
   HOME: /data/tmp
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
   OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-  SANDBOX_URL: http://sandbox:8080
-  SANDBOX_TOKEN: ${SANDBOX_TOKEN:-change-me-in-production}
   JEV_REQUESTS_PER_MINUTE: ${JEV_REQUESTS_PER_MINUTE:-1200}
   JEV_TOKENS_PER_SECOND: ${JEV_TOKENS_PER_SECOND:-250000}
   TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
@@ -43,7 +45,7 @@ x-build-common: &build-common
   volumes:
     - ./overbae:/code/overbae
     - ./modal_shared:/code/modal_shared
-    - ./sandbox:/code/sandbox
+    - ./sandbox:/code/sandbox:ro
     - ./manage.py:/code/manage.py
     - app_data:/data
     - ${HOME}/.aws:/data/tmp/.aws:ro
@@ -181,9 +183,7 @@ services:
     restart: unless-stopped
     environment:
       <<: *env-common
-    networks:
-      - default
-      - sandbox_net
+    networks: [default, sandbox_net]
     depends_on:
       api:
         condition: service_healthy
@@ -198,9 +198,7 @@ services:
     restart: unless-stopped
     environment:
       <<: *env-common
-    networks:
-      - default
-      - sandbox_net
+    networks: [default, sandbox_net]
     depends_on:
       api:
         condition: service_healthy
@@ -221,8 +219,7 @@ services:
       redis:
         condition: service_healthy
 
-  # Runs customer scripts and parses documents. Reachable only from the landing and
-  # interactive workers; no outbound network, no secrets, no shared data volume.
+  # Runs packages and document parsing without network egress, app secrets or media mounts.
   sandbox:
     image: overmind-dev
     entrypoint: ["/usr/local/bin/worker-entrypoint.sh"]
@@ -284,11 +281,6 @@ services:
       # Mount ~/.aws so Grafana can read SSO token cache and config
       - ${HOME}/.aws:/usr/share/grafana/.aws:ro
 
-networks:
-  default: {}
-  sandbox_net:
-    internal: true
-
 volumes:
   # Pin explicit physical names so renaming the compose project (name:
   # overmind-dev) keeps mounting the EXISTING data volumes — which were created
@@ -300,3 +292,7 @@ volumes:
     name: overclaw_pg_data
   grafana_data:
   frontend_node_modules:
+
+networks:
+  sandbox_net:
+    internal: true

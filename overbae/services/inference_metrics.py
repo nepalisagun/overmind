@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import timedelta
 from itertools import pairwise
 
-from django.db.models import Avg, Count, Max, Q, Sum
+from django.db.models import Aggregate, Avg, Count, FloatField, Max, Q, Sum
 from django.db.models.functions import Trunc
 from django.utils import timezone
 
@@ -16,6 +16,12 @@ from overbae.services.model_catalog import estimate_cost
 # Cap the per-model sample pulled into Python for percentile math. Bounds memory
 # for very chatty models while staying statistically ample.
 METRIC_SAMPLE_LIMIT = 5000
+
+
+class Median(Aggregate):
+    function = "PERCENTILE_CONT"
+    template = "%(function)s(0.5) WITHIN GROUP (ORDER BY %(expressions)s)%(filter)s"
+    output_field = FloatField()
 
 
 MONITORING_PERIODS = {

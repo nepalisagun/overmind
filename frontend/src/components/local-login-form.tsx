@@ -14,9 +14,9 @@ export function LocalLoginForm({ onSignedIn }: { onSignedIn: () => void }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
     setError(null);
     setSubmitting(true);
     try {
@@ -44,10 +44,8 @@ export function LocalLoginForm({ onSignedIn }: { onSignedIn: () => void }) {
     >
       <div className="flex flex-col gap-1">
         <h1 className="text-lg font-semibold text-auth-text">Continue</h1>
-        <p className="text-sm text-auth-text-label">
-          Email and password. Creates an account on first use.
-        </p>
       </div>
+      <p className="text-sm text-auth-text-label">Creates an account on first use.</p>
       <div className="flex flex-col gap-1.5">
         <Label className="text-auth-text-label" htmlFor="local-email">
           Email
@@ -78,7 +76,10 @@ export function LocalLoginForm({ onSignedIn }: { onSignedIn: () => void }) {
         />
       </div>
       {error ? (
-        <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <p
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          role="alert"
+        >
           {error}
         </p>
       ) : null}

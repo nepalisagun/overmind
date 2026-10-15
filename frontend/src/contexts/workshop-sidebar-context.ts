@@ -1,15 +1,13 @@
 import { createContext, useContext } from "react";
 
-export interface WorkshopSidebar {
+export const WorkshopSidebarContext = createContext<{
   open: boolean;
   close: () => void;
-  toggle: (trigger: HTMLElement | null) => void;
-}
+  toggle: (trigger: HTMLButtonElement) => void;
+} | null>(null);
 
-export const WorkshopSidebarContext = createContext<WorkshopSidebar | null>(null);
-
-export function useWorkshopSidebar(): WorkshopSidebar {
-  const sidebar = useContext(WorkshopSidebarContext);
-  if (!sidebar) throw new Error("The workshop sidebar needs the app layout.");
-  return sidebar;
+export function useWorkshopSidebar() {
+  const context = useContext(WorkshopSidebarContext);
+  if (!context) throw new Error("Workshop sidebar requires the app layout.");
+  return context;
 }

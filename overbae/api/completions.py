@@ -322,6 +322,16 @@ def _resolve_alias(request: Request, model_id: str) -> tuple[DeployedModel | Non
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    if deployed.inference_contract == "decision":
+        return Response(
+            {
+                "error": {
+                    "message": "This model returns decision probabilities. Use its deployed-model inference endpoint.",
+                    "type": "invalid_request_error",
+                }
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     if deployed.status != DeployedModel.Status.READY:
         # Name both ids: the alias alone hides which deployment is stuck.
         return None, Response(
@@ -755,6 +765,7 @@ def _deployed_model_to_dict(m: DeployedModel) -> dict:
         "finetuned": True,
         "status": m.status,
         "base_model": m.base_model_id,
+        "inference_contract": m.inference_contract,
     }
 
 

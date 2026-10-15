@@ -4,14 +4,13 @@ the surfaces that create it."""
 from __future__ import annotations
 
 import uuid
-from unittest.mock import patch
 
 import pytest
-from conftest import read_table
-from factories import make_project, make_user, member_client
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from overbae.models import Dataset, ProjectMembership, Span
-from overbae.services.datasets import dispatch, files, land, paths, store
+from overbae.models import Dataset, Project, ProjectMembership, Span, User
+from overbae.services.datasets import dispatch, land, paths, store
 from overbae.services.datasets.lifecycle import DatasetError
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -35,7 +34,7 @@ def test_split_takes_the_eval_slice_from_the_head_tail_or_a_fixed_draw():
     assert _inputs(evaluation) == ["q8", "q9"]
     first = _landing().split(eval_percent=30, position="random")
     again = _landing().split(eval_percent=30, position="random")
-    assert _inputs(first[1]) == _inputs(again[1]) and len(list(first[1].rows)) == 3
+    assert _inputs(first[1]) == _inputs(again[1]) and len(first[1].rows) == 3
     assert sorted(_inputs(first[0]) + _inputs(first[1])) == sorted(_inputs(_landing()))
     assert _inputs(first[0]) == sorted(_inputs(first[0]), key=lambda s: int(s[1:]))
 
@@ -43,26 +42,45 @@ def test_split_takes_the_eval_slice_from_the_head_tail_or_a_fixed_draw():
 def test_split_keeps_at_least_one_row_on_each_side():
     two = land.read_rows(ROWS[:2])
     train, evaluation = two.split(eval_percent=1, position="tail")
-    assert len(list(train.rows)) == 1 and len(list(evaluation.rows)) == 1
+    assert len(train.rows) == 1 and len(evaluation.rows) == 1
     train, evaluation = two.split(eval_percent=99, position="tail")
-    assert len(list(train.rows)) == 1 and len(list(evaluation.rows)) == 1
+    assert len(train.rows) == 1 and len(evaluation.rows) == 1
     with pytest.raises(land.LandError):
         land.read_rows(ROWS[:1]).split(eval_percent=50, position="tail")
     with pytest.raises(land.LandError):
         two.split(eval_percent=50, position="middle")
 
 
-def test_create_split_lands_two_idle_datasets_with_disjoint_rows_and_queues_nothing_else():
-    project, user = make_project(), make_user()
-    with patch("overbae.tasks.datasets.execute.apply_async") as execute:
-        train, evaluation = dispatch.create_split(
-            project=project,
-            user=user,
-            name="Support",
-            source={"rows": [dict(r) for r in ROWS]},
-            eval_percent=20,
-            position="tail",
-        )
+def _project() -> Project:
+    return Project.objects.create(name="P", slug=f"p-{uuid.uuid4().hex[:8]}")
+
+
+def _user() -> User:
+    return User.objects.create_user(
+        email=f"u-{uuid.uuid4().hex[:6]}@test.com",
+        password="pw",
+        clerk_user_id=f"clerk_{uuid.uuid4().hex}",
+    )
+
+
+def _client(project) -> APIClient:
+    user = _user()
+    ProjectMembership.objects.create(user=user, project=project)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {RefreshToken.for_user(user).access_token}")
+    return client
+
+
+def test_create_split_lands_disjoint_readable_sources_without_diagnosis():
+    project, user = _project(), _user()
+    train, evaluation = dispatch.create_split(
+        project=project,
+        user=user,
+        name="Support",
+        source={"rows": [dict(r) for r in ROWS]},
+        eval_percent=20,
+        position="tail",
+    )
     train.refresh_from_db()
     evaluation.refresh_from_db()
     assert (train.name, train.intent, train.state) == ("Support train", "train", "idle")
@@ -71,7 +89,6 @@ def test_create_split_lands_two_idle_datasets_with_disjoint_rows_and_queues_noth
         "eval",
         "idle",
     )
-    assert (train.active_id, evaluation.active_id) == (train.source.id, evaluation.source.id)
     assert train.source.rows == 8 and evaluation.source.rows == 2
     assert train.source_spec["split"] == {
         "eval_percent": 20,
@@ -83,52 +100,68 @@ def test_create_split_lands_two_idle_datasets_with_disjoint_rows_and_queues_noth
         "sibling": str(evaluation.id),
     }
     assert evaluation.source_spec["split"]["sibling"] == str(train.id)
-    frames = [read_table(paths.cell_path(ds.id, ds.source.id)) for ds in (train, evaluation)]
+    frames = [store.read_frame(paths.cell_path(ds.id, ds.source.id)) for ds in (train, evaluation)]
     assert list(frames[0][store.SOURCE_ROW]) == list(range(8))
     assert list(frames[1][store.SOURCE_ROW]) == [0, 1]
-    assert execute.call_args_list == []
 
 
 def test_create_split_refuses_a_bad_cut_or_a_short_source_before_creating():
-    project, user = make_project(), make_user()
+    project, user = _project(), _user()
     for bad in ({"eval_percent": 0, "position": "tail"}, {"eval_percent": 20, "position": "x"}):
         with pytest.raises(DatasetError):
             dispatch.create_split(
                 project=project, user=user, name="S", source={"rows": ROWS}, **bad
             )
-    Span.objects.create(
-        span_id=uuid.uuid4().hex[:16],
-        trace_id=uuid.uuid4().hex,
-        project=project,
-        span_type="entry_point",
-        name="run",
-        start_time_ns=1,
-        end_time_ns=2,
-        duration_ns=1,
-    )
-    upload_id, _ = files.begin_upload("one.jsonl", project=project.id)
-    files.append_chunk(upload_id, 0, b'{"input":"one"}\n')
-    files.inspect_upload(upload_id, size=files.upload_received(upload_id))
-    for source in (
-        {"rows": ROWS[:1]},
-        {"traces": {"filters": {"name": "run"}}},
-        {"uploads": [upload_id]},
-    ):
-        with pytest.raises(DatasetError, match="Two rows"):
-            dispatch.create_split(
-                project=project,
-                user=user,
-                name="S",
-                source=source,
-                eval_percent=20,
-                position="tail",
-            )
+    with pytest.raises(DatasetError, match="Two rows"):
+        dispatch.create_split(
+            project=project,
+            user=user,
+            name="S",
+            source={"rows": ROWS[:1]},
+            eval_percent=20,
+            position="tail",
+        )
     assert Dataset.objects.filter(project=project).count() == 0
 
 
+def test_raw_decisions_split_by_evidence_and_options_without_splitting_target_variants():
+    project, user = _project(), _user()
+    rows = []
+    for i in range(6):
+        row = {
+            "question": "Which option follows from the evidence?",
+            "state": f"Case {i // 2}",
+            "kind": "choice",
+            "options": ["yes", "no"] if i % 2 else ["allow", "deny"],
+            "target": [1.0, 0.0],
+            "source": "example",
+        }
+        rows.extend([row, {**row, "target": [0.0, 1.0], "source": "another-copy"}])
+    train, evaluation = dispatch.create_split(
+        project=project,
+        user=user,
+        name="Runtime decisions",
+        source={"rows": rows},
+        eval_percent=50,
+        position="head",
+    )
+    train.refresh_from_db()
+    evaluation.refresh_from_db()
+    assert train.state == evaluation.state == "idle"
+    frames = [store.read_frame(paths.cell_path(ds.id, ds.source.id)) for ds in (train, evaluation)]
+    assert [len(frame) for frame in frames] == [6, 6]
+    clusters = [
+        {(row["state"], tuple(row["options"])) for row in frame.to_dict("records")}
+        for frame in frames
+    ]
+    assert len(clusters[0]) == len(clusters[1]) == 3
+    assert not clusters[0] & clusters[1]
+    assert train.source_spec["contamination_report"]["content_overlap"] == 0
+
+
 def test_split_endpoint_returns_the_pair_and_validates_the_cut():
-    project = make_project()
-    client = member_client(project)
+    project = _project()
+    client = _client(project)
     body = {
         "name": "Support",
         "project": str(project.id),
@@ -150,14 +183,14 @@ def test_split_endpoint_returns_the_pair_and_validates_the_cut():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_mcp_create_dataset_from_traces_with_split_returns_both_datasets():
+def test_mcp_create_from_traces_with_split_returns_both_datasets():
     import asyncio
 
     from overbae.models import APIToken
     from overbae.services.mcp.catalog import CATALOG
     from overbae.services.mcp.context import MCPContext
 
-    project, user = make_project(), make_user()
+    project, user = _project(), _user()
     ProjectMembership.objects.create(user=user, project=project)
     token = APIToken(
         scope={
@@ -184,13 +217,12 @@ def test_mcp_create_dataset_from_traces_with_split_returns_both_datasets():
         )
 
     def call(arguments):
-        return asyncio.run(CATALOG.call("create_dataset", arguments, context))
+        return asyncio.run(CATALOG.call("create_dataset_from_traces", arguments, context))
 
-    source = {"kind": "traces", "trace_ids": traces}
-    refused = call({"name": "T", "source": source, "intent": "train", "split": {}})
+    refused = call({"name": "T", "trace_ids": traces, "intent": "train", "split": {}})
     assert refused.isError is True
     result = call(
-        {"name": "T", "source": source, "split": {"eval_percent": 25, "position": "head"}}
+        {"name": "T", "trace_ids": traces, "split": {"eval_percent": 25, "position": "head"}}
     )
     assert result.isError is False, result.structuredContent
     body = result.structuredContent
@@ -199,3 +231,37 @@ def test_mcp_create_dataset_from_traces_with_split_returns_both_datasets():
     train = Dataset.objects.get(pk=body["dataset"]["id"])
     evaluation = Dataset.objects.get(pk=body["eval_dataset"]["id"])
     assert train.source.rows == 3 and evaluation.source.rows == 1
+
+
+def test_native_decision_targets_do_not_split_identical_inputs():
+    from overbae.services.datasets.partition import content_key
+
+    decision = {
+        "state": "A coin is tossed.",
+        "question": "Which side?",
+        "kind": "choice",
+        "options": ["Heads", "Tails"],
+    }
+    first = {"decision": {**decision, "target_probabilities": [0.2, 0.8]}}
+    second = {"decision": {**decision, "target_probabilities": [0.6, 0.4], "weight": 2}}
+    assert content_key(first) == content_key(second)
+    different = {"decision": {**second["decision"], "state": "Two coins are tossed."}}
+    assert content_key(first) != content_key(different)
+
+
+def test_shared_group_identity_keeps_question_variants_together():
+    from overbae.services.datasets.partition import split_rows
+
+    records = [
+        {
+            "group_id": f"case-{case}",
+            "question": f"Question {variant}",
+            "state": f"Case {case}",
+            "target": [0, 1],
+        }
+        for case in range(10)
+        for variant in range(3)
+    ]
+    train, validation, report = split_rows(records, eval_percent=20, position="random")
+    assert not ({r["group_id"] for r in train} & {r["group_id"] for r in validation})
+    assert "group_id" in report["group_by"]

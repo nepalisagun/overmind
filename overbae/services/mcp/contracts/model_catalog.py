@@ -27,6 +27,8 @@ class ModelCatalogTrainingType(MCPModel):
 
 class ModelCatalogModel(MCPModel):
     id: str
+    openrouter_id: str | None
+    openrouter_status: Literal["available", "not_listed", "catalog_unavailable"]
     display: str
     params: str
     total_params_b: float
@@ -40,21 +42,6 @@ class ModelCatalogModel(MCPModel):
     disabled_reason: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
-class DecisionModelLimits(MCPModel):
-    options: int
-    score_levels: int
-    questions: int
-
-
-class DecisionCatalogModel(MCPModel):
-    id: str
-    family: str
-    params: int
-    max_context_length: int
-    limits: DecisionModelLimits
-    decision_index: float | None = None
-
-
 class GetModelCatalogOutput(MCPModel):
     summary: str = Field(min_length=1, max_length=240)
     backend: Literal["together", "baseten", "modal"]
@@ -62,4 +49,4 @@ class GetModelCatalogOutput(MCPModel):
     models: dict[str, list[ModelCatalogModel]]
     has_tool_calling: bool
     max_context: int | None = Field(gt=0, le=10_000_000)
-    decision_models: list[DecisionCatalogModel]
+    monitoring: dict

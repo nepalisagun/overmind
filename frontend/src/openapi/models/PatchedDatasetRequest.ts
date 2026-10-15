@@ -51,12 +51,6 @@ export interface PatchedDatasetRequest {
      * @memberof PatchedDatasetRequest
      */
     active?: string | null;
-    /**
-     * With active: refuse with 409 active_conflict unless this is the active version.
-     * @type {string}
-     * @memberof PatchedDatasetRequest
-     */
-    expectedActive?: string;
 }
 
 
@@ -82,7 +76,6 @@ export function PatchedDatasetRequestFromJSONTyped(json: any, ignoreDiscriminato
         'capability': json['capability'] == null ? undefined : json['capability'],
         'intent': json['intent'] == null ? undefined : IntentEnumFromJSON(json['intent']),
         'active': json['active'] == null ? undefined : json['active'],
-        'expectedActive': json['expected_active'] == null ? undefined : json['expected_active'],
     };
 }
 
@@ -101,6 +94,5 @@ export function PatchedDatasetRequestToJSONTyped(value?: PatchedDatasetRequest |
         'capability': value['capability'],
         'intent': IntentEnumToJSON(value['intent']),
         'active': value['active'],
-        'expected_active': value['expectedActive'],
     };
 }

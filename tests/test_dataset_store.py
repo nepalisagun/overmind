@@ -53,16 +53,17 @@ def test_values_a_typed_column_cannot_hold_are_kept_as_json(tmp_path):
     rows = [{name: values[i] for name, values in columns.items()} for i in range(3)]
     path = tmp_path / "wide.parquet"
     store.write_rows(path, rows)
-    frame = store.Frame(path)
-    assert frame.kinds == {"huge": "json", "mixed": "json", "wide": "json", "near": "number"}
+    kinds = {column["name"]: column["type"] for column in store.read_manifest(path)}
+    assert kinds == {"huge": "json", "mixed": "json", "wide": "json", "near": "number"}
+    retained = list(store.iter_rows(path))
     for name, values in columns.items():
-        assert list(frame.values(name)) == values
+        assert [row[name] for row in retained] == values
 
 
 def test_frames_decode_json_columns(table):
-    frame = store.Frame(table)
-    assert list(frame.values("input")) == [{"q": "hi"}, {"q": "bye"}, "plain"]
-    messages = list(frame.values("messages"))
+    frame = store.read_frame(table)
+    assert list(frame["input"]) == [{"q": "hi"}, {"q": "bye"}, "plain"]
+    messages = list(frame["messages"])
     assert messages[0] == [{"content": "hi", "role": "user"}]
     assert messages[1] is None
 
@@ -105,14 +106,14 @@ def test_query_is_sandboxed(table):
         "attach '/tmp/other.db'",
         "install httpfs",
     ):
-        with pytest.raises(Exception, match="Permission"):
+        with pytest.raises(Exception, match="Permission|Only one read-only SELECT"):
             store.query(sql, limit=None, t=table)
-    with pytest.raises(Exception, match="configuration"):
+    with pytest.raises(Exception, match="configuration|Only one read-only SELECT"):
         store.query("set enable_external_access = true", limit=None, t=table)
 
 
 def test_write_frame_round_trips_and_hashes(table, tmp_path):
-    df = store.frame_rows(table, range(3)).assign(n=[1, 2, 3])
+    df = store.read_frame(table).assign(n=[1, 2, 3])
     out = tmp_path / "p.parquet"
     manifest = store.write_frame(out, df)
     assert {c["name"]: c["type"] for c in manifest}["n"] == "integer"
@@ -154,5 +155,34 @@ def test_paste_detects_shape():
 
 
 def test_stream_rows_rejects_unknown_extension():
-    with pytest.raises(files.FileError, match="CSV, TSV, JSON, JSONL or Parquet"):
+    with pytest.raises(files.FileError, match="Use a CSV"):
         list(files.iter_stream_rows(io.StringIO("x"), filename="rows.xlsx"))
+
+
+def test_query_exposes_declared_nested_columns_as_json(tmp_path):
+    path = tmp_path / "nested.parquet"
+    store.write_rows(
+        path,
+        [
+            {
+                "source_row": 0,
+                "decision": {"kind": "choice", "target": [0.25, 0.75]},
+                "literal": '{"kind":"text"}',
+            },
+            {
+                "source_row": 1,
+                "decision": {"kind": "score", "target": [1.0, 0.0]},
+                "literal": "plain",
+            },
+        ],
+    )
+    result = store.query(
+        "SELECT json_extract_string(decision.kind, '$') AS kind, "
+        "CAST(decision.target AS DOUBLE[]) AS probabilities, typeof(literal) AS literal_type "
+        "FROM t ORDER BY source_row",
+        t=path,
+    )
+    assert result["rows"] == [
+        {"kind": "choice", "probabilities": [0.25, 0.75], "literal_type": "VARCHAR"},
+        {"kind": "score", "probabilities": [1.0, 0.0], "literal_type": "VARCHAR"},
+    ]

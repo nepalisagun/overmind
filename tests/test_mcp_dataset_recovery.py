@@ -50,14 +50,6 @@ def test_inspection_leads_to_source_recovery_through_existing_tool(monkeypatch, 
     queued = []
     monkeypatch.setattr(dataset_tasks.land, "apply_async", lambda **kwargs: queued.append(kwargs))
 
-    refused = asyncio.run(
-        CATALOG.call(
-            "try_dataset_script",
-            {"dataset": str(target.pk), "script": "df = df"},
-            context,
-        )
-    )
-    assert refused.isError
     target.refresh_from_db()
     assert target.state == Dataset.State.ERROR
     inspected = asyncio.run(CATALOG.call("inspect_dataset", {"dataset": str(target.pk)}, context))
@@ -71,7 +63,7 @@ def test_inspection_leads_to_source_recovery_through_existing_tool(monkeypatch, 
     assert not recovered.isError, recovered.structuredContent
     assert recovered.structuredContent["dataset"]["id"] == str(target.pk)
     assert recovered.structuredContent["dataset"]["state"] == "landing"
-    assert recovered.structuredContent["job"]["kind"] == "dataset_import"
+    assert recovered.structuredContent["job"]["kind"] == "dataset_run"
     assert recovered.structuredContent["job"]["id"] == str(target.pk)
     assert len(queued) == 1
     assert queued[0]["task_id"] == str(receipt.pk)

@@ -1,187 +1,12 @@
-import hashlib
 import json
-import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
-import httpx
 import pytest
 
-from .datasets import evaluate, prepare, tickets, training_rows, upload
+from .datasets import evaluate, tickets, upload
 from .stack import drain
 
-DOCUMENTS = Path(__file__).resolve().parents[1] / "fixtures" / "documents"
 
-
-def _versions(workshop, dataset) -> dict[str, dict]:
-    return {
-        v["version"]: v for v in workshop.call("inspect_dataset", {"dataset": dataset})["versions"]
-    }
-
-
-def _add(workshop, dataset, parent, title, script) -> dict:
-    return workshop.call(
-        "add_dataset_version",
-        {"dataset": dataset, "parent": parent, "title": title, "script": script},
-    )
-
-
-def _events(live_api, key, dataset) -> list[dict]:
-    seen = []
-    with httpx.stream(
-        "GET",
-        f"{live_api.url}/api/datasets/{dataset}/events/",
-        headers={"X-Api-Key": key},
-        timeout=30,
-    ) as response:
-        for line in response.iter_lines():
-            if not line.startswith("data: "):
-                continue
-            event = json.loads(line[6:])
-            if event["type"] == "replay.done":
-                return seen
-            seen.append(event)
-    return seen
-
-
-def test_an_agent_grows_a_tree_of_versions_and_training_uses_the_one_it_activated(
-    workshop, cli, sample_agent, live_api, worker, sft, fake_modal, tmp_path
-):
-    answer = workshop.capability("answer")
-    train = upload(
-        cli,
-        sample_agent,
-        training_rows(tmp_path),
-        "--intent",
-        "train",
-        "--capability",
-        answer["id"],
-    )
-    evals = upload(
-        cli, sample_agent, tickets(tmp_path), "--intent", "eval", "--capability", answer["id"]
-    )
-    drain(worker)
-    prepare(workshop, evals, "eval")
-    landed = workshop.call("inspect_dataset", {"dataset": train})
-    assert landed["state"] == "idle"
-    assert landed["active"]["version"] == "v0"
-    assert [v["version"] for v in landed["versions"]] == ["v0"]
-
-    tried = workshop.call(
-        "try_dataset_script", {"dataset": train, "parent": "v0", "script": "df = df.head(10)"}
-    )
-    assert (tried["status"], tried["rows"]) == ("ok", 10)
-    assert list(_versions(workshop, train)) == ["v0"]
-
-    first = _add(workshop, train, "v0", "Ten rows", "df = df.head(10)")
-    assert (first["status"], first["version"]["version"]) == ("ok", "v1")
-    short = _add(workshop, train, "v1", "First eight", "df = df.head(8)")
-    late = _add(workshop, train, "v1", "Last eight", "df = df.tail(8)")
-    assert (short["version"]["version"], late["version"]["version"]) == ("v2", "v3")
-    again = _add(workshop, train, "v1", "Same script, new title", "df = df.head(8)")
-    assert again["version"]["version"] == "v2"
-
-    failed = _add(workshop, train, "v1", "Broken", "df = df['no_such_column']")
-    assert failed["status"] == "failed"
-    assert "no_such_column" in failed["error"]
-    tree = _versions(workshop, train)
-    assert sorted(tree) == ["v0", "v1", "v2", "v3"]
-    assert tree["v2"]["parent"] == tree["v3"]["parent"] == "v1"
-    v1 = workshop.call("inspect_dataset", {"dataset": train, "version": "v1"})["selected"]
-    assert v1["impact"]["rows_removed"] == 2
-
-    compared = workshop.call("diff_dataset_versions", {"dataset": train, "from": "v2", "to": "v3"})
-    assert compared["diff"]["tracked"] is True
-
-    workshop.call(
-        "activate_dataset_version", {"dataset": train, "version": "v3", "expected_active": "v0"}
-    )
-    workshop.call(
-        "start_finetune",
-        {
-            "dataset": train,
-            "eval_dataset": evals,
-            "base_model": "Qwen/Qwen3-1.7B",
-            "capability": "answer",
-            "eval_model_before": False,
-        },
-    )
-    used = _versions(workshop, train)
-    assert used["v3"]["used"] is True
-    assert used["v2"]["used"] is False
-
-    added = [
-        e
-        for e in _events(live_api, cli.project_key(sample_agent), train)
-        if e["type"] == "version_added"
-    ]
-    assert [e["cell_id"] for e in added] == [used[v]["id"] for v in ("v1", "v2", "v3")]
-
-
-def test_a_pdf_lands_one_row_per_text_element_and_a_script_groups_it_by_page(
-    workshop, cli, sample_agent, worker
-):
-    document = upload(cli, sample_agent, DOCUMENTS / "native.pdf")
-    drain(worker)
-    landed = workshop.call(
-        "query_dataset",
-        {
-            "dataset": document,
-            "sql": "select page, text, _overmind_document_id from t order by page",
-        },
-    )["rows"]
-    assert [(r["page"], r["text"]) for r in landed] == [
-        (1, "Invoice total: 1234.56 USD"),
-        (2, "Refunds are issued within 30 days."),
-    ]
-    assert len({r["_overmind_document_id"] for r in landed}) == 1
-
-    pages = _add(
-        workshop,
-        document,
-        "v0",
-        "One row per page",
-        "df = df.groupby(['source_name', 'page'], as_index=False).agg(text=('text', '\\n'.join))",
-    )
-    assert pages["status"] == "ok", pages["error"]
-    grouped = workshop.call(
-        "query_dataset",
-        {"dataset": document, "version": "v1", "sql": "select page from t order by page"},
-    )["rows"]
-    assert grouped == [{"page": 1}, {"page": 2}]
-
-
-def test_a_slow_run_answers_running_and_a_full_project_queues_the_next(
-    workshop, cli, sample_agent, worker, settings, tmp_path
-):
-    settings.WORKSHOP_PROJECT_CONCURRENCY = 1
-    dataset = upload(cli, sample_agent, tickets(tmp_path), "--intent", "eval")
-    drain(worker)
-
-    def attempt(seconds: int) -> dict:
-        return workshop.call(
-            "try_dataset_script",
-            {
-                "dataset": dataset,
-                "parent": "v0",
-                "script": f"import time\ntime.sleep({seconds})\ndf = df.head(1)",
-            },
-        )
-
-    with ThreadPoolExecutor(2) as pool:
-        slow = pool.submit(attempt, 30)
-        time.sleep(3)
-        waiting = pool.submit(attempt, 1)
-        assert (slow.result()["status"], waiting.result()["status"]) == ("running", "queued")
-
-    finished = [attempt(30), attempt(1)]
-    deadline = time.monotonic() + 120
-    while any(r["status"] != "ok" for r in finished) and time.monotonic() < deadline:
-        finished = [attempt(30), attempt(1)]
-    assert [(r["status"], r["rows"]) for r in finished] == [("ok", 1), ("ok", 1)]
-
-
-def test_an_uploaded_eval_file_is_prepared_evaluated_and_marked_used(
+def test_an_uploaded_eval_source_is_usable_and_use_freezes_its_version(
     workshop, cli, sample_agent, worker, tmp_path
 ):
     answer = workshop.capability("answer")
@@ -189,19 +14,26 @@ def test_an_uploaded_eval_file_is_prepared_evaluated_and_marked_used(
         cli, sample_agent, tickets(tmp_path), "--intent", "eval", "--capability", answer["id"]
     )
     drain(worker)
-    version = prepare(workshop, dataset, "eval")
     prepared = workshop.call("inspect_dataset", {"dataset": dataset})["active"]
     assert prepared["fits"]["ok"] is True
 
     ready = workshop.call("check_evaluation_readiness", {"dataset": dataset})
-    assert ready["dataset"]["version"]["fits"] is True
+    assert ready["dataset"]["cell"]["fingerprint"] == prepared["fingerprint"]
 
     run = evaluate(workshop, dataset)
     drain(worker)
-    assert run["version"]["version"] == version
-    assert run["version"]["fingerprint"] == prepared["fingerprint"]
-    assert workshop.read(run["resource"]["uri"])["status"] == "completed"
-    assert _versions(workshop, dataset)[version]["used"] is True
+    assert run["cell"]["version"] == "1.0"
+    assert run["cell"]["fingerprint"] == prepared["fingerprint"]
+    [candidate] = run["runs"]
+    assert workshop.read(candidate["resource"]["uri"])["status"] == "completed"
+
+    frozen = next(
+        c
+        for c in workshop.call("inspect_dataset", {"dataset": dataset})["cells"]
+        if c["id"] == run["cell"]["id"]
+    )
+    assert frozen["frozen"] is True
+    assert frozen["version"] == "1.0"
 
 
 def test_an_unreadable_file_is_refused_before_it_becomes_a_dataset(
@@ -209,211 +41,167 @@ def test_an_unreadable_file_is_refused_before_it_becomes_a_dataset(
 ):
     broken = tmp_path / "broken.jsonl"
     broken.write_bytes(b"\x00\x01garbage{not json\n")
-    with pytest.raises(AssertionError, match="Line 1 is not valid JSON"):
+    with pytest.raises(AssertionError, match="transfer_conflict"):
         upload(cli, sample_agent, broken, "--intent", "eval")
 
     assert workshop.call("list_datasets", {"search": "broken"})["datasets"] == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Trace landing does not redact personal data; trace rows keep it.",
-)
-def test_personal_data_in_traces_is_redacted_in_the_dataset(
+def test_trace_landing_preserves_source_text_for_explicit_transformation(
     workshop, sample_agent, live_api, support_desk_llm, worker
 ):
+    ticket = "Refund order 42 please, mail me at jane.doe@example.com"
     sample_agent.run(
-        "Refund order 42 please, mail me at jane.doe@example.com",
+        ticket,
         api_url=live_api.url,
         llm_url=support_desk_llm,
     )
     drain(worker)
-    [execution] = workshop.call("query_task_executions", {"capability": "answer"})[
-        "task_executions"
-    ]
+    [execution] = workshop.call("query_traces", {"capability": "answer"})["traces"]
     created = workshop.call(
-        "create_dataset",
-        {
-            "name": "with pii",
-            "source": {"kind": "traces", "trace_ids": [execution["trace_id"]]},
-            "intent": "eval",
-        },
+        "create_dataset_from_traces",
+        {"name": "with pii", "trace_ids": [execution["trace_id"]], "intent": "eval"},
     )
     drain(worker)
     rows = workshop.call(
         "query_dataset", {"dataset": created["dataset"]["id"], "sql": "select * from t"}
     )["rows"]
-    assert "jane.doe@example.com" not in json.dumps(rows)
+    assert ticket in json.dumps(rows)
 
 
+@pytest.mark.parametrize("surface", ["mcp", "rest"])
+@pytest.mark.parametrize("slug", ["triage", "answer"])
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("selection", ["ids", "filter"])
 def test_trace_rows_carry_the_capability_they_were_selected_for(
+    workshop,
+    sample_agent,
+    live_api,
+    support_desk_llm,
+    worker,
+    cli,
+    rest_for,
+    surface,
+    slug,
+    capture,
+    selection,
+    fake_llm,
+):
+    ticket = "Refund order 42 please"
+    if capture:
+        agent = sample_agent.repo / "support_desk" / "agent.py"
+        source = agent.read_text()
+        for name in ("triage", "answer"):
+            source = source.replace(
+                f"def {name}(", f'@overmind.observe(ignore=["client"])\ndef {name}('
+            )
+        agent.write_text(source)
+    sample_agent.run(ticket, api_url=live_api.url, llm_url=support_desk_llm)
+    drain(worker)
+    capability = workshop.capability(slug)
+    [execution] = workshop.call(
+        "query_traces",
+        {"capability": slug, "all_spans": True, "span_type": "entry_point", "name": slug},
+    )["traces"]
+    arguments = {"name": slug, "intent": "eval", "capability": capability["id"]}
+    source = {"trace_ids": [execution["trace_id"]]}
+    if selection == "filter":
+        source = {"filters": {"capability": capability["id"]}}
+        arguments.pop("capability")
+    if surface == "mcp":
+        created = workshop.call("create_dataset_from_traces", {**arguments, **source})
+        dataset = created["dataset"]["id"]
+    else:
+        dataset = rest_for(cli.project_key(sample_agent)).request(
+            "POST",
+            "/api/datasets/",
+            json={**arguments, "project": workshop.project()["id"], "source": {"traces": source}},
+        )["id"]
+    drain(worker)
+    [row] = workshop.call(
+        "query_dataset",
+        {"dataset": dataset, "sql": "select * from t"},
+    )["rows"]
+    assert row["capability_id"] == capability["id"]
+    assert row["input"]["ticket"] == ticket, row
+    expected_score = execution["trajectory_score"]
+    if expected_score is None:
+        expected_score = execution["eval_score"]
+    assert row["score"] == expected_score
+    prefix = "You triage" if slug == "triage" else "You are a support agent."
+    assert row["prompt_tokens"] + row["completion_tokens"] == sum(
+        request.total_tokens for request in fake_llm.requests if request.system.startswith(prefix)
+    )
+    messages = row["messages"]
+    assert [m["content"] for m in messages if m["role"] == "user"] == [
+        ticket if slug == "triage" else f"[refund] {ticket}"
+    ]
+    if slug == "triage":
+        assert row["output"] == "refund"
+        assert row["tools"] is None
+        assert messages[-1]["content"] == "refund"
+    else:
+        assert row["input"]["category"] == "refund"
+        assert row["output"] == "Your refund is on its way. The order was delivered."
+        assert row["tools"][0]["function"]["name"] == "lookup_order"
+        assert any(m["role"] == "tool" for m in messages)
+
+
+def test_repeated_capability_invocations_refuse_to_publish_a_mixed_example(
+    workshop, sample_agent, live_api, support_desk_llm, worker
+):
+    agent = sample_agent.repo / "support_desk" / "agent.py"
+    agent.write_text(
+        agent.read_text().replace(
+            "return answer(client, ticket, triage(client, ticket))",
+            'triage(client, "A different ticket")\n    return answer(client, ticket, triage(client, ticket))',
+        )
+    )
+    sample_agent.run("Refund order 42 please", api_url=live_api.url, llm_url=support_desk_llm)
+    drain(worker)
+    [trace] = workshop.call("query_traces", {})["traces"]
+    created = workshop.call(
+        "create_dataset_from_traces",
+        {
+            "name": "Repeated triage",
+            "trace_ids": [trace["trace_id"]],
+            "capability": workshop.capability("triage")["id"],
+        },
+    )
+    drain(worker)
+    dataset = workshop.call("inspect_dataset", {"dataset": created["dataset"]["id"]})
+    assert dataset["state"] == "error"
+    assert "2 separate invocations" in dataset["error"]
+    assert dataset["cells"] == []
+
+
+def test_a_source_capability_filter_is_preserved_when_the_destination_differs(
     workshop, sample_agent, live_api, support_desk_llm, worker
 ):
     sample_agent.run("Refund order 42 please", api_url=live_api.url, llm_url=support_desk_llm)
     drain(worker)
+    triage = workshop.capability("triage")
     answer = workshop.capability("answer")
-    [execution] = workshop.call("query_task_executions", {"capability": "answer"})[
-        "task_executions"
-    ]
     created = workshop.call(
-        "create_dataset",
+        "create_dataset_from_traces",
         {
-            "name": "answers",
-            "source": {"kind": "traces", "trace_ids": [execution["trace_id"]]},
-            "intent": "eval",
+            "name": "Triage source for answer",
+            "filters": {"capability": triage["id"]},
             "capability": answer["id"],
         },
     )
     drain(worker)
-    rows = workshop.call(
+    dataset_id = created["dataset"]["id"]
+    [row] = workshop.call(
         "query_dataset",
-        {"dataset": created["dataset"]["id"], "sql": "select capability_id from t"},
-    )["rows"]
-    assert rows == [{"capability_id": answer["id"]}]
-
-
-def test_a_version_lands_as_its_own_dataset_or_split_into_train_and_eval(
-    workshop, cli, sample_agent, worker, rest_for, tmp_path
-):
-    source = upload(cli, sample_agent, tickets(tmp_path, n=6), "--intent", "eval")
-    drain(worker)
-    version = prepare(workshop, source, "eval")
-    project = workshop.project()["id"]
-
-    copy = rest_for(cli.project_key(sample_agent)).request(
-        "POST",
-        "/api/datasets/",
-        json={
-            "project": project,
-            "name": "tickets copy",
-            "source": {"version": {"dataset": source, "version": version}},
-        },
-    )
-    split = workshop.call(
-        "create_dataset",
         {
-            "name": "tickets",
-            "source": {"kind": "version", "dataset": source},
-            "split": {"eval_percent": 50, "position": "head"},
+            "dataset": dataset_id,
+            "sql": "select capability_id, messages from t",
         },
+    )["rows"]
+    assert row["capability_id"] == triage["id"]
+    assert row["messages"][-1]["content"] == "refund"
+    assert (
+        workshop.call("inspect_dataset", {"dataset": dataset_id})["capability"]["id"]
+        == answer["id"]
     )
-    drain(worker)
-
-    copied = workshop.call("inspect_dataset", {"dataset": copy["id"]})
-    assert (copied["state"], copied["intent"], copied["source_kind"]) == ("idle", "eval", "version")
-    assert copied["source"]["version"]["dataset"] == source
-    assert copied["source"]["version"]["version"] == version
-    assert copied["active"]["rows"] == 6
-    train = workshop.call("inspect_dataset", {"dataset": split["dataset"]["id"]})
-    evaluation = workshop.call("inspect_dataset", {"dataset": split["eval_dataset"]["id"]})
-    assert (train["intent"], evaluation["intent"]) == ("train", "eval")
-    assert train["active"]["rows"] + evaluation["active"]["rows"] == 6
-    assert evaluation["contamination_report"]["eval_rows"] == evaluation["active"]["rows"]
-    assert train["source"]["version"]["version"] == version
-
-
-def _add_with(workshop, call, attachment) -> dict:
-    return workshop.call(
-        "add_dataset_version", {**call, "title": "Labels", "attachment": attachment}
-    )
-
-
-def test_labels_made_outside_overmind_merge_into_a_version_that_keeps_the_file(
-    workshop, cli, sample_agent, worker, beat, clock, tmp_path
-):
-    dataset = upload(cli, sample_agent, tickets(tmp_path, n=6), "--intent", "eval")
-    drain(worker)
-    labels = tmp_path / "labels.csv"
-    labels.write_text(
-        "source_row,label\n" + "".join(f"{i},{'refund' if i < 4 else 'other'}\n" for i in range(6))
-    )
-    attached = json.loads(
-        cli.run("dataset", "attach", str(labels), "--json", cwd=sample_agent.repo)
-    )
-    assert attached["sha256"] == hashlib.sha256(labels.read_bytes()).hexdigest()
-    assert attached["rows"] == 6
-    script = "df = df.merge(attachment, on='source_row')\ndf['expected_output'] = df['label']"
-    call = {"dataset": dataset, "parent": "v0", "script": script}
-
-    tried = workshop.call("try_dataset_script", {**call, "attachment": attached["upload_id"]})
-    assert (tried["status"], tried["rows"]) == ("ok", 6)
-    added = _add_with(workshop, call, attached["upload_id"])
-    assert added["status"] == "ok", added["error"]
-    version = added["version"]
-    assert version["attachment"]["sha256"] == attached["sha256"]
-    [balance] = version["analytics"]["labels"]
-    assert balance["field"] == "expected_output"
-    assert balance["majority"] == {"label": "refund", "share": 0.6667}
-    assert _add_with(workshop, call, attached["upload_id"])["version"]["id"] == version["id"]
-    assert workshop.call("add_dataset_version", {**call, "title": "No file"})["status"] == "failed"
-
-    clock.shift(25 * 3600)
-    beat("overbae.tasks.cleanup_tmp.cleanup_uploads")
-    with pytest.raises(AssertionError, match="attachment is missing"):
-        workshop.call("try_dataset_script", {**call, "attachment": attached["upload_id"]})
-    kept = httpx.get(
-        f"{cli.api_url}/api/datasets/{dataset}/attachment/",
-        params={"cell": version["version"]},
-        headers={"X-Api-Key": cli.project_key(sample_agent)},
-    )
-    assert kept.content == labels.read_bytes()
-
-
-def _running(rest, dataset) -> dict:
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        runs = rest.request("GET", f"/api/datasets/{dataset}/executions/")
-        running = [run for run in runs if run["state"] == "running"]
-        if running:
-            return running[0]
-        time.sleep(0.2)
-    raise AssertionError("No run started.")
-
-
-def test_a_cancelled_script_run_stops_frees_the_project_and_keeps_no_version(
-    workshop, cli, sample_agent, worker, settings, rest_for, tmp_path
-):
-    settings.WORKSHOP_PROJECT_CONCURRENCY = 1
-    dataset = upload(cli, sample_agent, tickets(tmp_path), "--intent", "eval")
-    drain(worker)
-    rest = rest_for(cli.project_key(sample_agent))
-    slow = "import time\ntime.sleep(120)\ndf = df.head(1)"
-
-    with ThreadPoolExecutor(1) as pool:
-        pending = pool.submit(_add, workshop, dataset, "v0", "Slow", slow)
-        run = _running(rest, dataset)
-        started = time.monotonic()
-        stopped = workshop.call("cancel_dataset_job", {"dataset": dataset, "run": run["id"]})
-        assert (stopped["kind"], stopped["status"]) == ("dataset_run", "cancelled")
-        assert pending.result()["status"] == "cancelled"
-
-    quick = _add(workshop, dataset, "v0", "Two rows", "df = df.head(2)")
-    assert quick["status"] == "ok"
-    assert time.monotonic() - started < 30
-    tree = _versions(workshop, dataset)
-    assert sorted(tree) == ["v0", "v1"]
-    assert tree["v1"]["title"] == "Two rows"
-
-
-def test_a_stopped_import_lands_nothing_and_cannot_be_resumed(
-    workshop, cli, sample_agent, worker, settings
-):
-    settings.SANDBOX_URL = "http://127.0.0.1:9"
-    dataset = upload(cli, sample_agent, DOCUMENTS / "native.pdf")
-    job = f"overmind://jobs/dataset_import/{dataset}"
-    deadline = time.monotonic() + 30
-    while workshop.read(job)["import"]["state"] != "running":
-        assert time.monotonic() < deadline, "The import did not start."
-        time.sleep(0.1)
-
-    stopped = workshop.call("cancel_dataset_job", {"dataset": dataset})
-    assert (stopped["kind"], stopped["status"]) == ("dataset_import", "stopped")
-    drain(worker)
-
-    landed = workshop.read(job)
-    assert (landed["state"], landed["import"]["state"]) == ("stopped", "cancelled")
-    assert landed["error"] is None
-    detail = workshop.call("inspect_dataset", {"dataset": dataset})
-    assert (detail["versions"], detail["next_actions"]) == ([], [])
-    with pytest.raises(AssertionError, match="not blocked"):
-        workshop.call("resume_dataset_import", {"dataset": dataset})

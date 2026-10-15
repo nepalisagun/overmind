@@ -7,6 +7,7 @@ import uuid
 import pytest
 from conftest import EVAL_ROWS, TRAIN_ROWS, frozen_dataset
 from django.test import override_settings
+from factories import make_matrix_row
 
 from overbae.models import (
     DeployedModel,
@@ -17,8 +18,8 @@ from overbae.models import (
     Project,
 )
 from overbae.services.finetuning_eval import (
+    _baseline_target,
     baseline_needs_base_deploy,
-    ensure_target_eval,
     resolve_baseline_model,
     sync_eval_scores,
 )
@@ -29,21 +30,22 @@ GATEWAY = "https://gateway.example.modal.run"
 
 
 def _job(*, incumbent: str = "") -> FinetuningJob:
-    from overbae.models import Capability, EvalSet, EvalSetMember, Evaluator
+    from overbae.models import Capability, EvalMatrix, EvalSet
 
     project = Project.objects.create(name=f"bt-{uuid.uuid4().hex[:6]}")
     capability = Capability.objects.create(
         project=project, name="a", slug=f"a-{uuid.uuid4().hex[:6]}"
     )
-    dataset = frozen_dataset(project, TRAIN_ROWS, name="train")
-    eval_ds = frozen_dataset(project, EVAL_ROWS, name="eval")
+    dataset = frozen_dataset(project, TRAIN_ROWS, name="train", contract="train")
+    eval_ds = frozen_dataset(project, EVAL_ROWS, name="eval", contract="eval")
     eset = EvalSet.objects.create(project=project, capability=capability, name="set")
-    EvalSetMember.objects.create(
-        eval_set=eset,
-        evaluator=Evaluator.objects.create(
-            project=project, name="Match", kind="deterministic", config={"check": "exact_match"}
-        ),
-        role=EvalSetMember.Role.GENERATIVE,
+    eset.rows.add(
+        make_matrix_row(
+            project,
+            "Match",
+            type=EvalMatrix.Type.DETERMINISTIC,
+            source="def evaluate(span):\n    return span.output == span.expected\n",
+        )
     )
     return FinetuningJob.objects.create(
         project=project,
@@ -60,27 +62,33 @@ def _job(*, incumbent: str = "") -> FinetuningJob:
     )
 
 
-def _baseline_route(job):
-    row = ensure_target_eval(job, kind="baseline")
-    return row.eval_run.variants.get().model_ref if row else None
-
-
-@pytest.mark.parametrize(
-    ("incumbent", "model_id"),
-    [("openai/gpt-5.6-sol", "openai/gpt-5.6-sol"), ("gpt-4o-mini", "openai/gpt-4o-mini")],
-    ids=["frontier slug", "bare name"],
-)
 @override_settings(INFERENCE_API_URL=GATEWAY)
-def test_a_frontier_incumbent_is_benchmarked_on_openrouter_without_a_deployment(
-    incumbent, model_id
-):
-    job = _job(incumbent=incumbent)
-    route = _baseline_route(job)
+def test_frontier_incumbent_routes_via_openrouter_and_skips_deploy():
+    job = _job(incumbent="openai/gpt-5.6-sol")
+    target = _baseline_target(job)
 
-    assert route.provider == ModelRef.Provider.CUSTOM
-    assert route.base_url == "https://openrouter.ai/api/v1"
-    assert route.api_key_ref == "OPENROUTER_API_KEY"
-    assert route.model_id == model_id
+    assert target.kind == "openrouter"
+    assert target.provider == ModelRef.Provider.CUSTOM
+    assert target.base_url == "https://openrouter.ai/api/v1"
+    assert target.api_key_ref == "OPENROUTER_API_KEY"
+    assert target.model_id == "openai/gpt-5.6-sol"
+    assert target.ready is True
+    # A frontier model has no weights to serve — never Modal-deploy it.
+    assert baseline_needs_base_deploy(job) is False
+    assert "?" not in target.base_url
+
+
+@override_settings(INFERENCE_API_URL=GATEWAY)
+def test_provider_less_incumbent_routes_via_openrouter():
+    """A bare model name is still an incumbent — it must not fall back to the base FT model."""
+    job = _job(incumbent="gpt-4o-mini")
+    target = _baseline_target(job)
+
+    assert target.kind == "openrouter"
+    assert target.model_id == "openai/gpt-4o-mini"  # vendor prefix inferred
+    assert target.base_url == "https://openrouter.ai/api/v1"
+    assert target.api_key_ref == "OPENROUTER_API_KEY"
+    assert target.ready is True
     assert baseline_needs_base_deploy(job) is False
 
 
@@ -93,9 +101,7 @@ def test_a_frontier_incumbent_is_benchmarked_on_openrouter_without_a_deployment(
         (DeployedModel.Status.READY, "https://worker.modal.run", "", False),
     ],
 )
-def test_a_self_hosted_incumbent_is_benchmarked_through_the_gateway_once_ready(
-    status, url, gateway, ready, settings
-):
+def test_self_hosted_incumbent_routes_via_gateway(status, url, gateway, ready, settings):
     settings.INFERENCE_API_URL = gateway
     job = _job(incumbent="ft-prev-qwen3-8b")
     DeployedModel.objects.create(
@@ -105,25 +111,28 @@ def test_a_self_hosted_incumbent_is_benchmarked_through_the_gateway_once_ready(
         status=status,
         inference_url=url,
     )
-    route = _baseline_route(job)
+    target = _baseline_target(job)
 
+    assert target.kind == "gateway"
+    assert target.provider == ModelRef.Provider.CUSTOM
+    assert target.base_url == f"{gateway}/v1"
+    assert target.api_key_ref == "INFERENCE_API_KEY"
+    assert target.model_id == "ft-prev-qwen3-8b"
+    assert target.ready is ready
     assert baseline_needs_base_deploy(job) is False
-    if not ready:
-        assert route is None
-        return
-    assert route.provider == ModelRef.Provider.CUSTOM
-    assert route.base_url == f"{gateway}/v1"
-    assert route.api_key_ref == "INFERENCE_API_KEY"
-    assert route.model_id == "ft-prev-qwen3-8b"
 
 
 @override_settings(INFERENCE_API_URL=GATEWAY)
-def test_no_incumbent_waits_for_a_base_model_deployment(fake_llm):
-    fake_llm.catalog_models = []
+def test_no_incumbent_reports_unavailable_exact_base_route(fake_llm):
+    fake_llm.catalog_payload = []
     job = _job(incumbent="")
+    target = _baseline_target(job)
 
-    assert _baseline_route(job) is None
-    assert baseline_needs_base_deploy(job) is True
+    assert target.kind == "unavailable"
+    assert "Base model" in target.label
+    # No base deployment READY yet → not launchable.
+    assert target.ready is False
+    assert baseline_needs_base_deploy(job) is False
 
 
 def test_resolve_baseline_prefers_snapshot_over_live_capability():
@@ -136,7 +145,7 @@ def test_resolve_baseline_prefers_snapshot_over_live_capability():
         slug=f"a-{uuid.uuid4().hex[:6]}",
         model="anthropic/claude-sonnet-5",
     )
-    dataset = frozen_dataset(project, TRAIN_ROWS, name="t")
+    dataset = frozen_dataset(project, TRAIN_ROWS, name="t", contract="train")
     job = FinetuningJob.objects.create(
         project=project,
         capability=capability,
@@ -160,7 +169,7 @@ def test_delta_is_finetuned_minus_incumbent():
         dataset=job.eval_dataset,
         eval_set=job.eval_set,
         status=EvalRun.Status.COMPLETED,
-        summary={"variants": {"v": {"metrics": {"m": {"mean": 0.60}}}}},
+        summary={"score": 0.60},
     )
     final_run = EvalRun.objects.create(
         project=job.project,
@@ -168,7 +177,7 @@ def test_delta_is_finetuned_minus_incumbent():
         dataset=job.eval_dataset,
         eval_set=job.eval_set,
         status=EvalRun.Status.COMPLETED,
-        summary={"variants": {"v": {"metrics": {"m": {"mean": 0.75}}}}},
+        summary={"score": 0.75},
     )
     FinetuningJobEval.objects.create(
         job=job,
@@ -193,54 +202,3 @@ def test_delta_is_finetuned_minus_incumbent():
     assert baseline.model_id == "openai/gpt-5.6-sol"
     assert final.aggregate_score == pytest.approx(0.75)
     assert final.baseline_delta == pytest.approx(0.15)
-
-
-def _benchmarked_job(capability) -> FinetuningJob:
-    return FinetuningJob.objects.create(
-        project=capability.project,
-        capability=capability,
-        dataset=frozen_dataset(capability.project, TRAIN_ROWS, name="t"),
-        base_model="Qwen/Qwen3-8B",
-        provider=FinetuningJob.Provider.BASETEN,
-        baseline_model="",
-    )
-
-
-def _served(project, model_id: str, status=DeployedModel.Status.READY) -> DeployedModel:
-    return DeployedModel.objects.create(
-        project=project, model_id=model_id, status=status, base_model_id="Qwen/Qwen3-8B"
-    )
-
-
-def test_the_live_model_does_not_become_the_benchmark():
-    from overbae.models import Capability
-
-    project = Project.objects.create(name=f"bt-{uuid.uuid4().hex[:6]}")
-    capability = Capability.objects.create(
-        project=project,
-        name="a",
-        slug=f"a-{uuid.uuid4().hex[:6]}",
-        model="openai/gpt-5.6-sol",
-        active_model=_served(project, "ft-live-qwen3-8b"),
-    )
-    assert resolve_baseline_model(_benchmarked_job(capability)) == "openai/gpt-5.6-sol"
-
-
-@override_settings(INFERENCE_API_URL=GATEWAY)
-def test_a_warming_self_hosted_benchmark_waits_instead_of_calling_openrouter():
-    from overbae.models import Capability
-
-    project = Project.objects.create(name=f"bt-{uuid.uuid4().hex[:6]}")
-    warming = _served(project, "ft-warming-qwen3-8b", DeployedModel.Status.WARMING)
-    capability = Capability.objects.create(
-        project=project,
-        name="a",
-        slug=f"a-{uuid.uuid4().hex[:6]}",
-        active_model=warming,
-        benchmark_model=warming,
-    )
-
-    job = _benchmarked_job(capability)
-    assert _baseline_route(job) is None
-    assert resolve_baseline_model(job) == "ft-warming-qwen3-8b"
-    assert baseline_needs_base_deploy(job) is False

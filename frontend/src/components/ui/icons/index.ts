@@ -4,6 +4,7 @@
  *
  * Adding a glyph: `name: glyph("<svg file name>")` here, then `bun run icons:vendor`.
  */
+import { DiscordIcon } from "./discord";
 import { glyph } from "./glyph";
 import {
   BarbellVertical,
@@ -40,6 +41,7 @@ export const Icon = {
   clipboard: glyph("clipboard"),
   close: glyph("cancel"), // the "X" — close / dismiss / cancel only
   code: glyph("braces"),
+  collapse: glyph("collapse"),
   columns: glyph("grid-3x2"),
   components: glyph("blocks"),
   copy: glyph("copy"),
@@ -49,6 +51,7 @@ export const Icon = {
   datasetAdd: glyph("database-zap"),
   delete: glyph("trash"), // the ONLY delete glyph (never the Cancel "X")
   diff: glyph("git-pull-request"),
+  discord: DiscordIcon,
   docs: glyph("book-open"),
   download: glyph("download"),
   edit: glyph("pen-square"),
@@ -63,7 +66,9 @@ export const Icon = {
   finetuning: BarbellVertical,
   folder: glyph("folder"),
   folderAdd: glyph("folder-plus"),
+  folderOpen: glyph("folder-open"),
   forward: glyph("arrow-right"),
+  fullscreen: glyph("scale"),
   gitBranch: glyph("git-branch"),
   grid: glyph("grid-3x3"),
   hash: glyph("hash"),
@@ -110,6 +115,7 @@ export const Icon = {
   sort: glyph("sort-vertical"),
   sortable: glyph("chevrons-vertical"),
   stop: glyph("power-off"),
+  subtract: glyph("minus"),
   success: glyph("check"),
   successDouble: glyph("check-double"),
   target: glyph("target"),
@@ -124,6 +130,7 @@ export const Icon = {
   view: glyph("eye"),
   warning: glyph("warning-diamond"),
   workshop: glyph("settings-cog-2"),
+  workshopTitle: TitleChart,
   zap: glyph("zap"),
 } as const;
 

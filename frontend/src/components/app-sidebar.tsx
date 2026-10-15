@@ -33,6 +33,7 @@ import { useFinetuningJobsQuery } from "@/hooks/use-finetuning";
 import { useGuestGate } from "@/hooks/use-guest-gate";
 import { useOptimizerExperimentsQuery } from "@/hooks/use-optimizer";
 import { useOnboardingStatus } from "@/hooks/use-query";
+import { useUnseenSignalCountQuery } from "@/hooks/use-signals";
 import { featureFlags } from "@/lib/feature-flags";
 import { PUBLIC_PRICING_URL } from "@/lib/marketing";
 import { isMac } from "@/lib/platform";
@@ -112,25 +113,8 @@ export const navLinks: NavLeaf[] = [
 
 const externalLinks = [
   { href: "https://docs.overmindlab.ai", icon: Icon.docs, label: "Docs" },
-  { href: "https://discord.gg/TPF722ZKuj", icon: DiscordIcon, label: "Discord" },
+  { href: "https://discord.gg/TPF722ZKuj", icon: Icon.discord, label: "Discord" },
 ];
-
-function DiscordIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      aria-hidden="true"
-      className={className}
-      fill="none"
-      viewBox="0 0 16 16"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <path
-        d="M14.6667 7.33335V5.33335H14V4.00002H13.3333V3.33335H12V2.66669H10V3.33335H6V2.66669H4V3.33335H2.66666V4.00002H2V5.33335H1.33333V7.33335H0.666664V12H2V12.6667H3.33333V13.3334H4.66666V12H4V11.3334H5.33333V12H6V12.6667H10V12H10.6667V11.3334H12V12H11.3333V13.3334H12.6667V12.6667H14V12H15.3333V7.33335H14.6667ZM6 10H4.66666V9.33335H4V8.00002H4.66666V7.33335H6V8.00002H6.66666V9.33335H6V10ZM12 9.33335H11.3333V10H10V9.33335H9.33333V8.00002H10V7.33335H11.3333V8.00002H12V9.33335Z"
-        fill="currentColor"
-      />
-    </svg>
-  );
-}
 
 const isLeafActive = (pathname: string, to: string): boolean =>
   pathname === to || (to !== "/" && pathname.startsWith(to));
@@ -150,6 +134,8 @@ function useNavJobBadges(): Record<string, NavJobBadge> {
   const evalQuery = useAllEvalRunsQuery(projectId);
   const optimizerQuery = useOptimizerExperimentsQuery(projectId);
   const unseen = useUnseenCompletions();
+  const unseenSignals =
+    useUnseenSignalCountQuery(featureFlags.signals ? projectId : undefined).data ?? 0;
 
   const running = buildRunningJobs({
     evalRuns: evalQuery.data?.results,
@@ -179,6 +165,7 @@ function useNavJobBadges(): Record<string, NavJobBadge> {
     const runningCount = runningByRoute[route] ?? 0;
     if (runningCount > 0) badges[route] = { count: runningCount, tone: "running" };
   }
+  if (unseenSignals > 0) badges["/observability"] = { count: unseenSignals, tone: "success" };
   return badges;
 }
 
@@ -211,7 +198,10 @@ function NavLink({
         <Link
           className="!py-2.5"
           onClick={handleClick}
-          search={(e) => ({ projectId: e.projectId })}
+          search={(e) => ({
+            projectId: e.projectId,
+            ...(to === "/observability" ? { view: "sessions" } : {}),
+          })}
           to={to}
         >
           <Icon className="!size-[17px]" />
@@ -259,8 +249,8 @@ function NavGroupItem({
                   // connector. Every trunk starts at one shared point 0.75rem
                   // above the FIRST row's centre and ends at its own row's
                   // centre — hence the row pitch (2rem) times index. The active
-                  // line is raised above the muted ones, and its colour stays
-                  // a sidebar token, never a hard `#fff`.
+                  // line is raised above the muted ones, and its colour must
+                  // stay on the sidebar's semantic palette.
                   className={cn("sidebar-elbow", active && "z-10")}
                   key={item.to}
                   style={

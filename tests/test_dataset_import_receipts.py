@@ -13,11 +13,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from conftest import read_table
 from django.utils import timezone
 
 from overbae.models import Dataset, DatasetImport, Project
-from overbae.services.datasets import dispatch, files, imports
+from overbae.services.datasets import dispatch, files
 from overbae.services.datasets.lifecycle import DatasetError
 from overbae.tasks import datasets as dataset_tasks
 from overbae.tasks.cleanup_tmp import cleanup_uploads
@@ -29,7 +28,7 @@ pytestmark = pytest.mark.django_db(transaction=True)
 def imported_source(tmp_path, settings, monkeypatch):
     settings.MEDIA_ROOT = tmp_path
     project = Project.objects.create(name="Queued imports", slug=f"imports-{uuid.uuid4().hex[:10]}")
-    upload_id, filename = files.begin_upload("passengers.csv", project=project.id)
+    upload_id, filename = files.begin_upload("passengers.csv")
     files.append_chunk(upload_id, 0, b"passenger_id,survived\n1,0\n2,1\n")
     files.inspect_upload(upload_id, size=files.upload_received(upload_id))
     deliveries = []
@@ -107,7 +106,7 @@ def test_queue_age_does_not_count_as_execution_age(imported_source, settings):
         updated_at=old,
         queued_at=old,
     )
-    imports.reconcile()
+    dataset_tasks.reap_stuck_runs()
     dataset.refresh_from_db()
     run.refresh_from_db()
     assert dataset.state == "landing" and dataset.error == ""
@@ -134,7 +133,7 @@ def test_claim_starts_a_new_execution_clock_after_long_queue_wait(imported_sourc
     old = timezone.now() - timedelta(minutes=66)
     Dataset.objects.filter(pk=dataset.pk).update(updated_at=old)
     assert imports.claim(run.pk) is not None
-    imports.reconcile()
+    dataset_tasks.reap_stuck_runs()
     dataset.refresh_from_db()
     assert dataset.state == "landing"
     assert dataset.updated_at > old
@@ -287,8 +286,10 @@ def test_split_outputs_share_one_durable_import(imported_source):
     assert len(deliveries) == 1
 
 
-def test_real_csv_lands_once_and_retains_no_source_after_commit(imported_source, monkeypatch):
-    from overbae.services.datasets import imports, paths
+def test_real_csv_lands_once_and_retains_original_without_automatic_preparation(
+    imported_source, monkeypatch
+):
+    from overbae.services.datasets import imports, paths, store
 
     dataset, run = create_import(imported_source)
     result = imports.execute(str(run.pk), run.inputs)
@@ -296,16 +297,21 @@ def test_real_csv_lands_once_and_retains_no_source_after_commit(imported_source,
     dataset.refresh_from_db()
     run.refresh_from_db()
     assert dataset.state == "idle" and run.state == "complete"
-    assert dataset.cells.count() == 1 and dataset.active_id == dataset.source.pk
-    frame = read_table(paths.cell_path(dataset.pk, dataset.source.pk))
+    assert dataset.cells.count() == 1
+    frame = store.read_frame(paths.cell_path(dataset.pk, dataset.source.pk))
     assert frame["passenger_id"].tolist() == [1, 2]
     assert frame["survived"].tolist() == [0, 1]
     assert not files.upload_data_path(imported_source[1]).exists()
+    retained = dataset.source_spec["sources"][0]
+    assert (
+        paths.source_path(dataset.pk, retained["id"]).read_bytes()
+        == b"passenger_id,survived\n1,0\n2,1\n"
+    )
     assert imports.execute(str(run.pk), run.inputs) == {"status": "complete"}
     assert dataset.cells.count() == 1
 
 
-def test_resume_import_requeues_a_blocked_source_import(imported_source):
+def test_existing_run_action_resumes_blocked_source_import(imported_source, monkeypatch):
     from overbae.services.datasets import imports
 
     dataset, run = create_import(imported_source)
@@ -313,12 +319,10 @@ def test_resume_import_requeues_a_blocked_source_import(imported_source):
     imports.fail(claim, "The worker stopped before publication.")
     dataset.refresh_from_db()
     assert dataset.state == "error" and dataset.source is None
-    dataset = dispatch.resume_import(dataset)
+    dataset = imports.resume_dataset(dataset)
     run.refresh_from_db()
     assert dataset.state == "landing" and run.state == "queued"
     assert imports.execute(str(run.pk), run.inputs) == {"status": "ok", "rows": 2}
-    with pytest.raises(DatasetError, match="not blocked"):
-        dispatch.resume_import(dataset)
 
 
 def test_adopting_an_existing_message_does_not_publish_again(imported_source):
@@ -388,7 +392,7 @@ def test_receipt_adoption_cannot_be_overwritten_by_a_stale_reaper(imported_sourc
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_backend_pid()")
                 backend_ids.put(cursor.fetchone()[0])
-            return imports.reconcile()
+            return dataset_tasks.reap_stuck_runs()
         finally:
             connection.close()
 

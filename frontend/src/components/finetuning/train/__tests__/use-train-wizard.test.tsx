@@ -12,7 +12,13 @@ const mocks = vi.hoisted(() => ({
     isError: false,
   },
   create: vi.fn(),
-  evals: { results: [{ capability: null, id: "eval", name: "Evaluation", project: "project" }] },
+  estimate: vi.fn(),
+  estimateResults: [] as unknown[],
+  evals: {
+    results: [
+      { active: "eval-cell", capability: null, id: "eval", name: "Evaluation", project: "project" },
+    ],
+  },
   overlapCount: 0,
   queries: vi.fn(),
   recommend: vi.fn(),
@@ -37,13 +43,16 @@ const mocks = vi.hoisted(() => ({
       { capability: null, id: "set", name: "General", project: "project" },
     ],
   },
-  train: { results: [{ capability: "cap", id: "train", name: "Training" }] },
+  train: { results: [{ active: "train-cell", capability: "cap", id: "train", name: "Training" }] },
   validate: vi.fn(),
+}));
+vi.mock("@/client", () => ({
+  default: { finetuningJobs: { finetuningJobsEstimateCreate: mocks.estimate } },
 }));
 vi.mock("@tanstack/react-query", () => ({
   useQueries: (options: { queries: unknown[] }) => {
     mocks.queries(options);
-    return options.queries.map(() => ({ data: undefined }));
+    return options.queries.map((_, index) => ({ data: mocks.estimateResults[index] }));
   },
   useQuery: () => mocks.context,
 }));
@@ -52,6 +61,14 @@ vi.mock("@/hooks/use-capability-eval-preload", () => ({ useCapabilityEvalPreload
 vi.mock("@/hooks/use-subscription", () => ({ useCredits: () => ({ hasCredits: true }) }));
 vi.mock("@/hooks/use-evaluations", () => ({
   useEvalSetsQuery: () => ({ data: mocks.sets }),
+  useModelCatalogQuery: () => ({
+    data: {
+      models: [
+        { id: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol" },
+        { id: "anthropic/claude-sonnet-5", name: "Claude Sonnet 5" },
+      ],
+    },
+  }),
   useProjectCapabilitiesQuery: () => ({
     data: { results: [{ id: "cap", model: "openai/gpt-5.6-sol" }] },
   }),
@@ -72,6 +89,9 @@ vi.mock("@/hooks/use-finetuning", () => ({
 }));
 beforeEach(() => {
   mocks.recommendation.excluded = [];
+  mocks.recommendation.candidates = [mocks.recommendation.candidates[0]];
+  mocks.recommendation.shown = ["model"];
+  mocks.estimateResults = [];
   mocks.catalog.backend = "baseten";
   mocks.overlapCount = 0;
   mocks.train.results[0].capability = "cap";
@@ -85,9 +105,85 @@ afterEach(() => {
 const args = {
   groupId: "group",
   initialDatasetId: "train",
+  initialEvalDatasetId: "eval",
   onLaunched: vi.fn(),
   projectId: "project",
 };
+
+it.each([
+  "baseten",
+  "modal",
+  "together",
+])("uses the same default %s monitoring policy for forecasting and launch", async (backend) => {
+  mocks.catalog.backend = backend;
+  const { result } = renderHook(() => useTrainWizard({ ...args, initialEvalDatasetId: undefined }));
+  await waitFor(() => expect(result.current.canLaunch).toBe(true));
+  const latest = mocks.queries.mock.calls.at(-1)![0];
+  await latest.queries[0].queryFn();
+  await act(() => result.current.launch());
+  expect(
+    mocks.estimate.mock.calls.at(-1)![0].finetuningEstimateRequestRequest.hyperparameters.monitoring
+  ).toEqual(mocks.create.mock.calls.at(-1)![0][0].hyperparameters.monitoring);
+  expect(mocks.create.mock.calls.at(-1)![0][0].hyperparameters.monitoring).toEqual({
+    early_stopping: null,
+    interval_steps: null,
+    loss_sample: 2048,
+    max_checks: 12,
+    mode: backend === "together" ? "off" : "adaptive",
+    overhead_fraction: 0.1,
+    selection: "last",
+    target_seconds: 300,
+    train_sample: 256,
+  });
+});
+
+it("starts without optional evaluations and launches with the standard validation split", async () => {
+  const { result } = renderHook(() => useTrainWizard({ ...args, initialEvalDatasetId: undefined }));
+  await waitFor(() => expect(result.current.canLaunch).toBe(true));
+  expect(result.current.evaluationEnabled).toBe(false);
+  expect(result.current.evaluationPlan).toEqual({
+    evalIncumbentAfter: false,
+    evalIncumbentBefore: false,
+    evalModelAfter: false,
+    evalModelBefore: false,
+  });
+  await act(() => result.current.launch());
+  expect(mocks.create).toHaveBeenCalledWith([
+    expect.objectContaining({
+      evalDataset: null,
+      evalModelAfter: false,
+      evalModelBefore: false,
+      evalSet: null,
+      splitMethod: "random",
+      validationEnabled: true,
+      validationSplitRatio: 0.2,
+    }),
+  ]);
+});
+
+it("summarizes selected model ranges without falling back to a point estimate", async () => {
+  mocks.recommendation.shown.push("second-model");
+  mocks.recommendation.candidates.push({
+    ...mocks.recommendation.candidates[0],
+    model: "second-model",
+  });
+  mocks.estimateResults = [
+    {
+      forecast: { training_seconds: [60, 600] },
+      timeEstimate: { human: "1–10 min", seconds: null },
+    },
+    {
+      forecast: { training_seconds: [120, 300] },
+      timeEstimate: { human: "2–5 min", seconds: null },
+    },
+  ];
+  const { result, rerender } = renderHook(() => useTrainWizard(args));
+  await waitFor(() => expect(result.current.selectedDrafts).toHaveLength(2));
+  expect(result.current.totals.longest).toBe("2–10 min");
+  mocks.estimateResults = [mocks.estimateResults[0], undefined];
+  rerender();
+  expect(result.current.totals.longest).toBeNull();
+});
 
 it("keeps context warnings advisory", async () => {
   const { result } = renderHook(() => useTrainWizard(args));
@@ -130,6 +226,7 @@ it("launches Modal jobs without starting or waiting for setup preprocessing", as
   expect(queries.length).toBeGreaterThan(0);
   expect(queries.every((query) => query.queryKey[0] === "finetuning-estimate")).toBe(true);
   expect(mocks.validate).toHaveBeenCalledExactlyOnceWith({
+    cellId: "train-cell",
     datasetId: "train",
     splitMethod: "random",
     validationDatasetId: null,
@@ -142,7 +239,9 @@ it("launches Modal jobs without starting or waiting for setup preprocessing", as
   expect(mocks.create).toHaveBeenCalledWith([
     expect.objectContaining({
       baseModel: "model",
+      cell: "train-cell",
       dataset: "train",
+      evalCell: "eval-cell",
       evalDataset: "eval",
       splitMethod: "random",
       validationDataset: null,
@@ -163,133 +262,40 @@ it("allows launch with overlap and a different dataset capability", async () => 
   expect(mocks.create).toHaveBeenCalled();
 });
 
-it("defaults to the codebase incumbent and sends the selected benchmark with this run", async () => {
+it("defaults to trained-only evaluation and enables a matched benchmark comparison", async () => {
   const { result } = renderHook(() => useTrainWizard({ ...args, initialCapabilityId: "cap" }));
   await waitFor(() => expect(result.current.canLaunch).toBe(true));
-  expect(result.current.benchmarkModel).toBe("openai/gpt-5.6-sol");
-  expect(result.current.benchmarkOptions.map((option) => option.value)).toEqual([
-    "openai/gpt-5.6-sol",
-    "ft-trained",
-  ]);
-  act(() => {
-    result.current.setBenchmarkModel("ft-trained");
-    result.current.setEvaluationChoice("evalIncumbentBefore", true);
-    result.current.setEvaluationChoice("evalIncumbentAfter", true);
-  });
-  await act(() => result.current.launch());
-  expect(mocks.create).toHaveBeenCalledWith([
-    expect.objectContaining({
-      baselineModel: "ft-trained",
-      evalIncumbentAfter: true,
-      evalIncumbentBefore: true,
-    }),
-  ]);
-  act(() => result.current.setBenchmarkModel("openai/gpt-5.6-sol"));
-  await act(() => result.current.launch());
-  expect(mocks.create).toHaveBeenLastCalledWith([
-    expect.objectContaining({ baselineModel: "openai/gpt-5.6-sol" }),
-  ]);
-});
-
-it("allows benchmarking a trained model without a capability", async () => {
-  const { result } = renderHook(() => useTrainWizard(args));
-  await waitFor(() => expect(result.current.canLaunch).toBe(true));
-  act(() => {
-    result.current.setBenchmarkModel("ft-trained");
-    result.current.setEvaluationChoice("evalIncumbentBefore", true);
-  });
-  expect(result.current.hasIncumbent).toBe(true);
-  await act(() => result.current.launch());
-  expect(mocks.create).toHaveBeenCalledWith([
-    expect.objectContaining({
-      baselineModel: "ft-trained",
-      capability: null,
-      evalIncumbentBefore: true,
-    }),
-  ]);
-});
-
-it("resets the benchmark when changing capability", async () => {
-  const { result } = renderHook(() => useTrainWizard({ ...args, initialCapabilityId: "cap" }));
-  await waitFor(() => expect(result.current.canLaunch).toBe(true));
-  act(() => result.current.setBenchmarkModel("ft-trained"));
-  act(() => result.current.setCapabilityId(""));
-  expect(result.current.benchmarkModel).toBe("");
-  expect(result.current.hasIncumbent).toBe(false);
-});
-
-it("does not silently switch away from an unavailable selected benchmark", async () => {
-  const { result } = renderHook(() => useTrainWizard({ ...args, initialCapabilityId: "cap" }));
-  await waitFor(() => expect(result.current.canLaunch).toBe(true));
-  act(() => result.current.setBenchmarkModel("ft-deleted"));
-  expect(result.current.launchBlocker).toBe("Select an available benchmark model");
-  await act(() => result.current.launch());
-  expect(mocks.create).not.toHaveBeenCalled();
-});
-
-it("launches with no capability and a project-scoped unassigned eval set", async () => {
-  const { result } = renderHook(() => useTrainWizard(args));
-  await waitFor(() => expect(result.current.canLaunch).toBe(true));
-  expect(result.current.capabilityId).toBe("");
-  expect(result.current.evalSets.map((set) => set.id)).toEqual(["set"]);
-  expect(mocks.recommend).toHaveBeenCalledWith("train", undefined, "eval");
-  await act(() => result.current.launch());
-  expect(mocks.create).toHaveBeenCalledWith([
-    expect.objectContaining({
-      capability: null,
-      dataset: "train",
-      evalDataset: "eval",
-      evalIncumbentAfter: false,
-      evalIncumbentBefore: false,
-      evalModelAfter: true,
-      evalModelBefore: true,
-      evalSet: "set",
-    }),
-  ]);
-});
-
-it("preserves independently selected eval choices in the launch payload", async () => {
-  const { result } = renderHook(() => useTrainWizard({ ...args, initialCapabilityId: "cap" }));
-  await waitFor(() => expect(result.current.canLaunch).toBe(true));
+  expect(result.current.benchmarkModels).toEqual(["openai/gpt-5.6-sol"]);
   expect(result.current.evaluationPlan).toEqual({
     evalIncumbentAfter: false,
     evalIncumbentBefore: false,
     evalModelAfter: true,
-    evalModelBefore: true,
+    evalModelBefore: false,
   });
   act(() => {
-    result.current.setEvaluationChoice("evalIncumbentBefore", false);
-    result.current.setEvaluationChoice("evalIncumbentAfter", true);
-    result.current.setEvaluationChoice("evalModelBefore", true);
-    result.current.setEvaluationChoice("evalModelAfter", false);
+    result.current.setBenchmarkingEnabled(true);
+    result.current.toggleBenchmarkModel("anthropic/claude-sonnet-5");
   });
+  expect(result.current.evaluationPlan.evalModelBefore).toBe(true);
   await act(() => result.current.launch());
   expect(mocks.create).toHaveBeenCalledWith([
     expect.objectContaining({
-      evalIncumbentAfter: true,
-      evalIncumbentBefore: false,
-      evalModelAfter: false,
+      baselineModel: "openai/gpt-5.6-sol",
+      benchmarkModels: ["openai/gpt-5.6-sol", "anthropic/claude-sonnet-5"],
+      evalIncumbentAfter: false,
+      evalIncumbentBefore: true,
+      evalModelAfter: true,
       evalModelBefore: true,
     }),
   ]);
 });
 
-it("allows all evals off without bypassing dataset and eval-set selection", async () => {
-  const { result } = renderHook(() => useTrainWizard(args));
+it("resets benchmark selection when changing capability", async () => {
+  const { result } = renderHook(() => useTrainWizard({ ...args, initialCapabilityId: "cap" }));
   await waitFor(() => expect(result.current.canLaunch).toBe(true));
-  act(() => {
-    result.current.setEvaluationChoice("evalModelBefore", false);
-    result.current.setEvaluationChoice("evalModelAfter", false);
-  });
-  await act(() => result.current.launch());
-  expect(mocks.create).toHaveBeenCalledWith([
-    expect.objectContaining({
-      evalIncumbentAfter: false,
-      evalIncumbentBefore: false,
-      evalModelAfter: false,
-      evalModelBefore: false,
-    }),
-  ]);
+  act(() => result.current.toggleBenchmarkModel("anthropic/claude-sonnet-5"));
+  act(() => result.current.setCapabilityId(""));
+  expect(result.current.benchmarkModels).toEqual([]);
 });
 
 it("does not infer a capability from dataset picks and keeps unassigned eval sets available", async () => {
@@ -302,7 +308,8 @@ it("does not infer a capability from dataset picks and keeps unassigned eval set
 });
 
 it.each(["evals", "sets"] as const)("still requires %s when capability is none", async (field) => {
-  const saved = mocks[field];
+  const savedEvals = mocks.evals;
+  const savedSets = mocks.sets;
   mocks[field] = { results: [] };
   try {
     const { result } = renderHook(() => useTrainWizard(args));
@@ -312,6 +319,112 @@ it.each(["evals", "sets"] as const)("still requires %s when capability is none",
       field === "evals" ? "Select an eval dataset" : "Select an eval set"
     );
   } finally {
-    mocks[field] = saved;
+    mocks.evals = savedEvals;
+    mocks.sets = savedSets;
   }
+});
+
+it.each([
+  true,
+  false,
+])("launches a native contract with baseline %s and reuses its request identity", async (baseline) => {
+  mocks.catalog.backend = "modal";
+  mocks.validate.mockResolvedValue({ format: "decision", valid: true });
+  const { result } = renderHook(() => useTrainWizard(args));
+  await waitFor(() => expect(result.current.drafts.length).toBeGreaterThan(0));
+  act(() =>
+    result.current.updateDraft(result.current.drafts[0].id, {
+      ...result.current.drafts[0],
+      useLora: true,
+    })
+  );
+  await waitFor(() => expect(result.current.canLaunch).toBe(true));
+  act(() => {
+    result.current.setEvalDatasetId("");
+    result.current.setEvalSetId("");
+  });
+  expect(result.current.preTrainingBaseline).toBe(true);
+  act(() => result.current.setPreTrainingBaseline(baseline));
+  const queries = mocks.queries.mock.calls.at(-1)?.[0].queries;
+  await queries[0].queryFn();
+  expect(mocks.estimate).toHaveBeenLastCalledWith({
+    finetuningEstimateRequestRequest: expect.objectContaining({
+      hyperparameters: expect.objectContaining({ pre_training_baseline: baseline }),
+      validationEnabled: true,
+    }),
+  });
+  await act(() => result.current.launch());
+  await act(() => result.current.launch());
+  expect(mocks.create).toHaveBeenCalledTimes(2);
+  const first = mocks.create.mock.calls[0][0][0];
+  expect(first).toEqual(
+    expect.objectContaining({
+      evalDataset: null,
+      evalModelAfter: false,
+      evalModelBefore: false,
+      evalSet: null,
+      hyperparameters: expect.objectContaining({
+        objective: "decision_cross_entropy",
+        pre_training_baseline: baseline,
+      }),
+      validationEnabled: true,
+    })
+  );
+  expect(first.requestKey).toBe(mocks.create.mock.calls[1][0][0].requestKey);
+});
+
+it("does not attach chat evaluation settings to a native run opened from eval data", async () => {
+  mocks.catalog.backend = "modal";
+  mocks.validate.mockResolvedValue({ format: "decision", valid: true });
+  const { result } = renderHook(() => useTrainWizard({ ...args, initialCapabilityId: "cap" }));
+  await waitFor(() => expect(result.current.drafts.length).toBeGreaterThan(0));
+  act(() =>
+    result.current.updateDraft(result.current.drafts[0].id, {
+      ...result.current.drafts[0],
+      useLora: true,
+    })
+  );
+  await waitFor(() => expect(result.current.canLaunch).toBe(true));
+  await act(() => result.current.launch());
+  expect(mocks.create).toHaveBeenCalledWith([
+    expect.objectContaining({
+      evalDataset: null,
+      evalJudgeModel: "",
+      evalModelAfter: false,
+      evalSet: null,
+    }),
+  ]);
+  expect(mocks.create.mock.calls[0][0][0].baselineModel).toBeUndefined();
+});
+
+it("uses the same standard validation split for checks, estimates and launch", async () => {
+  const { result } = renderHook(() => useTrainWizard(args));
+  await waitFor(() => expect(result.current.canLaunch).toBe(true));
+  expect(mocks.validate).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      cellId: "train-cell",
+      splitMethod: "random",
+      validationDatasetId: null,
+      validationEnabled: true,
+      validationSplitRatio: 0.2,
+    })
+  );
+  const options = mocks.queries.mock.lastCall?.[0];
+  await options.queries[0].queryFn();
+  expect(mocks.estimate).toHaveBeenLastCalledWith({
+    finetuningEstimateRequestRequest: expect.objectContaining({
+      splitMethod: "random",
+      validationEnabled: true,
+      validationSplitRatio: 0.2,
+    }),
+  });
+  await act(() => result.current.launch());
+  expect(mocks.create).toHaveBeenLastCalledWith([
+    expect.objectContaining({
+      splitMethod: "random",
+      validationDataset: null,
+      validationEnabled: true,
+      validationSplitRatio: 0.2,
+    }),
+  ]);
 });

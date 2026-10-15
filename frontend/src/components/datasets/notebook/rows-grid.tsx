@@ -39,19 +39,6 @@ const FILTER_OPS: Array<{ value: RowFilter["op"]; label: string; needsValue: boo
 
 type Row = Record<string, unknown> & { _index: number };
 
-interface Evidence {
-  filename?: string;
-  page?: number | null;
-}
-
-function evidenceOf(row: Row): string[] {
-  const provenance = row._overmind_provenance as { evidence?: Evidence[] } | null | undefined;
-  return (provenance?.evidence ?? []).map((piece) =>
-    // `element` is the extractor's internal reference (`#/texts/1`), not something to read.
-    [piece.filename, piece.page != null ? `page ${piece.page}` : ""].filter(Boolean).join(" · ")
-  );
-}
-
 function fullText(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;
@@ -98,71 +85,6 @@ function ChangedValue({
   );
 }
 
-interface Turn {
-  role?: unknown;
-  content?: unknown;
-  tool_calls?: Array<{ function?: { name?: unknown; arguments?: unknown } }>;
-}
-
-/** A messages value: a list of chat turns, possibly stored as a JSON string. */
-function turnsOf(value: unknown): Turn[] | null {
-  let parsed = value;
-  if (typeof value === "string" && value.trimStart().startsWith("[")) {
-    try {
-      parsed = JSON.parse(value);
-    } catch {
-      return null;
-    }
-  }
-  return Array.isArray(parsed) &&
-    parsed.length > 0 &&
-    parsed.every((turn) => !!turn && typeof turn === "object" && "role" in turn)
-    ? (parsed as Turn[])
-    : null;
-}
-
-function contentText(content: unknown): string {
-  if (content === null || content === undefined) return "";
-  if (typeof content === "string") return content;
-  if (Array.isArray(content))
-    return content
-      .map((part) =>
-        part && typeof part === "object" && "text" in part ? String(part.text) : cellText(part)
-      )
-      .join(" ");
-  return cellText(content);
-}
-
-function turnText(turn: Turn | undefined): string {
-  if (!turn) return "";
-  const calls = (turn.tool_calls ?? [])
-    .map(
-      (call) => `→ ${String(call.function?.name ?? "tool")}(${cellText(call.function?.arguments)})`
-    )
-    .join("\n");
-  return [contentText(turn.content), calls].filter(Boolean).join("\n");
-}
-
-const summaryOf = (turns: Turn[]) =>
-  turns.map((turn) => `${String(turn.role)}: ${turnText(turn)}`).join("  ");
-
-function Conversation({ turns, before }: { turns: Turn[]; before: Turn[] | null }) {
-  return (
-    <span className="grid min-w-80 grid-cols-[4.5rem_1fr] gap-x-2 gap-y-1.5">
-      {turns.map((turn, index) => (
-        <Fragment key={`${index}-${String(turn.role)}`}>
-          <span className="pixel-label pt-px text-muted-foreground">{String(turn.role)}</span>
-          {before ? (
-            <ChangedValue after={turnText(turn)} before={turnText(before[index])} wrap />
-          ) : (
-            <span className="whitespace-pre-wrap break-words">{turnText(turn)}</span>
-          )}
-        </Fragment>
-      ))}
-    </span>
-  );
-}
-
 function TypeMark({ type }: { type: string }) {
   if (type === "number" || type === "integer") {
     return <span className="w-3 text-center font-mono text-muted-foreground">#</span>;
@@ -201,6 +123,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 /** One column's profile: fill, distinct values, range or lengths, and the
  *  values that occur most, each with its share of the rows. */
 function ColumnStatsCard({ column, total }: { column: ColumnStat; total: number }) {
+  const denominator = column.approximate ? column.sampleRows : total;
   const filled = Math.round((1 - column.nullRate) * 100);
   const numeric = column.mean !== undefined && column.mean !== null;
   const stats: Array<{ label: string; value: string }> = [
@@ -238,10 +161,16 @@ function ColumnStatsCard({ column, total }: { column: ColumnStat; total: number 
           <span className="pixel-label ml-auto text-xs text-muted-foreground">{column.type}</span>
         </div>
         <div className="mt-2.5 flex flex-col gap-1">
+          {column.approximate && (
+            <p className="text-xs text-muted-foreground">
+              Sample: {column.sampleRows.toLocaleString()} of {column.totalRows.toLocaleString()}{" "}
+              rows. Statistics describe this sample.
+            </p>
+          )}
           <div className="flex items-center justify-between text-xs">
             <span className="pixel-label text-muted-foreground">Filled</span>
             <span className="font-mono tabular-nums text-foreground">
-              {filled}% of {total.toLocaleString()}
+              {filled}% of {denominator.toLocaleString()}
             </span>
           </div>
           <div className="h-1.5 w-full overflow-hidden rounded-xs bg-muted">
@@ -315,61 +244,79 @@ function FilterAdd({ columns, onAdd }: { columns: string[]; onAdd: (f: RowFilter
   return (
     <Popover onOpenChange={setOpen} open={open}>
       <PopoverTrigger asChild>
-        <Button size="xs" variant="outline">
+        <Button
+          className="relative -ml-px rounded-l-none focus-visible:z-10"
+          size="xs"
+          variant="outline"
+        >
           <Icon.filter />
           Filter
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-80 p-3">
-        <div className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2 text-xs">
+      <PopoverContent
+        align="start"
+        aria-label="Filter rows"
+        className="w-72 max-w-[calc(100vw-2rem)] p-0 text-xs"
+      >
+        <div className="grid grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-2 border-b border-border/70 px-2.5 py-1.5">
           <span className="text-muted-foreground">Column</span>
           <Select onValueChange={(v) => setDraft({ ...draft, field: v })} value={draft.field}>
-            <SelectTrigger aria-label="Column" className="w-full" size="sm">
+            <SelectTrigger
+              aria-label="Column"
+              className="w-full border-border bg-transparent hover:bg-accent/50"
+              size="xs"
+            >
               <SelectValue placeholder="Column" />
             </SelectTrigger>
             <SelectContent>
               {columns.map((c) => (
-                <SelectItem key={c} value={c}>
+                <SelectItem className="text-xs" key={c} value={c}>
                   {c}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
+        </div>
+        <div className="grid grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-2 border-b border-border/70 px-2.5 py-1.5">
           <span className="text-muted-foreground">Condition</span>
           <Select
             onValueChange={(v) => setDraft({ ...draft, op: v as RowFilter["op"] })}
             value={draft.op}
           >
-            <SelectTrigger aria-label="Condition" className="w-full" size="sm">
+            <SelectTrigger
+              aria-label="Condition"
+              className="w-full border-border bg-transparent hover:bg-accent/50"
+              size="xs"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
               {FILTER_OPS.map((o) => (
-                <SelectItem key={o.value} value={o.value}>
+                <SelectItem className="text-xs" key={o.value} value={o.value}>
                   {o.label}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-          {needsValue && (
-            <>
-              <span className="text-muted-foreground">Value</span>
-              <Input
-                aria-label="Value"
-                autoFocus
-                onChange={(e) => setDraft({ ...draft, value: e.target.value })}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") add();
-                }}
-                size="sm"
-                value={draft.value ?? ""}
-              />
-            </>
-          )}
         </div>
-        <div className="mt-3 flex justify-end">
-          <Button onClick={add} size="sm">
-            Add
+        {needsValue && (
+          <div className="grid grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-2 border-b border-border/70 px-2.5 py-1.5">
+            <span className="text-muted-foreground">Value</span>
+            <Input
+              aria-label="Value"
+              className="border-border"
+              onChange={(e) => setDraft({ ...draft, value: e.target.value })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") add();
+              }}
+              size="xs"
+              value={draft.value ?? ""}
+            />
+          </div>
+        )}
+        <div className="flex justify-end px-2.5 py-1.5">
+          <Button onClick={add} size="xs" variant="secondary">
+            Add filter
           </Button>
         </div>
       </PopoverContent>
@@ -384,12 +331,21 @@ export interface RowsGridProps {
   /** Mark rows added and values changed against the cell before. */
   diff?: boolean;
   pageSize?: number;
+  className?: string;
+  enabled?: boolean;
 }
 
 /** Paged grid over one cell's frame, with server-side sort, search, filters,
  *  and git-style marks: new rows tinted, changed values tinted with the old
  *  value on hover. */
-export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: RowsGridProps) {
+export function RowsGrid({
+  datasetId,
+  cellId,
+  diff = false,
+  pageSize = 10,
+  className,
+  enabled = true,
+}: RowsGridProps) {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(pageSize);
   const [sort, setSort] = useState<{ field: string; dir: "asc" | "desc" } | null>(null);
@@ -403,16 +359,21 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
     setPage(1);
   }, [debouncedSearch, filters, sort]);
 
-  const rowsQuery = useRowsQuery(datasetId, cellId, {
-    diff,
-    dir: sort?.dir,
-    filters,
-    limit,
-    offset: (page - 1) * limit,
-    search: debouncedSearch,
-    sort: sort?.field,
-  });
-  const columnsQuery = useColumnsQuery(datasetId, cellId);
+  const rowsQuery = useRowsQuery(
+    datasetId,
+    cellId,
+    {
+      diff,
+      dir: sort?.dir,
+      filters,
+      limit,
+      offset: (page - 1) * limit,
+      search: debouncedSearch,
+      sort: sort?.field,
+    },
+    enabled
+  );
+  const columnsQuery = useColumnsQuery(datasetId, cellId, enabled);
   const statsByName = useMemo(() => {
     const map = new Map<string, ColumnStat>();
     for (const c of columnsQuery.data ?? []) map.set(c.name, c);
@@ -444,24 +405,31 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
     []
   );
 
+  if (!enabled) return null;
   const narrowing = !!debouncedSearch || filters.length > 0;
 
   return (
-    <div className="flex min-h-0 flex-col">
+    <div className={cn("flex min-h-0 flex-col", className)}>
       <div className="flex flex-wrap items-center gap-1.5 px-2.5 py-1">
-        <SearchInput
-          className="w-44"
-          label="Search rows"
-          onChange={(e) => setSearch(e.target.value)}
-          onClear={() => setSearch("")}
-          placeholder="Search"
-          size="xs"
-          value={search}
-        />
-        <FilterAdd
-          columns={columns.map((c) => c.name)}
-          onAdd={(f) => setFilters([...filters, f])}
-        />
+        <div
+          aria-label="Search and filter rows"
+          className="flex min-w-0 max-w-full items-center [&_input]:rounded-r-none [&_input]:border-border"
+          role="group"
+        >
+          <SearchInput
+            className="flex w-44 min-w-0 focus-within:z-10"
+            label="Search rows"
+            onChange={(e) => setSearch(e.target.value)}
+            onClear={() => setSearch("")}
+            placeholder="Search"
+            size="xs"
+            value={search}
+          />
+          <FilterAdd
+            columns={columns.map((c) => c.name)}
+            onAdd={(f) => setFilters([...filters, f])}
+          />
+        </div>
         {filters.map((f, i) => (
           <Badge
             className="max-w-full gap-1 rounded-sm border-border font-mono"
@@ -504,14 +472,14 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
           </Badge>
         )}
         <span className="flex-1" />
-        {data && narrowing && data.total > 0 && (
+        {data && narrowing && (
           <span className="text-xs tabular-nums text-muted-foreground">
-            {data.total.toLocaleString()} {data.total === 1 ? "row matches" : "rows match"}
+            {data.total.toLocaleString()} match
           </span>
         )}
       </div>
 
-      <div className="nowheel min-h-0 flex-1 overflow-auto overscroll-contain border-t border-border/70">
+      <div className="nowheel min-h-0 flex-1 overflow-auto border-t border-border/70">
         {rowsQuery.isPending ? (
           <div className="flex flex-col gap-1.5 p-2">
             <Skeleton className="h-5 w-full" />
@@ -536,20 +504,24 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
                   const active = sort?.field === c.name;
                   return (
                     <th
+                      aria-sort={
+                        active ? (sort?.dir === "asc" ? "ascending" : "descending") : "none"
+                      }
                       className="max-w-[26rem] border-r border-b border-border/70 px-2 py-1.5 text-left font-normal last:border-r-0"
                       key={c.name}
                       scope="col"
                     >
                       <span className="flex items-center gap-1">
-                        <TypeMark type={c.type} />
                         <button
+                          aria-label={`Sort by ${c.name}`}
                           className={cn(
-                            "flex items-center gap-1 text-foreground hover:underline",
+                            "flex min-h-6 flex-1 items-center gap-1 text-left text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                             active && "font-semibold"
                           )}
                           onClick={() => toggleSort(c.name)}
                           type="button"
                         >
+                          <TypeMark type={c.type} />
                           {c.name}
                           {active ? (
                             sort?.dir === "asc" ? (
@@ -574,10 +546,16 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
                     ? undefined
                     : marks[String(sourceRow)];
                 const open = openRow === rowIndex;
-                const evidence = open ? evidenceOf(row) : [];
+                const evidence =
+                  (
+                    row._overmind_provenance as {
+                      evidence?: Array<{ filename: string; page?: number; element?: string }>;
+                    } | null
+                  )?.evidence ?? [];
                 return (
                   <Fragment key={row._index}>
                     <tr
+                      aria-expanded={open}
                       className={cn(
                         "cursor-pointer hover:bg-accent/40",
                         mark?.added && "bg-success/10",
@@ -589,7 +567,7 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
                         <button
                           aria-expanded={open}
                           aria-label={`${open ? "Collapse" : "Inspect"} row ${row._index}`}
-                          className="rounded-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                          className="w-full text-left hover:text-foreground"
                           onClick={(event) => {
                             event.stopPropagation();
                             setOpenRow(open ? null : rowIndex);
@@ -601,18 +579,13 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
                       </td>
                       {columns.map((c) => {
                         const value = row[c.name];
-                        const turns = turnsOf(value);
-                        const text = turns
-                          ? summaryOf(turns)
-                          : open
-                            ? fullText(value)
-                            : cellText(value);
+                        const text = open ? fullText(value) : cellText(value);
                         const before = mark?.before && c.name in mark.before ? mark.before : null;
-                        const priorTurns = before ? turnsOf(before[c.name]) : null;
                         return (
                           <td
                             className={cn(
                               "max-w-[26rem] border-r border-b border-border/60 px-2 py-1 align-top last:border-r-0",
+                              // Open: the same cells, wrapped to their full text.
                               open ? "whitespace-pre-wrap break-words" : "truncate",
                               c.type === "number" || c.type === "integer"
                                 ? "text-right tabular-nums"
@@ -622,19 +595,7 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
                             key={c.name}
                             title={!open && text.length > 80 ? text.slice(0, 400) : undefined}
                           >
-                            {turns && open ? (
-                              <Conversation
-                                before={before ? (priorTurns ?? []) : null}
-                                turns={turns}
-                              />
-                            ) : turns && before ? (
-                              <ChangedValue
-                                after={text}
-                                before={
-                                  priorTurns ? summaryOf(priorTurns) : cellText(before[c.name])
-                                }
-                              />
-                            ) : before ? (
+                            {before ? (
                               <ChangedValue after={value} before={before[c.name]} wrap={open} />
                             ) : text === "" ? (
                               "null"
@@ -645,15 +606,22 @@ export function RowsGrid({ datasetId, cellId, diff = false, pageSize = 10 }: Row
                         );
                       })}
                     </tr>
-                    {evidence.length > 0 && (
-                      <tr className="bg-accent/20">
-                        <td className="border-r border-b border-border/60" />
+                    {open && evidence.length > 0 && (
+                      <tr>
                         <td
-                          className="border-b border-border/60 px-2 py-1 text-muted-foreground"
-                          colSpan={columns.length}
+                          className="border-b border-border/60 bg-wash-raised px-3 py-2"
+                          colSpan={columns.length + 1}
                         >
-                          <span className="pixel-label mr-2">From</span>
-                          {evidence.join(" · ")}
+                          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                            <span>Source evidence</span>
+                            {evidence.map((item, index) => (
+                              <span key={`${item.filename}-${index}`}>
+                                {item.filename}
+                                {item.page ? ` · page ${item.page}` : ""}
+                                {item.element ? ` · ${item.element}` : ""}
+                              </span>
+                            ))}
+                          </div>
                         </td>
                       </tr>
                     )}

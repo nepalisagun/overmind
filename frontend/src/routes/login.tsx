@@ -59,8 +59,8 @@ function RouteComponent() {
   if (!config.clerkReady) {
     return (
       <SplashBackground>
-        <div className="flex flex-col items-center justify-center gap-5">
-          <LocalLoginForm onSignedIn={() => refreshAuth()} />
+        <div className="mx-4 flex w-full max-w-sm flex-col items-center justify-center gap-5">
+          <LocalLoginForm onSignedIn={refreshAuth} />
         </div>
       </SplashBackground>
     );

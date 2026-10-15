@@ -6,14 +6,12 @@ from unittest.mock import patch
 import pytest
 from conftest import frozen_dataset
 from django.urls import reverse
-from factories import auth_client, make_user
+from factories import auth_client, make_matrix_row, make_user
 
 from overbae.models import (
     Capability,
     Dataset,
     EvalSet,
-    EvalSetMember,
-    Evaluator,
     FinetuningJob,
     Project,
     ProjectMembership,
@@ -60,7 +58,11 @@ def _dataset(
             row["trace_id"] = tid
         rows.append(row)
     return frozen_dataset(
-        project, rows, capability=capability, name=f"{intent}-{uuid.uuid4().hex[:6]}"
+        project,
+        rows,
+        capability=capability,
+        name=f"{intent}-{uuid.uuid4().hex[:6]}",
+        contract=intent,
     )
 
 
@@ -80,6 +82,15 @@ def test_baseten_bills_per_gpu_minute_not_per_token():
     est = estimate_training_cost(1_000_000, total_params_b=8, use_lora=True, backend="baseten")
     assert est is not None
     assert est["usd"] > 0
+
+
+def test_modal_estimate_uses_its_per_second_gpu_rate():
+    tokens = 1_000_000
+    seconds = estimate_training_time_s(tokens, total_params_b=4, use_lora=True)
+    estimate = estimate_training_cost(tokens, total_params_b=4, use_lora=True, backend="modal")
+    assert estimate["usd"] == pytest.approx(round(seconds * 0.001097, 4))
+    baseten = estimate_training_cost(tokens, total_params_b=4, use_lora=True, backend="baseten")
+    assert baseten["usd"] == pytest.approx(round(baseten["billed_minutes"] * 0.10833, 4))
 
 
 def test_cost_estimate_applies_together_minimum_charge():
@@ -291,17 +302,7 @@ def test_job_create_persists_eval_dataset_and_eval_set():
     train = _dataset(p, a, intent="ft", trace_ids=["t1", "t2"])
     eval_ds = _dataset(p, a, intent="eval", trace_ids=["t3"])
     eval_set = EvalSet.objects.create(project=p, capability=a, name="active set")
-    ev = Evaluator.objects.create(
-        project=p,
-        capability=a,
-        name="gate",
-        kind=Evaluator.Kind.DETERMINISTIC,
-        scope=Evaluator.Scope.FINAL_OUTPUT,
-        config={"check": "exact_match"},
-    )
-    EvalSetMember.objects.create(
-        eval_set=eval_set, evaluator=ev, role=EvalSetMember.Role.GENERATIVE, order=0
-    )
+    eval_set.rows.add(make_matrix_row(eval_set.project))
 
     with patch(CELERY_PATH, return_value=type("R", (), {"id": "task-1"})()):
         r = auth_client(u).post(
@@ -378,17 +379,12 @@ def test_job_create_allows_evaluation_that_may_exceed_serving_context():
     u, project, capability = _setup()
     train = _dataset(project, capability, intent="ft", trace_ids=["train"])
     eval_set = EvalSet.objects.create(project=project, capability=capability, name="Evaluation")
-    evaluator = Evaluator.objects.create(
-        project=project,
-        name="Reference match",
-        kind="deterministic",
-        config={"check": "exact_match"},
-    )
-    EvalSetMember.objects.create(eval_set=eval_set, evaluator=evaluator, role="generative")
+    eval_set.rows.add(make_matrix_row(eval_set.project))
     evaluation = frozen_dataset(
         project,
         [{"input": "x" * 120000, "expected_output": "answer"}],
         capability=capability,
+        contract="eval",
     )
     with patch(CELERY_PATH) as submit:
         submit.return_value.id = "context-warning-task"
@@ -417,6 +413,7 @@ def test_recommendation_warns_without_excluding_models_for_evaluation_context():
         project,
         [{"input": "x" * 120000, "expected_output": "answer"}],
         capability=capability,
+        contract="eval",
     )
     response = auth_client(u).post(
         reverse("finetuningjob-recommend"),

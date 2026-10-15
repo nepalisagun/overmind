@@ -1,130 +1,129 @@
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import { cn } from "@/lib/utils";
 import type { Cell } from "@/openapi";
 
-export interface Motion {
-  id: number;
-  kind: "arrival" | "refresh";
+export type CellMotion = { kind: "arrival" | "update"; revision: number };
+export type CompleteCellMotion = (id: string, revision: number) => void;
+
+function contentSignature(cell: Cell) {
+  return JSON.stringify([
+    cell.title,
+    cell.script,
+    cell.note,
+    cell.state,
+    cell.error,
+    cell.rows,
+    cell.columns,
+    cell.fingerprint,
+    cell.review,
+    cell.qualityReport,
+    cell.readiness,
+  ]);
 }
 
-const UNPLAYED_MS = 2000;
-
-const signature = (cell: Cell) =>
-  JSON.stringify([cell.impact, cell.intentReport, cell.capabilityReport, cell.stats]);
-
-export function useVersionMotion(cells: Cell[] | undefined) {
-  const seen = useRef<Map<string, string> | null>(null);
-  const counter = useRef(0);
-  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
-  const [motions, setMotions] = useState<Map<string, Motion>>(() => new Map());
-
-  const settle = useCallback((cellId: string, motionId: number) => {
+export function useCellMotion(cells: Cell[] | undefined, visibleIds: Set<string>) {
+  const previous = useRef<Map<string, string> | null>(null);
+  const revision = useRef(0);
+  const [motions, setMotions] = useState<Map<string, CellMotion>>(new Map());
+  const complete = useCallback<CompleteCellMotion>((id, completedRevision) => {
     setMotions((current) => {
-      if (current.get(cellId)?.id !== motionId) return current;
+      if (current.get(id)?.revision !== completedRevision) return current;
       const next = new Map(current);
-      next.delete(cellId);
+      next.delete(id);
       return next;
     });
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!cells) return;
-    const now = new Map(cells.map((cell) => [cell.id, signature(cell)]));
-    const before = seen.current;
-    seen.current = now;
-    if (!before) return;
-    const fresh: Array<[string, Motion]> = [];
-    for (const [id, sig] of now) {
-      const previous = before.get(id);
-      if (previous === undefined) fresh.push([id, { id: ++counter.current, kind: "arrival" }]);
-      else if (previous !== sig) fresh.push([id, { id: ++counter.current, kind: "refresh" }]);
+    const current = new Map(cells.map((cell) => [cell.id, contentSignature(cell)]));
+    const changes = new Map<string, CellMotion>();
+    if (previous.current) {
+      for (const [id, signature] of current) {
+        if (visibleIds.has(id) && previous.current.get(id) !== signature) {
+          changes.set(id, {
+            kind: previous.current.has(id) ? "update" : "arrival",
+            revision: ++revision.current,
+          });
+        }
+      }
     }
-    if (!fresh.length) return;
-    setMotions((current) => {
-      const next = new Map(current);
-      for (const [id, motion] of fresh) next.set(id, motion);
-      return next;
+    previous.current = current;
+    setMotions((existing) => {
+      const retained = [...existing].filter(([id]) => current.has(id) && visibleIds.has(id));
+      if (!changes.size && retained.length === existing.size) return existing;
+      return new Map([...retained, ...changes]);
     });
-    const timer = setTimeout(() => {
-      timers.current.delete(timer);
-      for (const [id, motion] of fresh) settle(id, motion.id);
-    }, UNPLAYED_MS);
-    timers.current.add(timer);
-  }, [cells, settle]);
+  }, [cells, visibleIds]);
 
   useEffect(() => {
-    const pending = timers.current;
-    return () => {
-      for (const timer of pending) clearTimeout(timer);
-    };
-  }, []);
+    if (!motions.size) return;
+    // Unmeasured or filtered-out nodes must not replay stale arrivals later.
+    const timeout = window.setTimeout(() => {
+      for (const [id, motion] of motions) complete(id, motion.revision);
+    }, 2000);
+    return () => window.clearTimeout(timeout);
+  }, [motions, complete]);
 
-  return { motions, settle };
+  return { complete, motions };
 }
 
-const token = (name: string) =>
-  getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-
-function onScreen(element: Element) {
-  const box = element.getBoundingClientRect();
-  return (
-    document.visibilityState === "visible" &&
-    box.bottom > 0 &&
-    box.top < window.innerHeight &&
-    box.right > 0 &&
-    box.left < window.innerWidth
-  );
-}
-
-export function VersionMotionFrame({
-  cellId,
+export function CellMotionFrame({
+  id,
   motion,
-  placed,
-  settle,
+  ready,
+  complete,
   children,
 }: {
-  cellId: string;
-  motion: Motion | undefined;
-  placed: boolean;
-  settle: (cellId: string, motionId: number) => void;
+  id: string;
+  motion?: CellMotion;
+  ready: boolean;
+  complete: CompleteCellMotion;
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const frame = ref.current;
-    if (!motion || !placed || !frame) return;
-    if (!onScreen(frame)) {
-      settle(cellId, motion.id);
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element || !motion || !ready) return;
+    const bounds = element.getBoundingClientRect();
+    if (
+      document.visibilityState !== "visible" ||
+      bounds.bottom <= 0 ||
+      bounds.top >= window.innerHeight ||
+      bounds.right <= 0 ||
+      bounds.left >= window.innerWidth ||
+      !element.animate
+    ) {
+      complete(id, motion.revision);
       return;
     }
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const surface = frame.querySelector<HTMLElement>("[data-cell-frame]") ?? frame;
-    const animation =
+    const surface = element.querySelector<HTMLElement>("[data-cell-frame]") ?? element;
+    const tokens = getComputedStyle(surface);
+    const target = motion.kind === "arrival" ? element : surface;
+    const animation = target.animate(
       motion.kind === "arrival"
-        ? frame.animate([{ opacity: reduced ? 0.8 : 0.35 }, { opacity: 1 }], {
-            duration: reduced ? 120 : 500,
-            easing: "cubic-bezier(0.16, 1, 0.3, 1)",
-          })
-        : surface.animate(
-            [{ backgroundColor: token("--wash-raised") }, { backgroundColor: token("--card") }],
-            { duration: reduced ? 120 : 500, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }
-          );
-    let finished = false;
-    animation.finished
-      .then(() => {
-        finished = true;
-        settle(cellId, motion.id);
-      })
-      .catch(() => {});
-    return () => {
-      if (!finished) animation.cancel();
-    };
-  }, [cellId, motion, placed, settle]);
+        ? [{ opacity: reduced ? 0.8 : 0.35 }, { opacity: 1 }]
+        : [
+            { backgroundColor: tokens.getPropertyValue("--wash-raised").trim() },
+            { backgroundColor: tokens.getPropertyValue("--card").trim() },
+          ],
+      { duration: reduced ? 120 : 500, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }
+    );
+    void animation.finished.then(
+      () => complete(id, motion.revision),
+      () => {}
+    );
+    return () => animation.cancel();
+  }, [id, motion, ready, complete]);
 
   return (
-    <div className={cn(motion?.kind === "arrival" && !placed && "opacity-0")} ref={ref}>
+    <div
+      className="workshop-cell-node nopan"
+      data-cell-motion={ready ? motion?.kind : undefined}
+      ref={ref}
+      style={{ opacity: motion?.kind === "arrival" && !ready ? 0 : undefined }}
+    >
       {children}
     </div>
   );

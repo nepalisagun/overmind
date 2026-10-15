@@ -8,6 +8,8 @@ from typing import Any
 import stripe
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Case, F, Value, When
+from django.db.models.functions import Concat, Replace, Substr, Upper
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -15,13 +17,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from overbae.api.config import PageNumberPagination
+from overbae.api.ordering import TableOrderingFilter
 from overbae.api.serializers import (
     BillingTelemetrySerializer,
     CheckoutSessionResponseSerializer,
     CreditTopUpRequestSerializer,
     SubscriptionSerializer,
 )
-from overbae.models import BillingTelemetry, Subscription, SubscriptionStatus, User
+from overbae.models import BillingService, BillingTelemetry, Subscription, SubscriptionStatus, User
 from overbae.services.billing_ledger import (
     CREDITS_PER_USD,
     balance_usd,
@@ -442,6 +445,10 @@ class SubscriptionView(APIView):
 class BillingLedgerView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = BillingTelemetrySerializer
+    filter_backends = [TableOrderingFilter]
+    ordering_aliases = {"service": "service_name"}
+    ordering_fields = ["timestamp", "service", "project__name", "amount"]
+    ordering = ["-timestamp", "id"]
     pagination_class = PageNumberPagination
 
     @extend_schema(
@@ -455,6 +462,18 @@ class BillingLedgerView(generics.ListAPIView):
         return (
             BillingTelemetry.objects.filter(user=self.request.user)
             .select_related("project")
+            .annotate(
+                service_name=Case(
+                    *[
+                        When(service=key, then=Value(label))
+                        for key, label in BillingService.choices
+                    ],
+                    default=Concat(
+                        Upper(Substr("service", 1, 1)),
+                        Substr(Replace(F("service"), Value("-"), Value(" ")), 2),
+                    ),
+                )
+            )
             .order_by("-timestamp")
         )
 

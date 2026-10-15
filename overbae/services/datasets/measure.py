@@ -1,97 +1,94 @@
-"""Everything a version records about its frame."""
+"""Everything a cell records about the frame it left."""
 
 from __future__ import annotations
 
-from django.core.cache import cache
-from django.db import transaction
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
 from django.utils import timezone
 
 from overbae.models import Cell, Dataset
-from overbae.services.datasets import alignment, contract, events, paths, store
-
-ANALYTICS_BATCH = 20
-ANALYTICS_LOCK_SECONDS = 600
+from overbae.services.datasets import alignment, contract, store
+from overbae.services.datasets.profile import profile_records
 
 
-def describe_frame(dataset, path, *, report=None):
-    frame = store.Frame(path)
-    report = report or contract.measure(frame)
-    column_stats = store.column_stats(path)
-    null_rates = {c["name"]: c["null_rate"] for c in column_stats}
+def describe_frame(
+    dataset: Dataset,
+    path: Path,
+    *,
+    df: pd.DataFrame | None = None,
+    report: dict[str, Any] | None = None,
+) -> dict:
+    report = report or (contract.measure(df) if df is not None else contract.measure_path(path))
+    manifest = store.read_manifest(path)
+    null_rates = store.null_rates(path)
     capability_report = (
-        alignment.capability_contract(dataset.capability, frame, dataset.intent)
+        capability_path(dataset.capability, path, dataset.intent)
         if dataset.capability_id is not None
         else {}
     )
-    return {
-        "rows": len(frame),
-        "columns": [{**c, "null_rate": null_rates.get(c["name"], 0.0)} for c in frame.manifest],
-        "fingerprint": store.file_sha256(path),
-        "intent_report": {
-            "train": report["train"],
-            "eval": report["eval"],
-            "decision": report["decision"],
+    fingerprint = store.file_sha256(path)
+    profile = profile_records(store.iter_rows(path))
+    analytics = {**profile.pop("analytics"), "fingerprint": fingerprint}
+    return dict(
+        state=Cell.State.OK,
+        error="",
+        rows=store.row_count(path),
+        columns=[{**c, "null_rate": null_rates.get(c["name"], 0.0)} for c in manifest],
+        fingerprint=fingerprint,
+        intent_report={"train": report["train"], "eval": report["eval"]},
+        capability_report=capability_report,
+        stats={
+            **contract.stats_rows(store.iter_rows(path), {c["name"] for c in manifest}),
+            "preparation_profile": profile,
+            "analytics": analytics,
         },
-        "capability_report": capability_report,
-        "stats": contract.stats(frame),
-        "analytics": contract.analytics(frame, column_stats),
-        "updated_at": timezone.now(),
-    }
-
-
-def request_analytics(dataset: Dataset, cells: list[Cell]) -> None:
-    """Versions measured before analytics existed are measured in the background."""
-    if all(cell.analytics for cell in cells):
-        return
-    # The task imports this service, so task imports stay at dispatch boundaries.
-    from overbae.tasks.datasets import measure_analytics
-
-    key = f"dataset-analytics:{dataset.pk}"
-
-    def dispatch():
-        if not cache.add(key, 1, timeout=ANALYTICS_LOCK_SECONDS):
-            return
-        try:
-            measure_analytics.delay(dataset_id=str(dataset.pk))
-        except Exception:
-            cache.delete(key)
-            raise
-
-    transaction.on_commit(dispatch)
-
-
-def backfill_analytics(dataset_id) -> int:
-    cells = list(
-        Cell.objects.filter(dataset_id=dataset_id, analytics={}).order_by("position")[
-            :ANALYTICS_BATCH
-        ]
+        updated_at=timezone.now(),
     )
-    for cell in cells:
-        path = paths.cell_path(dataset_id, cell.id)
-        result = (
-            contract.analytics(store.Frame(path), store.column_stats(path))
-            if path.exists()
-            else {"labels": [], "inputs": {}}
-        )
-        Cell.objects.filter(pk=cell.pk, analytics={}).update(analytics=result)
-    cache.delete(f"dataset-analytics:{dataset_id}")
-    if cells:
-        events.publish(
-            dataset_id,
-            {"dataset_id": str(dataset_id), "type": "dataset_updated", "changed": {}},
-        )
-    return len(cells)
+
+
+def frame(dataset: Dataset, cell: Cell, path: Path, *, df=None, report=None, **fields) -> Cell:
+    measured = describe_frame(dataset, path, df=df, report=report)
+    if cell.preparation_plan:
+        fields["preparation_plan"] = {
+            **cell.preparation_plan,
+            "result_fingerprint": measured["fingerprint"],
+        }
+    Cell.objects.filter(pk=cell.pk).update(**{**measured, **fields})
+    cell.refresh_from_db()
+    return cell
+
+
+def capability_path(capability, path, intent):
+    report = {}
+    for df in store.iter_frames(path):
+        part = alignment.capability_contract(capability, df, intent)
+        if not report:
+            report = part
+            continue
+        report["rows"] += part.get("rows", 0)
+        report["rows_ok"] += part.get("rows_ok", 0)
+        report["ok"] = report["ok"] and part.get("ok", False)
+        if not report["ok"]:
+            report["reason"] = (
+                f"{report['rows'] - report['rows_ok']} of {report['rows']} rows "
+                "do not match the capability."
+            )
+    return report
 
 
 def capability_only(dataset: Dataset) -> None:
-    """Re-measure the capability contract on every version after the capability or the
-    intent changed."""
-    for cell in dataset.cells.all():
+    """Re-measure the capability contract on every cell that ran, after the
+    capability or the intent changed."""
+    from overbae.services.datasets import paths
+
+    for cell in dataset.cells.filter(state=Cell.State.OK):
         path = paths.cell_path(dataset.id, cell.id)
         if not path.exists():
             continue
         report = (
-            alignment.capability_contract(dataset.capability, store.Frame(path), dataset.intent)
+            capability_path(dataset.capability, path, dataset.intent)
             if dataset.capability_id is not None
             else {}
         )

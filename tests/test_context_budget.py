@@ -7,26 +7,18 @@ from pydantic import BaseModel
 
 from modal_shared.context_budget import DEFAULT_OUTPUT_TOKENS, completion_body, reserve_output
 from overbae.core import llms
+from overbae.innermind import generation, replay, runs
 from overbae.models import (
     EvalRun,
-    EvalSample,
-    Evaluator,
-    EvalVariant,
+    EvalRunRow,
     FinetuningJob,
     FinetuningJobEval,
     Project,
-    RunEvaluator,
-    Score,
 )
 from overbae.services import deployment, serving_context
-from overbae.services.eval import funnel, runner, snapshots
-from overbae.services.eval.comparison import compare_runs
-from overbae.services.inference_client import (
-    ContextBudgetError,
-    InferenceClient,
-    InferenceClientError,
-)
-from overbae.tasks import eval as eval_tasks
+from overbae.services.finetuning_eval import sync_eval_scores
+from overbae.services.inference_client import ContextBudgetError, InferenceClient
+from overbae.services.judging import funnel
 
 
 @pytest.mark.parametrize("payload", [{}, {"max_tokens": None}, {"max_completion_tokens": None}])
@@ -99,7 +91,7 @@ def test_llm_preserves_incomplete_output_and_usage_without_json_repair(fake_llm,
     assert len(fake_llm.requests) == 1
 
 
-@pytest.mark.parametrize("generate", [runner.run_capability, runner.generate_decision])
+@pytest.mark.parametrize("generate", [replay.run_capability, replay.generate_decision])
 def test_incomplete_tool_call_is_never_executed(fake_llm, generate):
     tool = Mock()
     tool.tool_definitions.return_value = []
@@ -116,8 +108,10 @@ def test_incomplete_tool_call_is_never_executed(fake_llm, generate):
 @pytest.mark.django_db
 def test_deployment_and_eval_budget_are_independent_of_training_length():
     project = Project.objects.create(name="Context")
-    train = frozen_dataset(project, TRAIN_ROWS)
-    evaluation = frozen_dataset(project, [{"input": "i" * 9000, "expected_output": "o" * 18000}])
+    train = frozen_dataset(project, TRAIN_ROWS, contract="train")
+    evaluation = frozen_dataset(
+        project, [{"input": "i" * 9000, "expected_output": "o" * 18000}], contract="eval"
+    )
     job = FinetuningJob.objects.create(
         project=project,
         dataset=train,
@@ -143,59 +137,42 @@ def test_deployment_and_eval_budget_are_independent_of_training_length():
 @pytest.mark.django_db
 def test_truncated_generation_stays_visible_but_cannot_be_a_quality_score(fake_llm):
     project = Project.objects.create(name="Incomplete eval")
-    evaluation = frozen_dataset(project, [{"input": "packet", "expected_output": "report"}])
+    evaluation = frozen_dataset(
+        project, [{"input": "packet", "expected_output": "report"}], contract="eval"
+    )
     run = EvalRun.objects.create(
         project=project,
         dataset=evaluation,
         cell=evaluation.active_cell,
         name="run",
-        status="running",
+        status=EvalRun.Status.RUNNING,
+        mode=EvalRun.Mode.GENERATE,
+        model_name="gpt-4.1",
+        matrix=[{"name": "Report", "type": "llm", "source": "The output is the report."}],
     )
-    variant = EvalVariant.objects.create(run=run, label="model", mode="generate")
-    sample = EvalSample.objects.create(run=run, variant=variant, row_index=0)
-    evaluator = Evaluator.objects.create(
-        project=project, name="Quality", kind="deterministic", config={"check": "json_valid"}
-    )
-    run_evaluator = RunEvaluator.objects.create(
-        run=run, evaluator=evaluator, snapshot=snapshots.build_snapshot(evaluator)
-    )
-    train = frozen_dataset(project, TRAIN_ROWS)
+    row = EvalRunRow.objects.create(run=run, row_index=0)
+    train = frozen_dataset(project, TRAIN_ROWS, contract="train")
     job = FinetuningJob.objects.create(
         project=project, dataset=train, base_model="Qwen/Qwen3.5-27B", status="succeeded"
     )
     link = FinetuningJobEval.objects.create(job=job, kind="final", eval_run=run, status="running")
     _cut_off(fake_llm, '{"report":', prompt_tokens=3000, completion_tokens=1096)
-    eval_tasks.prepare_sample.run(sample_id=str(sample.pk))
-    sample.refresh_from_db()
-    assert sample.degraded is True
-    assert sample.degraded_reason.startswith("output_token_limit:")
-    assert sample.trajectory["metadata"]["truncated"] is True
-    assert sample.trajectory["metadata"]["finish_reasons"] == ["length"]
-    eval_tasks.execute_evaluator.run(
-        sample_id=str(sample.pk), run_evaluator_id=str(run_evaluator.pk)
-    )
-    score = Score.objects.get(sample=sample)
-    assert score.outcome == "skipped" and score.value is None
-    eval_tasks.aggregate_run.run(eval_run_id=str(run.pk))
+
+    generation.generate(EvalRunRow.objects.select_related("run__cell").get(pk=row.pk))
+
+    row.refresh_from_db()
+    assert row.degraded is True
+    assert row.degraded_reason.startswith("output_token_limit:")
+    assert row.metadata["truncated"] is True
+    assert row.metadata["finish_reasons"] == ["length"]
+    runs.finish(run)
     run.refresh_from_db()
+    assert run.summary["trust"] == {"trusted": False, "errored": 0, "degraded": 1}
+    assert run.scores.count() == 0
+    sync_eval_scores(job)
     link.refresh_from_db()
-    assert run.summary["trust"]["degraded"] == 1
-    assert compare_runs(run.summary, run.summary)["trust"]["current"]["trusted"] is False
     assert link.status == "failed" and link.aggregate_score is None
     assert "incomplete or degraded" in link.error_message
-
-
-def test_per_turn_truncation_cannot_be_hidden_by_other_successful_turns():
-    degraded, reason = eval_tasks._assess_degradation(
-        {
-            "metadata": {"generation_strategy": "per_assistant_turn", "output_truncated": True},
-            "final_output": "later valid output",
-        },
-        {"per_turn": [{"generated": "valid"}]},
-        [],
-        is_generate=True,
-    )
-    assert degraded and reason.startswith("output_token_limit:")
 
 
 def test_judge_does_not_repair_or_cache_truncated_json_but_keeps_usage(fake_llm):
@@ -208,7 +185,6 @@ def test_judge_does_not_repair_or_cache_truncated_json_but_keeps_usage(fake_llm)
     outcome = funnel.invoke_judge(
         "evidence",
         response_format=Result,
-        use_cache=False,
         judge=funnel.ResolvedJudge("gpt-4.1", None, "openai"),
     )
     assert outcome.parsed is None
@@ -228,32 +204,6 @@ def test_provider_context_rejection_is_actionable_without_leaking_body(scripted,
         )
     assert "private body" not in str(error.value)
     assert inference.calls[0].json["max_tokens"] == DEFAULT_OUTPUT_TOKENS
-
-
-REFUSED = {"error": {"code": "context_length_exceeded", "message": "private body"}}
-
-
-@pytest.mark.parametrize(
-    ("reply", "stream"),
-    [({"json_body": REFUSED}, False), ({"text": f"data: {json.dumps(REFUSED)}\n\n"}, True)],
-)
-def test_a_context_refusal_inside_a_successful_reply_is_classified(scripted, reply, stream):
-    scripted("https://inference.test").reply(200, **reply)
-    client = InferenceClient(base_url="https://inference.test", api_key="test")
-    request = {"model_id": "model", "messages": [{"role": "user", "content": "q"}]}
-    with pytest.raises(ContextBudgetError, match="reserved output exceed"):
-        if stream:
-            list(client.stream_chat_completions(**request))
-        else:
-            client.chat_completions(**request)
-
-
-def test_an_unrelated_output_limit_error_is_not_a_context_refusal(scripted):
-    scripted("https://inference.test").reply(400, text="max_tokens must be an integer")
-    client = InferenceClient(base_url="https://inference.test", api_key="test")
-    with pytest.raises(InferenceClientError) as error:
-        client.chat_completions(model_id="model", messages=[{"role": "user", "content": "q"}])
-    assert not isinstance(error.value, ContextBudgetError)
 
 
 def test_impossible_gpu_context_is_rejected_instead_of_selecting_an_undersized_gpu(monkeypatch):

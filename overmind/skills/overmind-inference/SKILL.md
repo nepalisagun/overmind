@@ -31,11 +31,35 @@ Do not let platform evaluations or smoke calls stand in for application usage.
 
 ## Test or activate
 
+Successful training automatically starts deployment using the model's inference
+contract. `deploy_finetune` backfills a completed historical job and reuses its
+existing deployment; it never changes application routing. Failed or deleted
+deployments still require `retry_deployment`.
+
 Use `run_inference` only for a requested test on a ready deployment, with the
-user's supplied messages and output budget. Preserve explicit `max_tokens`;
+user's supplied messages and output budget, or input-only `decisions` for a
+decision deployment. Decisions contain state, question, kind and ordered options;
+they never contain targets or chat generation settings. Their results contain
+ordered probabilities and the verified artifact identity. Native models use
+`POST /api/deployed-models/{id}/inference/` and poll
+`GET /api/inference-requests/{id}/`; they do not support chat completions or chat
+capability activation. Preserve explicit `max_tokens` for chat;
 omission uses the production default. Report finish reason and truncation.
 An oversized context request needs a deliberate input/budget change, not silent
 clipping. A test may incur inference spend.
+
+Supply a stable `request_key`. Contract 4.0 returns an `inference_request` job,
+not a synchronous answer. Read it with `get_job`; a disconnected client can reuse
+the same key/input to recover the same receipt without resubmission. A different
+input under that key conflicts. Unknown provider acknowledgement is not a reason
+to create another request. Result resources support `offset`/`limit` content
+paging when the compact result is clipped.
+
+Follow linked operational receipts with `inspect_operation(operation, after, limit)`. The event timeline distinguishes source/observation time, heartbeat and
+forward progress, and labels shared-pool observations separately from
+request-specific adapter/generation work. Missing measurements, dropped provider
+publications and uncollected event backlog remain explicit. Inspection does not
+wake workers; it cannot establish application integration or semantic quality.
 
 For an authorized rollout, prefer `ship-model` when capability, deployment and
 fine-tuning job are known. Otherwise inspect readiness, then use
@@ -56,18 +80,3 @@ independently of a completed activation.
 Report readiness, worker state, selected alias and application evidence
 separately. Open `inference` under the project's Console base, preserving
 `projectId`, when the user wants the visual serving view.
-
-## Decision requests
-
-Use `run_decision_model` to answer a System One request from a decision model.
-Pass `job` for a trained decision job, or `model` for a catalog model, with the
-`state` and `questions` in the shape described in overmind-datasets. The answer
-gives one option per question: a choice key, `true` or `false`, a level index
-such as `"2"`, or option weights.
-
-- A cold model answers "warming". Retry after the number of seconds it gives.
-- Keep each request within the model's limits and context length from
-  `overmind://decision-models`. Report a rejected request; do not drop questions
-  to make it fit.
-- Decision models are not chat models. Use `run_decision_model`, not
-  `run_inference`.

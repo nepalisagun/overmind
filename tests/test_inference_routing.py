@@ -129,6 +129,7 @@ def _chat(deployed=None, **routing):
         model_id=getattr(deployed, "model_id", "ft-abc"),
         messages=[{"role": "user", "content": "hi"}],
         deployed=deployed,
+        max_tokens=32,
         **routing,
     )
 

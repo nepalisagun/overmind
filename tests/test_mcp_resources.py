@@ -11,10 +11,13 @@ from starlette.testclient import TestClient
 from overbae.models import (
     APIToken,
     Capability,
+    Cell,
     Conversation,
     Dataset,
     DeployedModel,
+    EvalMatrix,
     EvalRun,
+    EvalSet,
     FinetuningJob,
     OptimizerExperiment,
     Project,
@@ -26,6 +29,8 @@ from overbae.services.mcp.catalog import CATALOG
 from overbae.services.mcp.context import MCPContext, bind_context
 from overbae.services.mcp.resources import (
     read_resource,
+    resource_list,
+    resource_templates,
     safe_json,
 )
 from overbae.services.mcp.server import create_mcp_application
@@ -52,6 +57,31 @@ def _rpc(method: str, params: dict | None = None) -> dict:
     return payload
 
 
+def test_discovery_reports_the_connected_endpoint_and_permission_scoped_catalog():
+    project, key = _project()
+    headers = {"X-Api-Key": key, "Accept": "application/json"}
+    with TestClient(create_mcp_application()) as client:
+        tools = client.post("/api/mcp/", json=_rpc("tools/list"), headers=headers).json()["result"][
+            "tools"
+        ]
+        projects = client.post(
+            "/api/mcp/",
+            json=_rpc("tools/call", {"name": "list_projects", "arguments": {}}),
+            headers=headers,
+        ).json()["result"]["structuredContent"]
+        interface = client.post(
+            "/api/mcp/",
+            json=_rpc("resources/read", {"uri": "overmind://interface/current"}),
+            headers=headers,
+        ).json()["result"]
+    identity = json.loads(interface["contents"][0]["text"])
+    assert identity["connection"]["mcp_url"] == "http://testserver/api/mcp/"
+    assert identity["tool_count"] == len(tools)
+    assert projects["connection"] == identity["connection"]
+    assert projects["catalog_sha256"] == identity["catalog_sha256"]
+    assert key not in json.dumps(identity)
+
+
 def test_project_resource_exposes_scan_provenance():
     project, _ = _project()
     project.settings = {
@@ -75,7 +105,121 @@ def test_project_resource_exposes_scan_provenance():
     assert resource["last_synced_at"] == project.settings["last_synced_at"]
 
 
-def test_connector_setup_resource_names_no_secret_fields():
+def test_resource_templates_cover_the_public_resource_surface():
+    templates = {
+        template.uriTemplate.removesuffix("{?project_id}") for template in resource_templates()
+    }
+    assert templates == {
+        "overmind://capabilities/{capability}",
+        "overmind://traces/{trace_id}",
+        "overmind://sessions/{session}",
+        "overmind://datasets/{dataset}",
+        "overmind://dataset-pipelines/{id}",
+        "overmind://dataset-pipeline-packages/{id}",
+        "overmind://dataset-pipeline-bindings/{id}",
+        "overmind://pipeline-diagnostics/{id}",
+        "overmind://eval-runs/{eval_run}",
+        "overmind://eval-sets/{eval_set}",
+        "overmind://finetunes/{job_id}",
+        "overmind://deployments/{deployment}",
+        "overmind://optimizer-runs/{experiment}",
+        "overmind://jobs/{kind}/{id}",
+        "overmind://operations/{id}",
+        "overmind://jobs/data_exploration/{id}/strata",
+        "overmind://connectors/{connector}",
+    }
+
+
+def test_dataset_upload_resource_describes_cli_flow_and_server_limits():
+    project, _ = _project()
+    token = APIToken(scope={"scope": "project", "permission": ["read"]})
+    context = MCPContext(
+        user=User(email="upload-resource@example.com"), token=token, project=project
+    )
+
+    async def read():
+        with bind_context(context):
+            contents = list(await read_resource("overmind://dataset-upload"))
+        return json.loads(contents[0].content)
+
+    resource = asyncio.run(read())
+    assert resource["extensions"] == [
+        ".csv",
+        ".tsv",
+        ".json",
+        ".jsonl",
+        ".ndjson",
+        ".parquet",
+        ".pdf",
+        ".docx",
+        ".md",
+        ".txt",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+    ]
+    assert resource["max_bytes"] == 2 * 1024**3
+    assert resource["json_array_max_bytes"] == 256 * 1024**2
+    assert "capped at 2 GiB" in resource["limits"]
+    assert "capped at 256 MiB" in resource["limits"]
+    assert resource["command"] == "overmind dataset upload FILE --project-id PROJECT --json"
+    assert "OVERMIND_API_KEY" in resource["auth"]
+    assert "get_job" in resource["next_mcp_calls"][0]
+
+
+def test_dataset_export_resource_describes_local_download_and_trace_flow():
+    project, _ = _project()
+    token = APIToken(scope={"scope": "project", "permission": ["read"]})
+    context = MCPContext(
+        user=User(email="export-resource@example.com"), token=token, project=project
+    )
+
+    async def read():
+        with bind_context(context):
+            contents = list(await read_resource("overmind://dataset-export"))
+        return json.loads(contents[0].content)
+
+    resource = asyncio.run(read())
+    assert resource["command"] == "overmind dataset export DATASET --json"
+    assert resource["formats"] == ["jsonl", "csv"]
+    assert "dataset id" in resource["dataset"]
+    assert "--api-url" in resource["config"]
+    assert "--path" in resource["config"]
+    assert (
+        "select traces -> land a dataset from traces -> run dataset export locally"
+        in resource["flow"]
+    )
+    assert "no export_trace MCP tool" in resource["trace_export"]
+
+
+def test_checkpoint_download_resource_describes_cli_boundary_and_availability():
+    project, _ = _project()
+    token = APIToken(scope={"scope": "project", "permission": ["read"]})
+    context = MCPContext(
+        user=User(email="checkpoint-resource@example.com"), token=token, project=project
+    )
+
+    async def read():
+        with bind_context(context):
+            contents = list(await read_resource("overmind://checkpoint-download"))
+        return json.loads(contents[0].content)
+
+    resource = asyncio.run(read())
+    assert resource["command"] == "overmind model download-checkpoint DEPLOYMENT --json"
+    assert "deployment id supplied by MCP" in resource["deployment"]
+    assert "OVERMIND_API_KEY" in resource["auth"]
+    assert "--api-url" in resource["config"]
+    assert "presigned S3" in resource["mcp_boundary"]
+    assert "model context" in resource["mcp_boundary"]
+    assert "baseten or modal" in resource["availability"]
+    assert "archived checkpoints" in resource["availability"]
+    assert "path" in resource["output"]
+    assert "bytes_written" in resource["output"]
+    assert "refuses to overwrite" in resource["overwrite"]
+
+
+def test_connector_setup_resource_describes_human_cli_boundary():
     project, _ = _project()
     token = APIToken(scope={"scope": "project", "permission": ["read"]})
     context = MCPContext(
@@ -89,8 +233,21 @@ def test_connector_setup_resource_names_no_secret_fields():
 
     resource = asyncio.run(read())
     encoded = json.dumps(resource)
+    assert resource["command"] == "overmind connector add langfuse --json"
+    assert resource["types"][0]["env"] == ["LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"]
+    assert "Do not have the agent export keys" in resource["boundary"]
+    assert "inspect_connectors" in resource["next_mcp_calls"][0]
     assert "needs_secret" not in encoded
     assert "api_key" not in encoded
+
+
+def test_static_resource_manifest_includes_checkpoint_download_guidance():
+    resources = resource_list()
+
+    assert len(resources) == 7
+    uris = {str(resource.uri) for resource in resources}
+    assert "overmind://checkpoint-download" in uris
+    assert "overmind://connector-setup" in uris
 
 
 def test_resource_reads_are_json_and_project_scoped():
@@ -136,7 +293,7 @@ def test_resource_reads_are_json_and_project_scoped():
         f"overmind://finetunes/{finetune.id}",
         f"overmind://deployments/{deployment.id}",
         f"overmind://optimizer-runs/{optimizer.id}",
-        f"overmind://jobs/dataset_import/{dataset.id}",
+        f"overmind://jobs/dataset_run/{dataset.id}",
     ]
 
     async def read_all():
@@ -182,7 +339,7 @@ def test_trace_resource_preserves_resource_attrs_for_verification():
     trace_id = "3" * 32
     resource_attrs = {"overmind.capability.id": str(uuid.uuid4())}
     Span.objects.create(
-        span_id="a" * 16,
+        span_id="0123456789abcdef",
         trace_id=trace_id,
         project=project,
         name="run",
@@ -217,6 +374,20 @@ def test_safe_json_redacts_nested_secret_key_styles():
     assert redacted == {"nested": [{"label": "kept"}]}
 
 
+def test_token_measurements_remain_visible_without_exposing_credentials():
+    measurements = {
+        "trained_tokens": 54000,
+        "max_tokens": 8192,
+        "max_new_tokens": 128,
+        "padded_tokens": 32768,
+        "tokens": 54000,
+        "supervised_tokens": 1200,
+    }
+    assert safe_json({"forecast": measurements}) == {"forecast": measurements}
+    for value in ("credential-value", {"value": 12}, [12], True, float("nan")):
+        assert safe_json({**dict.fromkeys(measurements, value), "access_token": 1234}) == {}
+
+
 def test_finetune_resource_redacts_all_checkpoint_url_styles():
     project, _ = _project()
     signed_url = "https://storage.example/checkpoint?X-Amz-Signature=signed-value"
@@ -225,7 +396,20 @@ def test_finetune_resource_redacts_all_checkpoint_url_styles():
         project=project,
         dataset=dataset,
         base_model="model/base",
+        cost_usd="0.2500",
+        group_id=uuid.uuid4(),
+        hyperparameters={"objective": "decision_cross_entropy"},
+        requested_configuration={
+            "configuration": {
+                "hyperparameters": {
+                    "monitoring": {"generation": {"max_new_tokens": 128}},
+                    "provider_token": "provider-secret",
+                }
+            }
+        },
+        result={"inference_contract": "typed_probabilities"},
         progress={
+            "diagnostics": {"stage": "initial_validation", "completed": 600, "total": 1200},
             "checkpoint_uri": signed_url,
             "checkpointUri": signed_url,
             "CHECKPOINT.URI": signed_url,
@@ -248,11 +432,28 @@ def test_finetune_resource_redacts_all_checkpoint_url_styles():
         return json.loads(contents[0].content)
 
     resource = asyncio.run(read())
+    assert resource["cost_usd"] == 0.25
+    assert resource["group_id"] == str(job.group_id)
+    assert resource["training_objective"] == "decision_cross_entropy"
+    assert resource["inference_contract"] == "typed_probabilities"
     encoded = json.dumps(resource)
     assert signed_url not in encoded
     assert "api-secret" not in encoded
     assert "refresh-secret" not in encoded
-    assert resource["progress"] == {"nested": {"safe": "kept"}}
+    assert "provider-secret" not in encoded
+    frozen = resource["record"]["requested"]["configuration"]["hyperparameters"]
+    assert frozen["monitoring"]["generation"]["max_new_tokens"] == 128
+    assert resource["progress"] == {
+        "diagnostics": {"stage": "initial_validation", "completed": 600, "total": 1200},
+        "nested": {"safe": "kept"},
+        "stage_label": "Pre-training baseline evaluation",
+        "stage_description": (
+            "Measuring the starting model on the development set before training begins."
+        ),
+    }
+    result = asyncio.run(CATALOG.call("get_job", {"kind": "finetune", "id": str(job.id)}, context))
+    assert result.isError is False, result.structuredContent
+    assert result.structuredContent["progress"] == resource["progress"]
 
 
 def test_resource_read_through_transport_returns_safe_not_found_error():
@@ -320,66 +521,77 @@ def test_dataset_resource_matches_inspect_fields_and_hides_paths(settings):
     assert payload["active"]["rows"] == 2
     assert payload["active"]["id"]
     assert payload["active"]["version"]
-    assert [version["version"] for version in payload["versions"]] == ["v0"]
-    assert payload["versions_total"] == 1
-    assert payload["sample"]["id"] == payload["active"]["id"]
+    assert payload["cells"]
+    assert payload["cells_truncated"] is False
+    assert payload["sample"]["cell_id"] == payload["active"]["id"]
     assert len(payload["sample"]["rows"]) == 2
+    assert "recent_chat" not in payload
     assert payload["next_actions"]
-    assert payload["human_action"]["command"] == (
-        "overmind dataset export DATASET --cell VERSION --json"
-    )
-    assert payload["human_action"]["arguments"]["version"] == "v0"
+    assert payload["human_action"]["command"] == "overmind dataset export DATASET --json"
     assert "api_key" not in json.dumps(payload["human_action"]).lower()
     assert "OVERMIND_API_KEY" not in encoded
     assert str(settings.MEDIA_ROOT) not in encoded
     assert ".parquet" not in encoded
     assert "upload/" not in encoded
     assert local["id"] == payload["id"]
-    assert local["versions"] == payload["versions"]
+    assert local["cells"]
     assert local["human_action"]["command"] == payload["human_action"]["command"]
 
 
-def test_get_job_dataset_import_tracks_state_and_emits_job_resource_link():
+def test_get_job_dataset_run_tracks_state_and_emits_job_resource_link():
     project, _ = _project()
-    dataset = Dataset.objects.create(project=project, name="Upload", state=Dataset.State.LANDING)
+    dataset = Dataset.objects.create(
+        project=project,
+        name="Notebook",
+        state=Dataset.State.LANDING,
+    )
+    Cell.objects.create(dataset=dataset, position=0, title="Source", state=Cell.State.QUEUED)
     context = _tool_context(project)
-    uri = f"overmind://jobs/dataset_import/{dataset.id}"
+    uri = f"overmind://jobs/dataset_run/{dataset.id}"
 
-    for state, status in ((Dataset.State.LANDING, "queued"), (Dataset.State.ERROR, "failed")):
+    states = (
+        Dataset.State.LANDING,
+        Dataset.State.RUNNING,
+        Dataset.State.IDLE,
+        Dataset.State.ERROR,
+    )
+    for state in states:
         Dataset.objects.filter(pk=dataset.pk).update(
             state=state, error="clipped-secret" if state == Dataset.State.ERROR else ""
         )
         result = asyncio.run(
-            CATALOG.call("get_job", {"kind": "dataset_import", "id": str(dataset.id)}, context)
+            CATALOG.call("get_job", {"kind": "dataset_run", "id": str(dataset.id)}, context)
         )
         assert result.isError is False, result.structuredContent
         body = result.structuredContent
-        assert body["kind"] == "dataset_import"
+        assert body["kind"] == "dataset_run"
         assert body["id"] == str(dataset.id)
-        assert body["status"] == status
+        assert body["status"] == state
         assert body["resource"]["uri"] == uri
+        assert body["details"]["next_action"]["tool"]
         links = [str(item.uri) for item in result.content if isinstance(item, types.ResourceLink)]
         assert uri in links
         assert f"overmind://datasets/{dataset.id}" in links
         job = _read(project, uri)
-        assert job["status"] == status
+        assert job["status"] == state
         assert job["dataset"]["uri"] == f"overmind://datasets/{dataset.id}"
+        assert "latest_turn" not in job
 
     assert result.structuredContent["job_error"] == "clipped-secret"
-    landing = asyncio.run(
-        CATALOG.call("inspect_dataset", {"dataset": str(dataset.id)}, context)
-    ).structuredContent
-    assert landing["next_actions"] == []
+    assert result.structuredContent["details"]["next_action"]["tool"] in {
+        "inspect_dataset",
+        "inspect_dataset_workbench",
+    }
 
 
-def test_dataset_import_job_is_project_scoped():
+def test_dataset_run_job_is_project_scoped():
     project, _ = _project()
     other = Project.objects.create(name="Other", slug=f"other-{uuid.uuid4().hex[:8]}")
     foreign = Dataset.objects.create(project=other, name="Foreign")
     context = _tool_context(project)
 
     missing = asyncio.run(
-        CATALOG.call("get_job", {"kind": "dataset_import", "id": str(foreign.id)}, context)
+        CATALOG.call("get_job", {"kind": "dataset_run", "id": str(foreign.id)}, context)
     )
     retired = asyncio.run(
         CATALOG.call("get_job", {"kind": "dataset_build", "id": str(foreign.id)}, context)
@@ -395,4 +607,105 @@ def test_dataset_import_job_is_project_scoped():
     with pytest.raises(McpError):
         _read(project, f"overmind://datasets/{foreign.id}")
     with pytest.raises(McpError):
-        _read(project, f"overmind://jobs/dataset_import/{foreign.id}")
+        _read(project, f"overmind://jobs/dataset_run/{foreign.id}")
+
+
+def test_native_running_resource_retains_latest_metrics_and_contract():
+    from conftest import TRAIN_ROWS, frozen_dataset
+
+    project, _ = _project()
+    dataset = frozen_dataset(project, TRAIN_ROWS, contract="train")
+    points = [{"step": n, "train_loss": 1 / n, "api_key": "must-redact"} for n in range(1, 251)]
+    job = FinetuningJob.objects.create(
+        project=project,
+        dataset=dataset,
+        base_model="Qwen/Qwen3.5-4B",
+        status="running",
+        hyperparameters={"objective": "decision_cross_entropy"},
+        progress={"trained_steps": 250, "metrics": {"loss": points}, "metrics_history": points},
+    )
+    context = MCPContext(
+        user=User(email="reader@example.com"),
+        token=APIToken(scope={"scope": "project", "permission": ["read"]}),
+        project=project,
+    )
+
+    async def read():
+        with bind_context(context):
+            contents = list(await read_resource(f"overmind://finetunes/{job.id}"))
+        return json.loads(contents[0].content)
+
+    resource = asyncio.run(read())
+    assert resource["inference_contract"] == "decision"
+    assert resource["loss"][-1]["step"] == 250
+    assert resource["progress"]["metrics_history"][-1]["step"] == 250
+    assert "must-redact" not in json.dumps(resource)
+
+
+def test_capability_resource_exposes_tool_branches_and_execution_steps():
+    project, _ = _project()
+    branch = {
+        "condition": "Select element",
+        "basis": "code",
+        "action": "Read options",
+        "outcome": "Choices",
+        "next": "Decide again",
+        "provenance": ["tools.py#L20-L35"],
+    }
+    capability = Capability.objects.create(
+        project=project,
+        name="Browser",
+        slug="browser",
+        improvement_metadata={
+            "capability_card": {
+                "tool_spec": [
+                    {"name": "click", "purpose": "Activate", "args": "index", "branches": [branch]}
+                ]
+            }
+        },
+    )
+    context = MCPContext(
+        user=User(email="reader@example.com"),
+        token=APIToken(scope={"scope": "project", "permission": ["read"]}),
+        project=project,
+    )
+
+    async def read():
+        with bind_context(context):
+            contents = list(await read_resource(f"overmind://capabilities/{capability.id}"))
+        return json.loads(contents[0].content)
+
+    result = asyncio.run(read())
+    assert result["tool_spec"][0]["branches"] == [branch]
+    assert result["trajectory_map"] == []
+
+
+def test_eval_set_pages_preserve_complete_sources_and_project_scope():
+    project, key = _project()
+    _, other_key = _project()
+    eval_set = EvalSet.objects.create(project=project, name="Audit")
+    sources = ["def evaluate(span):\n    return True\n# " + str(i) * 2500 for i in range(3)]
+    for i, source in enumerate(sources):
+        eval_set.rows.add(
+            EvalMatrix.objects.create(
+                project=project, name=f"row-{i}", type="deterministic", source=source
+            )
+        )
+    uri = f"overmind://eval-sets/{eval_set.id}"
+    with TestClient(create_mcp_application()) as client:
+
+        def read(suffix, api_key=key):
+            return client.post(
+                "/api/mcp/",
+                json=_rpc("resources/read", {"uri": uri + suffix}),
+                headers={"X-Api-Key": api_key, "Accept": "application/json"},
+            ).json()
+
+        first = json.loads(read("?limit=2")["result"]["contents"][0]["text"])
+        last = json.loads(read("?limit=2&offset=2")["result"]["contents"][0]["text"])
+        assert [r["source"] for r in first["rows"] + last["rows"]] == sources
+        assert first["total"] == 3 and first["next_offset"] == 2
+        assert last["next_offset"] is None and not last["rows_truncated"]
+        assert "error" in read("?offset=-1")
+        assert "error" in read("?limit=101")
+        assert "error" in read("", other_key)

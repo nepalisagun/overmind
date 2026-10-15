@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -81,6 +83,40 @@ def test_docker_compose_drains_every_routed_queue():
     )
 
 
+def test_packages_use_independently_scalable_interactive_capacity():
+    from overbae.tasks.datasets import execute_pipeline
+
+    assert settings.CELERY_TASK_ROUTES[execute_pipeline.name]["queue"] == "interactive"
+    assert execute_pipeline.acks_late and execute_pipeline.reject_on_worker_lost
+    services = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text())["services"]
+    assert "sandbox_net" in services["celery-interactive-worker"]["networks"]
+    assert "workshop-runner" not in services
+
+
+def test_fresh_worker_registers_every_routed_and_scheduled_task():
+    # Test collection imports task modules that a fresh worker may never discover.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import django, json; django.setup(); "
+            "from overbae.celery import app; app.loader.import_default_modules(); "
+            "print(json.dumps(sorted(app.tasks)))",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    registered = set(json.loads(result.stdout.splitlines()[-1]))
+    configured = set(settings.CELERY_TASK_ROUTES) | {
+        entry["task"] for entry in settings.CELERY_BEAT_SCHEDULE.values()
+    }
+    missing = configured - registered
+    assert not missing, f"Fresh workers cannot execute configured tasks: {sorted(missing)}"
+
+
 def _prefork_queues() -> set[str]:
     """Queues drained by a pool that can enforce ``time_limit``."""
     drained: set[str] = set()
@@ -129,7 +165,7 @@ def test_makefile_worker_drains_every_routed_queue():
 
 def test_landing_has_dedicated_prefork_capacity():
     landing_queue = settings.CELERY_TASK_ROUTES["overbae.tasks.datasets.land"]["queue"]
-    bulk_queue = settings.CELERY_TASK_ROUTES["overbae.tasks.eval.prepare_sample"]["queue"]
+    bulk_queue = settings.CELERY_TASK_ROUTES["overbae.tasks.innermind.generate_row"]["queue"]
     assert landing_queue != bulk_queue, "Evaluation fanout must not queue ahead of source landing"
     services = _compose_services()
     dedicated = {

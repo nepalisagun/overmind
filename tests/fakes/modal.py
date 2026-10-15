@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
 import itertools
+import json
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +28,12 @@ class _Method:
 
     async def aio(self, *args, **kwargs):
         return await sync_to_async(self._sync)(*args, **kwargs)
+
+
+class _IteratorMethod(_Method):
+    async def aio(self, *args, **kwargs):
+        for chunk in self._sync(*args, **kwargs):
+            yield chunk
 
 
 @dataclass
@@ -158,6 +169,7 @@ class FakeModal:
     calls: dict[str, FakeCall] = field(default_factory=dict)
     log: list[tuple[str, str, tuple, dict]] = field(default_factory=list)
     cancelled: list[tuple[str, dict]] = field(default_factory=list)
+    files: dict[str, bytes] = field(default_factory=dict)
     worker_stats: dict[str, Any] | BaseException | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -217,6 +229,28 @@ class FakeModal:
             def from_name(app: str, cls: str, **_):
                 return lambda **__: _FakeInstance(cloud, app, cls)
 
+        class Volume:
+            @staticmethod
+            def from_name(*args, **kwargs):
+                return Volume()
+
+            @contextmanager
+            def batch_upload(self, **kwargs):
+                yield self
+
+            def put_file(self, local, remote):
+                cloud.files[remote] = Path(local).read_bytes()
+
+            def _read_file(self, path):
+                if path not in cloud.files:
+                    raise FileNotFoundError(path)
+                yield cloud.files[path]
+
+            @property
+            def read_file(self):
+                return _IteratorMethod(self._read_file)
+
+        monkeypatch.setattr(modal, "Volume", Volume)
         monkeypatch.setattr(modal, "Function", Function)
         monkeypatch.setattr(modal, "Cls", Cls)
         monkeypatch.setattr(modal, "FunctionCall", FunctionCall)
@@ -231,31 +265,56 @@ class SftBackend:
     cloud: FakeModal
     runs: dict[str, dict[str, Any]] = field(default_factory=dict)
     uploads: list[str] = field(default_factory=list)
+    prepared: dict[str, dict] = field(default_factory=dict)
+    materialized: dict[str, dict] = field(default_factory=dict)
 
     def install(self) -> SftBackend:
         from modal_shared.stacks import TRAIN_FUNCTION_NAMES
+        from overbae.services.training_release import current
 
+        release = current()
+        app = release["app"]
+        self.cloud.deploy(app, "release_identity", lambda: release)
         for name in TRAIN_FUNCTION_NAMES.values():
-            self.cloud.deploy(SFT_APP, name, self._train, held=True)
-            self.cloud.deploy(SFT_APP, f"prepare_{name}", self._prepare, held=True)
-        self.cloud.deploy(SFT_APP, "upload_dataset", self._upload)
-        self.cloud.deploy(SFT_APP, "get_progress", self._progress)
-        self.cloud.deploy(SFT_APP, "mark_cancelled", self._cancelled)
+            self.cloud.deploy(app, name, self._train, held=True)
+            self.cloud.deploy(app, f"prepare_{name}", self._prepare, held=True)
+        self.cloud.deploy(app, "upload_dataset", self._upload)
+        self.cloud.deploy(app, "get_progress", self._progress)
+        self.cloud.deploy(app, "mark_cancelled", self._cancelled)
         self.cloud.deploy("overmind-register", "fetch_base_model", lambda **_: {"ok": True})
         return self
 
     def _prepare(self, preparation_id: str, request: dict) -> dict:
+        from modal_shared.training_data import row_key
+
+        body = self.cloud.files[request["rows_path"].removeprefix("/data")]
+        assert hashlib.sha256(body).hexdigest() == request["rows_sha256"]
+        rows = [json.loads(line) for line in gzip.decompress(body).splitlines()]
+        self.prepared[preparation_id] = {row_key(row): row for row in rows}
         return {
             "ready": True,
             "max_tokens": 64,
             "incompatible_rows": 0,
-            "rows": len(request["rows"]),
+            "rows": len(rows),
+            "artifact_sha256": hashlib.sha256(body).hexdigest(),
         }
 
-    def _upload(self, run_id: str, data_jsonl: str, val_jsonl=None, preparation_id=None) -> dict:
+    def _upload(
+        self, run_id: str, *, preparation_id, artifact_sha256, selections, monitoring=None
+    ) -> dict:
         self.uploads.append(run_id)
         self.runs[run_id] = {"status": "running", "steps": 2}
-        return {"run_id": run_id, "rows": len(data_jsonl.splitlines())}
+        rows = {}
+        for name, spec in selections.items():
+            content = self.cloud.files[f"/runs/{run_id}/selected-{name}.keys"]
+            assert hashlib.sha256(content).hexdigest() == spec["sha256"]
+            rows[name] = [
+                self.prepared[preparation_id][content[i : i + 32].hex()]
+                for i in range(0, len(content), 32)
+            ]
+            assert len(rows[name]) == spec["rows"]
+        self.materialized[run_id] = rows
+        return {"run_id": run_id, "rows": len(rows["data"])}
 
     def crash(self, message: str = "CUDA out of memory") -> None:
         for run in self.runs.values():
@@ -325,85 +384,3 @@ class ServingBackend:
     def _pre_warm(self, *, model_id: str, **_) -> dict:
         self.warmed.append(model_id)
         return {"ok": True}
-
-
-DECISION_APP = "overmind-decision"
-
-
-def _decision_answer(question: dict) -> dict:
-    if question["type"] == "noul":
-        return {"type": "noul", "noul": 0.7}
-    keys = (
-        list(question["criteria"])
-        if question["type"] == "choice"
-        else [str(i) for i in range(len(question["criteria"]))]
-    )
-    weights = {key: 0.1 / max(1, len(keys) - 1) for key in keys}
-    weights[keys[0]] = 0.9 if len(keys) > 1 else 1.0
-    return {"type": question["type"], "probabilities": weights}
-
-
-@dataclass
-class DecisionBackend:
-    """The ``overmind-decision`` app: staged records, training, evaluation and scoring.
-    Training and evaluation are held until released; scoring answers each question with
-    its first option at 0.9. Set ``train_error``, ``trained_error`` or ``score_error`` to
-    make the worker report that error in place of a result."""
-
-    cloud: FakeModal
-    staged: dict[str, dict[str, str | None]] = field(default_factory=dict)
-    trained: list[dict] = field(default_factory=list)
-    scored: list[dict] = field(default_factory=list)
-    train_error: dict | None = None
-    trained_error: dict | None = None
-    score_error: dict | None = None
-    train_metrics: dict = field(default_factory=dict)
-
-    def install(self, *, warm: bool = True) -> DecisionBackend:
-        self.cloud.deploy(DECISION_APP, "upload_records", self._upload)
-        self.cloud.deploy(DECISION_APP, "train_decision", self._train, held=True)
-        self.cloud.deploy(DECISION_APP, "train_d1", self._train, held=True)
-        self.cloud.deploy(DECISION_APP, "evaluate_decision", self._evaluate, held=True)
-        for server in ("ClefServer", "D3Server", "D1Server"):
-            self.cloud.deploy(DECISION_APP, f"{server}.score", self._score, held=not warm)
-        return self
-
-    def _upload(self, job_id: str, records_jsonl: str, eval_jsonl: str | None = None) -> dict:
-        self.staged[job_id] = {"records": records_jsonl, "eval": eval_jsonl}
-        return {"records": records_jsonl.count("\n")}
-
-    def _train(self, payload: dict) -> dict:
-        self.trained.append(payload)
-        if self.train_error is not None:
-            return {"error": self.train_error}
-        return {
-            "model": payload["repo"],
-            "saved": f"/artifacts/{payload['job_id']}/adapter",
-            **self.train_metrics,
-        }
-
-    def _records(self, job_id: str, name: str) -> list[dict]:
-        import json
-
-        return [json.loads(line) for line in (self.staged[job_id][name] or "").splitlines()]
-
-    def _evaluate(self, payload: dict) -> dict:
-        records = self._records(payload["job_id"], "eval")
-        base = [
-            {"answers": {key: _decision_answer(q) for key, q in record["questions"].items()}}
-            for record in records
-        ]
-        if self.trained_error is not None:
-            trained = [{"error": self.trained_error} for _ in records]
-        else:
-            trained = base
-        return {"base": base, "trained": trained}
-
-    def _score(self, payload: dict) -> dict:
-        self.scored.append(payload)
-        if self.score_error is not None:
-            return {"error": self.score_error}
-        return {
-            "answers": {key: _decision_answer(q) for key, q in payload["questions"].items()},
-            "usage": {"input_tokens": 12, "output_tokens": 0},
-        }

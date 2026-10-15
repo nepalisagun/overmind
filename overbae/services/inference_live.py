@@ -18,6 +18,7 @@ from modal_shared.shared import (
     worker_cls_name,
 )
 from overbae.models import DeployedModel
+from overbae.services.decision_serving import worker as decision_worker
 from overbae.services.deployed_chat import has_recent_inference
 from overbae.services.deployment import modal_environment, serving_gpu
 
@@ -92,6 +93,26 @@ def live_worker_stats(deployed: DeployedModel) -> dict:
         return {**unavailable, **signals}
 
     try:
+        if deployed.inference_contract == "decision":
+            key = f"decision-worker-stats:{deployed.pk}:{deployed.deployment_generation}"
+            measurements = cache.get(key)
+            if measurements is None:
+
+                async def inspect():
+                    stats = await asyncio.wait_for(
+                        decision_worker(deployed).predict.get_current_stats.aio(),
+                        timeout=WORKER_STATS_TIMEOUT,
+                    )
+                    return {
+                        "available": True,
+                        "backlog": stats.backlog,
+                        "num_running_inputs": stats.num_running_inputs,
+                        "num_total_runners": stats.num_total_runners,
+                    }
+
+                measurements = async_to_sync(inspect)()
+                cache.set(key, measurements, timeout=WORKER_STATS_TTL)
+            return {**measurements, **signals}
         environment = modal_environment()
         lora = bool(deployed.adapter_path)
         path = rel_weights_path(deployed.weights_path)

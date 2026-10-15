@@ -14,17 +14,17 @@
 
 
 /**
+ * * `pending` - Pending
  * * `file` - File
  * * `traces` - Traces
  * * `llm_calls` - Llm Calls
- * * `version` - Version
  * @export
  */
 export const DatasetSourceKindEnum = {
+    pending: 'pending',
     file: 'file',
     traces: 'traces',
-    llm_calls: 'llm_calls',
-    version: 'version'
+    llm_calls: 'llm_calls'
 } as const;
 export type DatasetSourceKindEnum = typeof DatasetSourceKindEnum[keyof typeof DatasetSourceKindEnum];
 

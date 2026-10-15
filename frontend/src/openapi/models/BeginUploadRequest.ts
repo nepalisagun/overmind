@@ -25,12 +25,6 @@ export interface BeginUploadRequest {
      * @memberof BeginUploadRequest
      */
     filename: string;
-    /**
-     *
-     * @type {string}
-     * @memberof BeginUploadRequest
-     */
-    project?: string;
 }
 
 /**
@@ -52,7 +46,6 @@ export function BeginUploadRequestFromJSONTyped(json: any, ignoreDiscriminator: 
     return {
 
         'filename': json['filename'],
-        'project': json['project'] == null ? undefined : json['project'],
     };
 }
 
@@ -68,6 +61,5 @@ export function BeginUploadRequestToJSONTyped(value?: BeginUploadRequest | null,
     return {
 
         'filename': value['filename'],
-        'project': value['project'],
     };
 }

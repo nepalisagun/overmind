@@ -18,12 +18,13 @@ from django.db.models.functions import Least
 from django.utils import timezone
 
 from overbae.models import Dataset, DatasetImport, User
-from overbae.services.datasets import events, files, heartbeat, llm_calls, paths
+from overbae.services.datasets import events, files, heartbeat, llm_calls, operations, paths
 from overbae.services.datasets import land as landing
 from overbae.services.datasets.lifecycle import DatasetError
 
 logger = logging.getLogger(__name__)
 
+LANDING_RECEIPT_VERSION = 1
 EXECUTION_SECONDS = 60 * 60
 LEASE_GRACE_SECONDS = 5 * 60
 LEASE_SECONDS = 5 * 60
@@ -31,13 +32,6 @@ MAX_ATTEMPTS = 3
 MAX_PUBLICATIONS = 8
 RECONCILE_BATCH = 40
 PUBLISH_LEASE_SECONDS = 30
-# The source itself cannot land, so a retry fails the same way.
-SOURCE_FAILURES = ("source_invalid", "mixed_sources", "source_missing", "source_changed")
-OPEN_STATES = (
-    DatasetImport.State.QUEUED,
-    DatasetImport.State.RUNNING,
-    DatasetImport.State.BLOCKED,
-)
 
 
 @dataclass(frozen=True)
@@ -60,11 +54,11 @@ def _uploads(source):
     )
 
 
-def _source_inputs(inputs, dataset):
+def _source_inputs(inputs):
     inputs = {**inputs, "source": dict(inputs["source"])}
     source = inputs["source"]
     if source.get("rows") is not None:
-        upload_id, _filename = files.begin_upload("pasted.jsonl", project=dataset.project_id)
+        upload_id, _filename = files.begin_upload("pasted.jsonl")
         with files.upload_data_path(upload_id).open("w", encoding="utf-8") as output:
             for row in source["rows"]:
                 output.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -77,8 +71,7 @@ def _source_inputs(inputs, dataset):
             stat = files.stored_stat(files.upload_data_path(upload_id))
         except OSError:
             stat = None
-        owned = files.belongs(upload_id, project=dataset.project_id, user=dataset.created_by_id)
-        if not filename or stat is None or not owned:
+        if not filename or stat is None:
             raise DatasetError(
                 "The source upload is missing. Upload it again.", code="source_missing"
             )
@@ -96,8 +89,6 @@ def _source_inputs(inputs, dataset):
                 "mtime_ns": stat.st_mtime_ns,
             }
         )
-    if len({files.is_document(source["filename"]) for source in manifest}) > 1:
-        raise DatasetError(files.MIXED, code="mixed_sources")
     return inputs, manifest
 
 
@@ -139,7 +130,7 @@ def queue_landing_receipt(dataset, task_id, inputs, *, published=False, preserve
     was_error = locked.state == Dataset.State.ERROR or (
         evaluation is not None and evaluation.state == Dataset.State.ERROR
     )
-    inputs, manifest = _source_inputs(inputs, locked)
+    inputs, manifest = _source_inputs(inputs)
     now = timezone.now()
     run = DatasetImport.objects.create(
         id=task_id,
@@ -205,7 +196,7 @@ def publish(run_id):
             pk=run_id, state=DatasetImport.State.QUEUED, publish_owner=owner
         ).update(
             failure_code="dispatch_failed",
-            error="The import could not start. Retry it.",
+            error="The broker did not acknowledge the import.",
             updated_at=timezone.now(),
         )
         return
@@ -254,7 +245,7 @@ def claim(run_id):
         )
         return None
     if run.attempts >= MAX_ATTEMPTS:
-        _block(run, "attempts_exhausted", "The import failed several times. Retry it.")
+        _block(run, "attempts_exhausted", "The import failed repeatedly. Its source is retained.")
         return None
     targets = list(
         Dataset.objects.select_for_update().filter(pk__in=_target_ids(run)).order_by("id")
@@ -262,9 +253,7 @@ def claim(run_id):
     if len(targets) != len(_target_ids(run)) or any(
         target.source is not None for target in targets
     ):
-        _block(
-            run, "source_mismatch", "The dataset changed during the import. Upload the file again."
-        )
+        _block(run, "source_mismatch", "The import targets changed before the source could land.")
         return None
     if any(target.state not in (Dataset.State.LANDING, Dataset.State.ERROR) for target in targets):
         _block(run, "ownership_lost", "Another operation changed this dataset.")
@@ -333,30 +322,44 @@ def fail(claimed, error, *, code="import_failed"):
         _block(run, code, error)
 
 
-def resumable_imports(dataset_id):
-    """Blocked imports of this dataset (or its split) that may still be retried."""
-    return DatasetImport.objects.filter(
-        Q(dataset_id=dataset_id) | Q(evaluation_id=dataset_id),
-        state=DatasetImport.State.BLOCKED,
-        attempts__lt=MAX_ATTEMPTS,
-    ).exclude(failure_code__in=SOURCE_FAILURES)
-
-
 @transaction.atomic
 def resume(run_id):
     run = DatasetImport.objects.select_for_update().get(pk=run_id)
     if run.state != DatasetImport.State.BLOCKED:
         raise DatasetError("Only a stopped import can be retried.", code="import_busy")
-    if run.failure_code in SOURCE_FAILURES:
-        raise DatasetError(
-            "The source cannot land. Fix it and upload it again.", code="not_resumable"
-        )
     if run.attempts >= MAX_ATTEMPTS:
         raise DatasetError(
-            "The import failed several times. Retry it.",
+            "The import attempt limit was reached. Its source is retained.",
             code="attempts_exhausted",
         )
     return _requeue(run)
+
+
+def resume_dataset(dataset):
+    run = DatasetImport.objects.filter(
+        Q(dataset=dataset) | Q(evaluation=dataset), state=DatasetImport.State.BLOCKED
+    ).first()
+    if run is None:
+        raise DatasetError("No stopped source import is available.", code="import_not_found")
+    resume(run.pk)
+    dataset.refresh_from_db()
+    return dataset
+
+
+def status(dataset):
+    run = DatasetImport.objects.filter(Q(dataset=dataset) | Q(evaluation=dataset)).first()
+    if run is None:
+        return None
+    return {
+        "id": str(run.pk),
+        "state": run.state,
+        "attempts": run.attempts,
+        "queued_at": run.queued_at.isoformat(),
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "failure_code": run.failure_code,
+        "error": run.error,
+        "can_resume": run.state == DatasetImport.State.BLOCKED and run.attempts < MAX_ATTEMPTS,
+    }
 
 
 def _requeue(run):
@@ -404,7 +407,7 @@ def validate_sources(run):
 def retained_uploads():
     retained = set()
     for manifest in (
-        DatasetImport.objects.filter(state__in=OPEN_STATES)
+        DatasetImport.objects.exclude(state=DatasetImport.State.COMPLETE)
         .values_list("source_manifest", flat=True)
         .iterator()
     ):
@@ -415,7 +418,7 @@ def retained_uploads():
 def _release_sources(run):
     for source in run.source_manifest:
         retained = (
-            DatasetImport.objects.filter(state__in=OPEN_STATES)
+            DatasetImport.objects.exclude(state=DatasetImport.State.COMPLETE)
             .filter(
                 source_manifest__contains=[{"upload_id": source["upload_id"]}],
             )
@@ -423,35 +426,6 @@ def _release_sources(run):
         )
         if not retained:
             files.discard_upload(source["upload_id"])
-
-
-def cancel(run_id):
-    """Stop an import that has not landed. A running attempt notices within a second,
-    closes its sandbox request and publishes nothing; its datasets keep no source."""
-    now = timezone.now()
-    with transaction.atomic():
-        moved = DatasetImport.objects.filter(pk=run_id, state__in=OPEN_STATES).update(
-            state=DatasetImport.State.CANCELLED,
-            owner=None,
-            lease_until=None,
-            failure_code="cancelled",
-            error=landing.STOPPED,
-            updated_at=now,
-        )
-        if not moved:
-            raise DatasetError("The import is not running.", code="import_not_running")
-        run = DatasetImport.objects.get(pk=run_id)
-        Dataset.objects.filter(
-            pk__in=_target_ids(run), state__in=[Dataset.State.LANDING, Dataset.State.ERROR]
-        ).update(state=Dataset.State.STOPPED, error="", updated_at=now)
-        for dataset_id in _target_ids(run):
-            transaction.on_commit(
-                lambda dataset_id=dataset_id: events.publish(
-                    dataset_id, {"dataset_id": str(dataset_id), "type": "land_cancelled"}
-                )
-            )
-        transaction.on_commit(lambda: _release_sources(run))
-    return run
 
 
 def reconcile():
@@ -490,7 +464,7 @@ def reconcile():
                     _block(
                         run,
                         "worker_timeout",
-                        "The import stopped before it finished. Retry it.",
+                        "The import worker stopped before publication. Its source is retained.",
                     )
                 else:
                     try:
@@ -508,68 +482,25 @@ def reconcile():
             elif run.state == DatasetImport.State.QUEUED:
                 transaction.on_commit(lambda run_id=run_id: publish(run_id))
         processed += 1
-    return {"processed": processed, "orphaned": _fail_orphaned_landings(now)}
+    return {"processed": processed}
 
 
-def _fail_orphaned_landings(now):
-    """A landing with no import receipt has nothing that can finish it."""
-    error = "The worker stopped before this finished."
-    with transaction.atomic():
-        stale = list(
-            Dataset.objects.filter(
-                state=Dataset.State.LANDING,
-                updated_at__lt=now - timedelta(seconds=EXECUTION_SECONDS + LEASE_GRACE_SECONDS),
-            )
-            .select_for_update(skip_locked=True)
-            .values_list("pk", flat=True)
-        )
-        if not stale:
-            return 0
-        owned = set()
-        for dataset_id, evaluation_id in DatasetImport.objects.filter(
-            Q(dataset_id__in=stale) | Q(evaluation_id__in=stale)
-        ).values_list("dataset_id", "evaluation_id"):
-            owned.update((dataset_id, evaluation_id))
-        ids = [pk for pk in stale if pk not in owned]
-        Dataset.objects.filter(pk__in=ids, state=Dataset.State.LANDING).update(
-            state=Dataset.State.ERROR, error=error, updated_at=now
-        )
-    for dataset_id in ids:
-        events.publish(
-            dataset_id, {"dataset_id": str(dataset_id), "type": "land_failed", "error": error}
-        )
-    return len(ids)
-
-
-def _read_parts(run, targets, stop):
+def _read_parts(run, targets):
     source = run.inputs["source"]
     split = run.inputs.get("split")
 
-    def progress(event):
-        if stop.is_set():
-            raise landing.LandError(landing.STOPPED, code="cancelled")
-        events.publish(run.dataset_id, {"dataset_id": str(run.dataset_id), **event})
+    def progress(detail):
+        for target in targets:
+            Dataset.objects.filter(pk=target.pk, state=Dataset.State.LANDING).update(
+                source_spec={**target.source_spec, "landing_progress": detail},
+                updated_at=timezone.now(),
+            )
+            events.publish(
+                target.pk, {"type": "land_progress", "dataset_id": str(target.pk), **detail}
+            )
 
     if source.get("uploads"):
-
-        def extracting(filename):
-            for target in targets:
-                events.publish(
-                    target.pk,
-                    {
-                        "dataset_id": str(target.pk),
-                        "type": "land_progress",
-                        "stage": "extracting",
-                        "filename": filename,
-                    },
-                )
-
-        read = landing.read_uploads(
-            source["uploads"],
-            json_rows_field=source.get("json_rows_field"),
-            on_extract=extracting,
-            stop=stop,
-        )
+        read = landing.read_uploads(source["uploads"], on_progress=progress)
         if source.get("pasted"):
             read = replace(read, spec={"pasted": True})
     elif source.get("upload_id"):
@@ -577,16 +508,21 @@ def _read_parts(run, targets, stop):
             files.upload_data_path(source["upload_id"]),
             filename=source.get("filename") or files.upload_filename(source["upload_id"]),
             json_rows_field=source.get("json_rows_field"),
+            on_progress=progress,
         )
     elif source.get("traces") is not None:
         read = landing.read_traces(
             run.dataset.project_id,
             source["traces"],
-            capability_id=run.dataset.capability_id,
-            on_progress=lambda done: progress({"type": "land_progress", "traces": done}),
+            on_progress=lambda done: events.publish(
+                run.dataset_id,
+                {
+                    "dataset_id": str(run.dataset_id),
+                    "type": "land_progress",
+                    "traces": done,
+                },
+            ),
         )
-    elif source.get("version") is not None:
-        read = landing.read_version(run.dataset.project_id, source["version"])
     elif source.get("llm_calls") is not None:
         read = llm_calls.read(
             run.dataset.project_id,
@@ -620,7 +556,7 @@ def _read_parts(run, targets, stop):
                         ),
                     )
                 )
-            return parts
+            return parts, Dataset.State.IDLE
         return [
             (
                 targets[0],
@@ -631,16 +567,15 @@ def _read_parts(run, targets, stop):
                     manifest=llm_calls.manifest_for(targets[0].intent),
                 ),
             )
-        ]
+        ], Dataset.State.IDLE
     else:
         raise landing.LandError("No saved source is available.")
     if not split:
-        return [(targets[0], read)]
-    documents = any(c["name"] == landing.DOCUMENT_GROUP for c in read.manifest or [])
+        return [(targets[0], read)], Dataset.State.IDLE
     cut = {
         "eval_percent": int(split["eval_percent"]),
         "position": split["position"],
-        "group_by": split.get("group_by") or ([landing.DOCUMENT_GROUP] if documents else []),
+        "group_by": split.get("group_by", []),
         "stratify_by": split.get("stratify_by"),
         "deduplicate": split.get("deduplicate", True),
     }
@@ -656,7 +591,7 @@ def _read_parts(run, targets, stop):
             (targets[0], train, "train", targets[1]),
             (targets[1], evaluation, "eval", targets[0]),
         )
-    ]
+    ], Dataset.State.IDLE
 
 
 def execute(task_id, inputs):
@@ -672,76 +607,93 @@ def execute(task_id, inputs):
         )
     elif task_id and str(run.pk) != str(task_id):
         return {"status": "superseded"}
+    if dataset.operation.get("state") == "cancelled":
+        DatasetImport.objects.filter(pk=run.pk).update(state=DatasetImport.State.CANCELLED)
+        return {"status": "cancelled"}
     claimed = claim(run.pk)
     if claimed is None:
         run.refresh_from_db()
         return {"status": run.state}
     stage = paths.dataset_dir(dataset.pk) / "imports" / str(run.pk) / str(claimed.owner)
     beat = heartbeat.start(lambda: renew(claimed), owner=f"import {run.pk}")
-    cancelled = DatasetImport.objects.filter(pk=run.pk, state=DatasetImport.State.CANCELLED)
-    with heartbeat.watch(cancelled.exists, owner=f"import {run.pk}") as stop:
-        try:
-            run.refresh_from_db()
-            validate_sources(run)
-            targets = [Dataset.objects.get(pk=pk) for pk in _target_ids(run)]
-            user = (
-                User.objects.filter(pk=run.inputs.get("user_id")).first()
-                if run.inputs.get("user_id")
-                else None
+    try:
+        run.refresh_from_db()
+        validate_sources(run)
+        targets = [Dataset.objects.get(pk=pk) for pk in _target_ids(run)]
+        user = (
+            User.objects.filter(pk=run.inputs.get("user_id")).first()
+            if run.inputs.get("user_id")
+            else None
+        )
+        for target in targets:
+            Dataset.objects.filter(pk=target.pk).update(
+                operation={
+                    "task_id": str(run.pk),
+                    "state": "running",
+                    "started_at": run.started_at.isoformat(),
+                }
             )
-            for target in targets:
-                events.publish(target.pk, {"type": "land_started", "dataset_id": str(target.pk)})
-            parts = _read_parts(run, targets, stop)
-            prepared = [
-                (
+            events.publish(target.pk, {"type": "land_started", "dataset_id": str(target.pk)})
+        parts, state = _read_parts(run, targets)
+        prepared = [
+            (
+                target,
+                landing.prepare(
                     target,
-                    landing.prepare(
-                        target,
-                        part,
-                        path=stage / f"{target.pk}.parquet",
-                        infer_capability=run.inputs.get("infer_capability", True),
-                    ),
-                )
-                for target, part in parts
-            ]
-            validate_sources(run)
-            if run.inputs["source"].get("llm_calls") is not None:
-                for target, result in prepared:
-                    report = result.cell_fields["intent_report"].get(target.intent, {})
-                    if not report.get("ok") or not result.cell_fields["rows"]:
-                        raise landing.LandError(
-                            report.get("reason") or "The source does not fit its intent."
-                        )
-            with publication(claimed) as locked:
-                rows = 0
-                for target, result in prepared:
-                    landing.publish(target, result, user=user)
-                    rows += result.cell_fields["rows"]
-                locked.state = DatasetImport.State.COMPLETE
-                locked.result = {"rows": rows}
-                locked.owner = locked.lease_until = None
-                locked.save(update_fields=["state", "result", "owner", "lease_until", "updated_at"])
+                    part,
+                    path=stage / f"{target.pk}.parquet",
+                    state=state,
+                    infer_capability=run.inputs.get("infer_capability", True),
+                ),
+            )
+            for target, part in parts
+        ]
+        validate_sources(run)
+        if run.inputs["source"].get("llm_calls") is not None:
             for target, result in prepared:
-                events.publish(
-                    target.pk,
-                    {
-                        "type": "land_done",
-                        "dataset_id": str(target.pk),
-                        "rows": result.cell_fields["rows"],
-                    },
-                )
-            run.refresh_from_db()
-            try:
-                _release_sources(run)
-            except OSError:
-                logger.exception("could not clean up completed dataset import %s", run.pk)
-            return {"status": "ok", "rows": rows}
-        except Exception as exc:  # noqa: BLE001 — a failed attempt retains its exact source
-            if stop.is_set():
-                return {"status": "cancelled"}
-            logger.exception("dataset import %s failed", run.pk)
-            fail(claimed, str(exc), code=getattr(exc, "code", "import_failed"))
-            return {"status": "failed", "error": str(exc)}
-        finally:
-            beat.set()
-            shutil.rmtree(stage, ignore_errors=True)
+                report = result.cell_fields["intent_report"].get(target.intent, {})
+                if not report.get("ok") or not result.cell_fields["rows"]:
+                    raise landing.LandError(
+                        report.get("reason") or "The source does not fit its intent."
+                    )
+        with publication(claimed) as locked:
+            rows = 0
+            for target, result in prepared:
+                landing.publish(target, result, user=user)
+                rows += result.cell_fields["rows"]
+            locked.state = DatasetImport.State.COMPLETE
+            locked.result = {"rows": rows}
+            locked.owner = locked.lease_until = None
+            locked.save(
+                update_fields=[
+                    "state",
+                    "result",
+                    "owner",
+                    "lease_until",
+                    "updated_at",
+                ]
+            )
+        for target, result in prepared:
+            events.publish(
+                target.pk,
+                {
+                    "type": "land_done",
+                    "dataset_id": str(target.pk),
+                    "rows": result.cell_fields["rows"],
+                },
+            )
+        run.refresh_from_db()
+        try:
+            _release_sources(run)
+        except OSError:
+            logger.exception("could not clean up completed dataset import %s", run.pk)
+        return {"status": "ok", "rows": rows}
+    except Exception as exc:  # noqa: BLE001 — a failed attempt retains its exact source
+        logger.exception("dataset import %s failed", run.pk)
+        fail(claimed, str(exc), code=getattr(exc, "code", "import_failed"))
+        return {"status": "failed", "error": str(exc)}
+    finally:
+        beat.set()
+        for target_id in _target_ids(run):
+            operations.finished(target_id, task_id=str(run.pk))
+        shutil.rmtree(stage, ignore_errors=True)

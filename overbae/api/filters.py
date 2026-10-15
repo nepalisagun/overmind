@@ -16,15 +16,14 @@ from overbae.models import (
     Capability,
     Conversation,
     DeployedModel,
+    EvalMatrix,
     EvalRun,
-    EvalSample,
-    Evaluator,
+    EvalRunRow,
+    EvalScore,
     FinetuningJob,
     Project,
-    Score,
+    SignalEvent,
     Span,
-    TaskExecution,
-    Verdict,
 )
 
 
@@ -64,19 +63,13 @@ class FinetuningJobFilter(filters.FilterSet):
 
 
 class LLMActivityFilterMixin:
-    """Shared model/usage filters for the traces toolbar, joined through span
-    ``attributes``. Subclasses provide ``_filter_usage`` — the two
-    implementations deliberately diverge and must not be merged: SpanFilter
-    applies the correlated usage SQL directly to its own rows, while
-    TaskExecutionFilter must evaluate it on the Span table first (an ``__in``
-    subquery would alias the span table and break the correlated SQL's
-    ``overbae_span.trace_id`` reference)."""
+    """Model/usage filters for the traces toolbar, joined through span ``attributes``.
+    Subclasses provide ``_filter_usage``."""
 
     def _scoped_project_ids(self, queryset):
         """Projects from the form, else the OUTER queryset — guards against
         unbounded scans (``services.trace_selection`` builds SpanFilter from a
-        payload with no ``project``). ``project`` cleans to a model instance on
-        SpanFilter and a bare UUID on TaskExecutionFilter."""
+        payload with no ``project``)."""
         project = self.form.cleaned_data.get("project")
         if project:
             return [getattr(project, "pk", project)]
@@ -127,6 +120,18 @@ class LLMActivityFilterMixin:
 
 
 class SpanFilter(LLMActivityFilterMixin, filters.FilterSet):
+    signal_event = filters.UUIDFilter(method="filter_signal_event")
+
+    def filter_signal_event(self, queryset, name, value):
+        event = SignalEvent.objects.filter(
+            pk=value, project_id__in=self._scoped_project_ids(queryset)
+        ).first()
+        if event is None:
+            return queryset.none()
+        trace_ids = event.details.get("trace_ids") or [event.trace_id]
+        return queryset.filter(project_id=event.project_id, trace_id__in=trace_ids)
+
+    capability = filters.UUIDFilter(method="filter_capability")
     name = filters.CharFilter(lookup_expr="icontains")
     operation = filters.CharFilter(lookup_expr="icontains")
     service_name = filters.CharFilter(lookup_expr="icontains")
@@ -157,9 +162,6 @@ class SpanFilter(LLMActivityFilterMixin, filters.FilterSet):
     # ``span_type=llm_call``, which ingest stamps on unlabelled spans by default.
     # The param name is frozen: it is in the OpenAPI schema and in saved filters.
     has_model = filters.BooleanFilter(method="filter_has_model")
-    capability = filters.ModelChoiceFilter(
-        queryset=Capability.objects.all(), method="filter_capability"
-    )
     # Spans ingest could not attribute to a current capability — the graph floor.
     unbound = filters.BooleanFilter(field_name="capability", lookup_expr="isnull")
 
@@ -167,6 +169,7 @@ class SpanFilter(LLMActivityFilterMixin, filters.FilterSet):
         model = Span
         fields = [
             "project",
+            "capability",
             "conversation",
             "trace_id",
             "span_id",
@@ -186,14 +189,13 @@ class SpanFilter(LLMActivityFilterMixin, filters.FilterSet):
 
     def filter_capability(self, queryset, name, value):
         if self.form.cleaned_data.get("all_spans"):
-            return queryset.filter(capability=value)
-        # A trace belongs to every capability that ran in it, not only its head's.
+            return queryset.filter(capability_id=value)
         return queryset.filter(
             Exists(
                 Span.objects.filter(
                     project_id=OuterRef("project_id"),
                     trace_id=OuterRef("trace_id"),
-                    capability=value,
+                    capability_id=value,
                 )
             )
         )
@@ -214,102 +216,6 @@ class SpanFilter(LLMActivityFilterMixin, filters.FilterSet):
         all_spans = bool(self.form.cleaned_data.get("all_spans"))
         expr = usage_sql(per_span_sql, all_spans=all_spans)
         return queryset.extra(where=[f"({expr}) {operator} %s"], params=[float(value)])
-
-
-class TaskExecutionFilter(LLMActivityFilterMixin, filters.FilterSet):
-    """Same query-param names as ``SpanFilter`` so the Console traces toolbar
-    can reuse its URL on the executions list. Span-level fields join through
-    the unit span or the execution's trace."""
-
-    project = filters.UUIDFilter(field_name="project_id")
-    capability = filters.UUIDFilter(field_name="capability_id")
-    behaviour = filters.UUIDFilter(field_name="behaviour_id")
-    binding_source = filters.CharFilter()
-    trace_id = filters.CharFilter()
-    status = filters.CharFilter()
-
-    started_at__gte = filters.IsoDateTimeFilter(field_name="started_at", lookup_expr="gte")
-    started_at__lte = filters.IsoDateTimeFilter(field_name="started_at", lookup_expr="lte")
-    received_at__gte = filters.IsoDateTimeFilter(field_name="started_at", lookup_expr="gte")
-    received_at__lte = filters.IsoDateTimeFilter(field_name="started_at", lookup_expr="lte")
-
-    min_duration_ms = filters.NumberFilter(field_name="duration_ms", lookup_expr="gte")
-    max_duration_ms = filters.NumberFilter(field_name="duration_ms", lookup_expr="lte")
-    has_error = filters.BooleanFilter(method="filter_has_error")
-
-    service_name = filters.CharFilter(method="filter_service_name")
-    operation = filters.CharFilter(method="filter_operation")
-    span_type = filters.CharFilter(method="filter_span_type")
-    status_code = filters.NumberFilter(method="filter_status_code")
-
-    model = filters.CharFilter(method="filter_model")
-    has_model = filters.BooleanFilter(method="filter_has_model")
-    total_tokens__gte = filters.NumberFilter(method="filter_total_tokens_gte")
-    total_tokens__lte = filters.NumberFilter(method="filter_total_tokens_lte")
-    total_cost__gte = filters.NumberFilter(method="filter_total_cost_gte")
-    total_cost__lte = filters.NumberFilter(method="filter_total_cost_lte")
-
-    class Meta:
-        model = TaskExecution
-        fields = ["project", "capability", "behaviour", "binding_source", "trace_id", "status"]
-
-    def _filter_unit_span(self, queryset, **lookups):
-        from django.db.models import Exists, OuterRef  # noqa: PLC0415
-
-        return queryset.filter(
-            Exists(
-                Span.objects.filter(
-                    project_id=OuterRef("project_id"),
-                    span_id=OuterRef("unit_span_id"),
-                    **lookups,
-                )
-            )
-        )
-
-    def filter_has_error(self, queryset, name, value):
-        return (
-            queryset.filter(status=TaskExecution.Status.ERROR)
-            if value
-            else queryset.exclude(status=TaskExecution.Status.ERROR)
-        )
-
-    def filter_service_name(self, queryset, name, value):
-        if not value:
-            return queryset
-        return self._filter_unit_span(queryset, service_name__icontains=value)
-
-    def filter_operation(self, queryset, name, value):
-        if not value:
-            return queryset
-        return self._filter_unit_span(queryset, operation__icontains=value)
-
-    def filter_span_type(self, queryset, name, value):
-        if not value:
-            return queryset
-        return self._filter_unit_span(queryset, span_type=value)
-
-    def filter_status_code(self, queryset, name, value):
-        if value is None:
-            return queryset
-        # OTel codes from the shared traces toolbar: 2 = error, 1 = OK.
-        if int(value) == 2:
-            return queryset.filter(status=TaskExecution.Status.ERROR)
-        if int(value) == 1:
-            return queryset.exclude(status=TaskExecution.Status.ERROR)
-        return self._filter_unit_span(queryset, status_code=value)
-
-    def _filter_usage(self, queryset, per_span_sql, operator, value):
-        # Evaluate here, on the Span table: an `__in` subquery would alias the
-        # span table and the correlated usage SQL still names
-        # `overbae_span.trace_id`. Do not merge with SpanFilter's version.
-        expr = usage_sql(per_span_sql, all_spans=False)
-        matching = list(
-            Span.objects.filter(project_id__in=self._scoped_project_ids(queryset))
-            .extra(where=[f"({expr}) {operator} %s"], params=[float(value)])
-            .values_list("trace_id", flat=True)
-            .distinct()
-        )
-        return queryset.filter(trace_id__in=matching)
 
 
 class SessionFilter(filters.FilterSet):
@@ -335,83 +241,59 @@ class SessionFilter(filters.FilterSet):
         )
 
 
-class EvaluatorFilter(filters.FilterSet):
-    name = filters.CharFilter(lookup_expr="icontains")
-    # A method filter, not an exact match: global managed templates
-    # (project IS NULL) must stay visible inside a project-scoped list.
-    project = filters.UUIDFilter(method="filter_project")
-    include_managed = filters.BooleanFilter(method="filter_include_managed")
+class EvalMatrixFilter(filters.FilterSet):
+    """``capability`` includes the project-wide rows that apply to it."""
+
+    capability = filters.UUIDFilter(method="filter_capability")
 
     class Meta:
-        model = Evaluator
-        fields = ["capability", "kind", "scope", "score_type", "is_managed", "is_archived"]
+        model = EvalMatrix
+        fields = ["project", "type", "enabled", "span_type"]
 
-    def filter_project(self, queryset, name, value):
+    def filter_capability(self, queryset, name, value):
         from django.db.models import Q  # noqa: PLC0415
 
-        include_managed = str(self.data.get("include_managed", "true")).lower() != "false"
-        q = Q(project_id=value)
-        if include_managed:
-            q |= Q(is_managed=True, project__isnull=True)
-        return queryset.filter(q)
-
-    def filter_include_managed(self, queryset, name, value):
-        # Applied inside filter_project; a no-op here so the param still reaches
-        # the schema.
-        return queryset
+        return queryset.filter(Q(capability_id=value) | Q(capability__isnull=True))
 
 
 class EvalRunFilter(filters.FilterSet):
     created_after = filters.DateTimeFilter(field_name="created_at", lookup_expr="gte")
     created_before = filters.DateTimeFilter(field_name="created_at", lookup_expr="lte")
-    # An EvalRun has no capability FK; the list serializer annotates it from the dataset.
     capability = filters.UUIDFilter(field_name="dataset__capability")
 
     class Meta:
         model = EvalRun
-        fields = ["project", "status", "data_source", "dataset"]
+        fields = ["project", "status", "mode", "dataset", "group", "is_baseline"]
 
 
-class EvalSampleFilter(filters.FilterSet):
+class EvalRunRowFilter(filters.FilterSet):
     class Meta:
-        model = EvalSample
-        fields = ["run", "variant", "row_index", "source_trace_id"]
+        model = EvalRunRow
+        fields = ["run", "state", "degraded", "row_index"]
 
 
-class ScoreFilter(filters.FilterSet):
-    name = filters.CharFilter(lookup_expr="icontains")
-    value_min = filters.NumberFilter(field_name="value", lookup_expr="gte")
-    value_max = filters.NumberFilter(field_name="value", lookup_expr="lte")
-
-    class Meta:
-        model = Score
-        fields = [
-            "run",
-            "variant",
-            "sample",
-            "evaluator",
-            "scope",
-            "data_type",
-            "source",
-            "failure_role",
-        ]
-
-
-class VerdictFilter(filters.FilterSet):
-    target_id__in = filters.BaseInFilter(field_name="target_id")
-    # All verdicts of one trace in a single call: span-target verdicts key on
-    # span_id, so the trace resolves through its spans.
+class EvalScoreFilter(filters.FilterSet):
+    source_id__in = filters.BaseInFilter(field_name="source_id")
+    # Every span score of one trace in a single call.
     trace_id = filters.CharFilter(method="filter_trace_id")
 
     class Meta:
-        model = Verdict
-        fields = ["target_id", "target_kind", "evaluator_name", "outcome"]
+        model = EvalScore
+        fields = ["project", "source_type", "source_id", "run"]
 
     def filter_trace_id(self, queryset, name, value):
+        span_ids = Span.objects.filter(trace_id=value).values("span_id")
         return queryset.filter(
-            target_kind=Verdict.TargetKind.SPAN,
-            target_id__in=Span.objects.filter(trace_id=value).values("span_id"),
-        )
+            source_type=EvalScore.SourceType.SPAN, source_id__in=span_ids
+        ) | queryset.filter(source_type=EvalScore.SourceType.TRAJECTORY, source_id=value)
+
+
+class SignalEventFilter(filters.FilterSet):
+    unseen = filters.BooleanFilter(field_name="seen_at", lookup_expr="isnull")
+
+    class Meta:
+        model = SignalEvent
+        fields = ["project", "capability", "signal_type", "trace_id", "conversation"]
 
 
 # Same sentinel the datasets list uses for its unassigned rows.

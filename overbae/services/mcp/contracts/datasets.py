@@ -1,19 +1,19 @@
-"""Bounded MCP contracts for datasets, their versions and script runs."""
+"""Bounded MCP contracts for Dataset + Cell. No ingestion, workshop, ft, or surface."""
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
 
-from django.db.models import Q
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 
-from overbae.models import Cell, Dataset, DatasetImport, Execution
-from overbae.services.datasets import executions, imports, lifecycle, paths, store, workshop
+from overbae.models import Cell, Dataset
+from overbae.services.datasets import analytics, imports, review, transformation
 from overbae.services.datasets.context import workshop_context
 from overbae.services.datasets.contract import public_intent
 from overbae.services.mcp.contracts.common import (
@@ -21,29 +21,18 @@ from overbae.services.mcp.contracts.common import (
     MCPModel,
     PageContract,
     ResourceLinkContract,
-    VersionRef,
-    request_key_field,
-    version_field,
 )
 
 _LIST_CAP = 100
-_VERSION_DEFAULT = 50
-_VERSION_CAP = 200
+_CELL_CAP = 50
 _SAMPLE_ROWS = 5
 _SAMPLE_CELL_CHARS = 600
 _QUERY_ROWS = 100
-_SCRIPT_CHARS = 4_000
-_SCRIPT_INPUT_CHARS = 20_000
-_STDOUT_CHARS = 4_000
+_SCRIPT_CHARS = 8_000
 _RANK_CAP = 20
 _SUMMARY_CHARS = 240
-_USED_BY_CAP = 20
-_LIVE_RUNS = 20
+_BUSY = (Dataset.State.LANDING, Dataset.State.RUNNING)
 _PATH_RE = re.compile(r"(?:/[\w.-]+)+")
-
-DatasetState = Literal[tuple(Dataset.State.values)]
-RunStatus = Literal["queued", "running", "ok", "failed", "cancelled"]
-SourceKind = Literal["file", "traces", "llm_calls", "version"]
 
 
 def _clip(value: str, limit: int = _SCRIPT_CHARS) -> str:
@@ -63,10 +52,66 @@ def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
-        return None if value != value else value
+        return value if math.isfinite(value) else None
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return _clip(str(value))
+
+
+def _json_bytes(value):
+    return len(json.dumps(value, ensure_ascii=False).encode())
+
+
+def _bounded(value, limit=2500):
+    value = _jsonable(value)
+    if _json_bytes(value) <= limit:
+        return value
+    if isinstance(value, dict):
+        result = {"truncated": True}
+        share = max(30, limit // max(1, len(value)) - 30)
+        for key, item in value.items():
+            candidate = {**result, key: _bounded(item, share)}
+            if _json_bytes(candidate) <= limit:
+                result = candidate
+        return result
+    if isinstance(value, list):
+        result = {"items": [], "total": len(value), "truncated": True}
+        for item in value:
+            candidate = {**result, "items": [*result["items"], _bounded(item, max(30, limit // 4))]}
+            if _json_bytes(candidate) > limit:
+                break
+            result = candidate
+        return result if _json_bytes(result) <= limit else {"truncated": True}
+    text = str(value)
+    while _json_bytes(text + "…") > limit:
+        text = text[: max(0, len(text) // 2)]
+    return text + "…"
+
+
+def _quality_summary(report):
+    result = review.summary(report or {})
+    for key in ("audit", "audits"):
+        if key in result:
+            result[key] = _bounded(result[key], 500)
+    result["checks"] = [
+        {**check, "evidence": _clip(check.get("evidence", ""), 160)}
+        for check in result.get("checks", [])
+    ]
+    if result.get("semantic_audit"):
+        result["semantic_audit"] = {
+            **result["semantic_audit"],
+            "definitions": _bounded(result["semantic_audit"].get("definitions", []), 1000),
+        }
+    return result
+
+
+def _source_summary(source):
+    # Page whole entries: clipping extraction metadata can erase OCR limitations.
+    return {
+        key: source[key]
+        for key in ("id", "sha256", "filename", "bytes", "rows", "extraction")
+        if key in source
+    }
 
 
 def sanitize_error(value: str, limit: int = 500) -> str:
@@ -82,9 +127,10 @@ def dataset_resource_link(dataset) -> ResourceLinkContract:
     return _link(f"overmind://datasets/{ds_id}", dataset.name or "Dataset")
 
 
-def dataset_import_job_link(dataset) -> ResourceLinkContract:
+def dataset_run_job_link(dataset) -> ResourceLinkContract:
     ds_id = quote(str(dataset.id), safe="")
-    return _link(f"overmind://jobs/dataset_import/{ds_id}", f"{dataset.name or 'Dataset'} import")
+    title = f"{dataset.name or 'Dataset'} run"
+    return _link(f"overmind://jobs/dataset_run/{ds_id}", title)
 
 
 def _capability_link(capability) -> ResourceLinkContract:
@@ -92,11 +138,15 @@ def _capability_link(capability) -> ResourceLinkContract:
     return _link(f"overmind://capabilities/{cap_id}", capability.name or "Capability")
 
 
+def _cell_link(dataset, cell) -> ResourceLinkContract:
+    """A cell is read through its dataset: the server serves no per-cell resource."""
+    ds_id = quote(str(dataset.id), safe="")
+    return _link(f"overmind://datasets/{ds_id}", cell.title.strip() or "Cell")
+
+
 class FitReport(MCPModel):
     ok: bool
     reason: str = Field(default="", max_length=500)
-    # Present only for decision rows, which decision models read instead of chat consumers.
-    format: Literal["decision"] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CapabilityRef(MCPModel):
@@ -105,7 +155,9 @@ class CapabilityRef(MCPModel):
     resource: ResourceLinkContract
 
 
-class ActiveVersion(VersionRef):
+class ActiveVersion(MCPModel):
+    id: str
+    version: str = Field(min_length=1, max_length=32)
     title: str = Field(min_length=1, max_length=255)
     rows: int = Field(ge=0)
     fingerprint: str = Field(default="", max_length=64)
@@ -115,52 +167,55 @@ class ActiveVersion(VersionRef):
 class DatasetListItem(MCPModel):
     id: str
     name: str = Field(default="", max_length=255)
-    intent: Literal["train", "eval", "pending"]
-    source_kind: SourceKind
-    state: DatasetState
+    intent: Literal["train", "eval", "explore", "pending"]
+    source_kind: Literal["file", "traces", "llm_calls", "pending"]
+    state: Literal["landing", "idle", "running", "error"]
     capability: CapabilityRef | None = None
     active: ActiveVersion | None = None
     resource: ResourceLinkContract
 
 
-class VersionAttachment(MCPModel):
-    filename: str = Field(default="", max_length=255)
-    rows: int | None = Field(default=None, ge=0)
+class CellTransformation(MCPModel):
+    execution: Literal[
+        "source", "unrecorded", "isolated_container", "platform_operations", "external_import"
+    ]
+    run: str | None = Field(max_length=36)
+    pipeline: str | None = Field(max_length=36)
+    revision: int | None = Field(ge=1)
+    package: str | None = Field(max_length=36)
+    package_sha256: str = Field(max_length=64)
+    entrypoint: str = Field(max_length=255)
+    provenance: str = Field(max_length=8000)
 
 
-class VersionRow(VersionRef):
-    parent: str | None = Field(default=None, max_length=32)
-    title: str = Field(min_length=1, max_length=255)
-    rows: int = Field(ge=0)
-    fits: bool
-    used: bool
-    attachment: VersionAttachment | None = None
-    created_at: datetime
-
-
-class VersionUse(MCPModel):
-    kind: Literal["eval_run", "finetune_job", "optimizer_experiment"]
+class CellSummary(MCPModel):
+    analytics: dict[str, Any] = Field(default_factory=dict)
+    preparation_plan: dict[str, Any] = Field(default_factory=dict)
     id: str
-    name: str = Field(default="", max_length=255)
-
-
-class VersionSummary(VersionRef):
-    parent: str | None = Field(default=None, max_length=32)
+    position: int = Field(ge=0)
+    version: str = Field(min_length=1, max_length=32)
     title: str = Field(min_length=1, max_length=255)
     script: str = Field(default="", max_length=_SCRIPT_CHARS)
     script_truncated: bool = False
+    transformation: CellTransformation
+    note: str = Field(default="", max_length=512)
+    note_truncated: bool = False
+    state: Literal["queued", "running", "ok", "failed"]
+    error: str | None = None
+    frozen: bool
     rows: int = Field(ge=0)
     columns: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     fingerprint: str = Field(default="", max_length=64)
-    fits: FitReport
+    input_fingerprint: str = Field(default="", max_length=64)
     intent_report: dict[str, Any] = Field(default_factory=dict)
     capability_report: dict[str, Any] = Field(default_factory=dict)
-    impact: dict[str, Any] = Field(default_factory=dict)
-    analytics: dict[str, Any] = Field(default_factory=dict)
-    attachment: dict[str, Any] = Field(default_factory=dict)
-    used: bool
-    used_by: list[VersionUse] = Field(default_factory=list, max_length=_USED_BY_CAP)
-    created_at: datetime
+    fits: FitReport
+    seconds: float = 0.0
+    review: dict[str, Any] = Field(default_factory=dict)
+    quality_report: dict[str, Any] = Field(default_factory=dict)
+    readiness: dict[str, Any] = Field(default_factory=dict)
+    used_at: datetime | None = None
+    resource: ResourceLinkContract
 
 
 class CapabilityRankItem(MCPModel):
@@ -170,7 +225,9 @@ class CapabilityRankItem(MCPModel):
     reason: str = Field(default="", max_length=500)
 
 
-class DatasetSample(VersionRef):
+class DatasetSample(MCPModel):
+    version: str = Field(min_length=1, max_length=32)
+    cell_id: str
     rows: list[dict[str, Any]] = Field(default_factory=list, max_length=_SAMPLE_ROWS)
 
 
@@ -185,58 +242,24 @@ class DatasetHumanAction(MCPModel):
     arguments: dict[str, str] = Field(default_factory=dict, max_length=20)
 
 
-class SourceFile(MCPModel):
-    filename: str = Field(max_length=255)
-    bytes: int | None = Field(default=None, ge=0)
-    rows: int | None = Field(default=None, ge=0)
-    extraction: dict[str, Any] = Field(default_factory=dict)
-
-
-class SourceVersion(VersionRef):
-    dataset: str
-    name: str = Field(default="", max_length=255)
-    fingerprint: str = Field(default="", max_length=64)
-    resource: ResourceLinkContract
-
-
-class SplitSibling(MCPModel):
-    id: str
-    name: str = Field(default="", max_length=255)
-    resource: ResourceLinkContract
-
-
-class SplitPair(MCPModel):
-    role: Literal["train", "eval"]
-    sibling: SplitSibling | None = None
-    eval_percent: int = Field(ge=1, le=99)
-
-
-class DatasetSource(MCPModel):
-    files: list[SourceFile] = Field(default_factory=list, max_length=_LIST_CAP)
-    limitations: list[str] = Field(default_factory=list, max_length=50)
-    version: SourceVersion | None = None
-    split: SplitPair | None = None
-
-
-class LiveRun(MCPModel):
-    id: str
-    mode: Literal["try", "probe", "cell", "synthetic"]
-    title: str = Field(default="", max_length=120)
-    state: Literal["queued", "running"]
-    queued_at: datetime
-    job: ResourceLinkContract
-
-
 class DatasetDetail(DatasetListItem):
-    active: VersionSummary | None = None
-    selected: VersionSummary | None = None
-    source: DatasetSource
+    operation: dict[str, Any] = Field(default_factory=dict)
+    landing_progress: dict[str, Any] | None = Field(
+        default=None,
+        description="Latest file stage; completed/total count files. PDF OCR adds pages_total, ocr_pages_completed and ocr_pages_total. Not an ETA or overall percentage.",
+    )
+    preparation_plan: dict[str, Any] = Field(default_factory=dict)
+    brief: str = Field(default="", max_length=8000)
+    sources: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    sources_total: int = Field(default=0, ge=0)
+    source_page: PageContract
     preparation_context: dict[str, Any] = Field(default_factory=dict)
     contamination_report: dict[str, Any] = Field(default_factory=dict)
     capability_rank: list[CapabilityRankItem] = Field(default_factory=list, max_length=_RANK_CAP)
-    versions: list[VersionRow] = Field(default_factory=list, max_length=_VERSION_CAP)
-    versions_total: int = Field(ge=0)
-    running: list[LiveRun] = Field(default_factory=list, max_length=_LIVE_RUNS)
+    cells: list[CellSummary] = Field(default_factory=list, max_length=_CELL_CAP)
+    cells_truncated: bool = False
+    cell_page: PageContract
+    truncated_fields: list[str] = Field(default_factory=list)
     sample: DatasetSample | None = None
     next_actions: list[NextAction] = Field(default_factory=list, max_length=8)
     resource_links: list[ResourceLinkContract] = Field(default_factory=list, max_length=8)
@@ -248,12 +271,17 @@ class DatasetDetail(DatasetListItem):
 class DatasetMutationRef(MCPModel):
     id: str
     name: str = Field(default="", max_length=255)
-    state: DatasetState
+    state: Literal["landing", "idle", "running", "error"]
     resource: ResourceLinkContract
 
 
 class DatasetJobReceipt(JobReceipt):
-    kind: Literal["dataset_import"] = "dataset_import"
+    kind: Literal["dataset_run"] = "dataset_run"
+
+
+class DatasetUploadHandoff(MCPModel):
+    argv: list[str]
+    replace: dict[str, str]
 
 
 class DatasetMutationOutput(MCPModel):
@@ -261,27 +289,21 @@ class DatasetMutationOutput(MCPModel):
     dataset: DatasetMutationRef
     job: DatasetJobReceipt
     eval_dataset: DatasetMutationRef | None = None
+    upload: DatasetUploadHandoff | None = None
+    # Set by create_dataset_from_traces: the traces the selection resolved to.
     traces: int | None = Field(default=None, ge=0)
+    # Set by create_dataset_from_llm_calls: spans matching the selection.
     calls: int | None = Field(default=None, ge=0)
     resource_links: list[ResourceLinkContract] = Field(max_length=4)
 
 
-def _dataset_field():
-    return Field(
-        min_length=1,
-        max_length=255,
-        validation_alias=AliasChoices("dataset", "dataset_id"),
-    )
-
-
 class ListDatasetsInput(MCPModel):
     capability: str | None = Field(default=None, min_length=1, max_length=255)
-    intent: Literal["train", "eval", "pending"] | None = None
-    state: DatasetState | None = None
+    intent: Literal["train", "eval", "explore", "pending"] | None = None
+    state: Literal["landing", "idle", "running", "error"] | None = None
     search: str | None = Field(default=None, min_length=1, max_length=255)
     limit: int = Field(default=20, ge=1, le=_LIST_CAP)
     offset: int = Field(default=0, ge=0)
-    cursor: str | None = Field(default=None, min_length=1, max_length=20)
 
 
 class ListDatasetsOutput(MCPModel):
@@ -292,27 +314,38 @@ class ListDatasetsOutput(MCPModel):
 
 
 class InspectDatasetInput(MCPModel):
-    dataset: str = _dataset_field()
-    version: str | None = version_field()
-    version_offset: int = Field(default=0, ge=0)
-    version_limit: int = Field(default=_VERSION_DEFAULT, ge=1, le=_VERSION_CAP)
+    dataset: str = Field(
+        min_length=1,
+        max_length=255,
+        validation_alias=AliasChoices("dataset", "dataset_id"),
+    )
+    cell_offset: int = Field(default=0, ge=0)
+    cell_limit: int = Field(default=5, ge=1, le=20)
+    source_offset: int = Field(default=0, ge=0)
+    source_limit: int = Field(default=10, ge=1, le=20)
 
 
 class QueryDatasetInput(MCPModel):
-    dataset: str = _dataset_field()
+    dataset: str = Field(
+        min_length=1,
+        max_length=255,
+        validation_alias=AliasChoices("dataset", "dataset_id"),
+    )
     sql: str = Field(
         min_length=1,
         max_length=8_000,
-        description="One DuckDB SELECT over table t. source_row is row identity, not data.",
+        description="One SELECT over the table `t`, the chosen cell. DuckDB dialect; nested columns have JSON type. "
+        "`source_row` is the row's identity in the source, not data.",
     )
-    version: str | None = version_field()
+    cell: str | None = Field(default=None, min_length=1, max_length=80)
     limit: int = Field(default=_QUERY_ROWS, ge=1, le=_QUERY_ROWS)
 
 
 class QueryDatasetOutput(MCPModel):
     summary: str = Field(min_length=1, max_length=_SUMMARY_CHARS)
     dataset: str
-    version: VersionRef
+    cell_id: str
+    version: str | None = None
     columns: list[str] = Field(default_factory=list, max_length=200)
     rows: list[dict[str, Any]] = Field(default_factory=list, max_length=_QUERY_ROWS)
     n: int = Field(ge=0, le=_QUERY_ROWS)
@@ -321,25 +354,71 @@ class QueryDatasetOutput(MCPModel):
 
 
 class SplitInput(MCPModel):
-    eval_percent: int = Field(default=20, ge=1, le=99)
-    position: Literal["head", "tail", "random", "hash"] | None = Field(
-        default=None,
-        description="Where eval rows come from; default tail, and llm_calls only hash span_id.",
-    )
     group_by: list[str] = Field(default_factory=list, max_length=10)
     stratify_by: str | None = Field(default=None, max_length=255)
     deduplicate: bool = True
+    eval_percent: int = Field(
+        default=20, ge=1, le=99, description="Share of the rows that lands as the eval dataset."
+    )
+    position: Literal["head", "tail", "random"] = Field(
+        default="tail", description="Where the eval rows are taken from."
+    )
 
 
-class TracesSource(MCPModel):
-    kind: Literal["traces"]
-    trace_ids: list[str] | None = Field(default=None, max_length=10_000)
+class CreateDatasetFromTracesInput(MCPModel):
+    """One row lands per trace. Either ``trace_ids`` or a filter selection, never both."""
+
+    name: str = Field(min_length=1, max_length=255, description="Dataset name.")
+    brief: str = Field(default="", max_length=8000)
+    trace_ids: list[str] | None = Field(
+        default=None,
+        max_length=10_000,
+        description="Explicit trace ids (32 hex chars each). Rows land in this order.",
+    )
     filters: dict[str, Any] | None = Field(
         default=None,
-        description="query_traces arguments or traces-list filters; unknown keys are refused.",
+        description=(
+            "Traces-list filters. Keys: capability (uuid), has_error (true|false), "
+            "received_at__gte / received_at__lte (ISO 8601), model, service_name, "
+            "session (uuid), conversation, min_duration_ms / max_duration_ms, "
+            "total_tokens__gte / __lte, total_cost__gte / __lte, unbound (true|false). "
+            "An unknown key is refused."
+        ),
     )
-    search: str | None = Field(default=None, min_length=1, max_length=255)
-    limit: int | None = Field(default=None, ge=1, le=1_000_000, description="Newest first.")
+    search: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="Free text over span name, service name, trace id and span id.",
+    )
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=1_000_000,
+        description="Take at most this many matching traces, newest first.",
+    )
+    intent: Literal["train", "eval"] | None = Field(
+        default=None,
+        description="Omit to explore before choosing training or evaluation. Landing leaves purpose pending.",
+    )
+    capability: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description=(
+            "Destination capability uuid. If present in a trace, land its unique invocation "
+            "and descendants; repeated invocations fail. Otherwise retain the complete source "
+            "trace. A source capability filter takes precedence for extraction. Omit to infer "
+            "from source rows; null means none."
+        ),
+    )
+    split: SplitInput | None = Field(
+        default=None,
+        description=(
+            "Land the selection as two datasets, `<name> train` and `<name> eval`, "
+            "with disjoint rows. Cannot be combined with intent."
+        ),
+    )
 
     @model_validator(mode="after")
     def require_selection(self):
@@ -347,217 +426,47 @@ class TracesSource(MCPModel):
             raise ValueError("provide trace_ids, or filters and/or search")
         if self.trace_ids and (self.filters or self.search):
             raise ValueError("give either trace_ids or a filter selection, not both")
-        if self.filters is not None and len(json.dumps(self.filters, default=str)) > 12_000:
-            raise ValueError("filters are too large")
+        if self.split is not None and self.intent is not None:
+            raise ValueError("split fixes the intents; omit intent")
         return self
 
+    @field_validator("filters")
+    @classmethod
+    def filters_are_object(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        encoded = json.dumps(value, default=str)
+        if len(encoded) > 12_000:
+            raise ValueError("filters are too large")
+        return value
 
-class LlmCallsSource(MCPModel):
-    kind: Literal["llm_calls"]
+
+class CreateDatasetFromLlmCallsInput(MCPModel):
+    name: str = Field(min_length=1, max_length=255)
+    capability: str = Field(min_length=1, max_length=255)
     since: str = Field(min_length=1, max_length=64)
     until: str | None = Field(default=None, max_length=64)
     model: str | None = Field(default=None, max_length=255)
     limit: int = Field(default=200, ge=1, le=10_000)
-
-
-class VersionSource(MCPModel):
-    kind: Literal["version"]
-    dataset: str = Field(min_length=1, max_length=255)
-    version: str | None = version_field()
-
-
-class CreateDatasetInput(MCPModel):
-    name: str = Field(min_length=1, max_length=255)
-    source: TracesSource | LlmCallsSource | VersionSource = Field(discriminator="kind")
-    intent: Literal["train", "eval"] | None = Field(
-        default=None, description="Omit to propose it from the rows, or keep a version's."
-    )
-    capability: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=255,
-        description="Id, name or slug. Omit to infer it, or keep a version's; null means none.",
-    )
-    split: SplitInput | None = Field(
-        default=None, description="Land `<name> train` and `<name> eval` with disjoint rows."
-    )
-    request_key: str | None = request_key_field()
+    intent: Literal["train", "eval"] = "eval"
+    split: bool = False
+    eval_percent: int = Field(default=20, ge=1, le=99)
 
     @model_validator(mode="after")
-    def check_shape(self):
-        if self.split is not None and self.intent is not None:
-            raise ValueError("split fixes the intents; omit intent")
-        if self.split is not None and len(self.name) > 249:
+    def split_name_fits(self):
+        # create_split appends " train" / " eval", and Dataset.name is 255.
+        if self.split and len(self.name) > 249:
             raise ValueError("name must be at most 249 characters when split is set")
-        if self.source.kind == "llm_calls":
-            if not self.capability:
-                raise ValueError("llm_calls needs capability")
-            if self.split is None and self.intent is None:
-                raise ValueError("llm_calls needs intent or split")
         return self
 
 
-def _attachment_field():
-    return Field(
-        default=None,
-        min_length=36,
-        max_length=36,
-        description="upload_id from `overmind dataset attach FILE --json`; the script reads "
-        "it as the frame attachment.",
-    )
-
-
-class TryDatasetScriptInput(MCPModel):
-    dataset: str = _dataset_field()
-    parent: str | None = version_field()
-    script: str = Field(min_length=1, max_length=_SCRIPT_INPUT_CHARS)
-    attachment: str | None = _attachment_field()
-
-
-class ProbeDatasetVersionInput(MCPModel):
-    dataset: str = _dataset_field()
-    version: str | None = version_field()
-    script: str = Field(min_length=1, max_length=_SCRIPT_INPUT_CHARS)
-
-
-class AddDatasetVersionInput(MCPModel):
-    dataset: str = _dataset_field()
-    parent: str | None = version_field()
-    title: str = Field(min_length=1, max_length=120)
-    script: str = Field(min_length=1, max_length=_SCRIPT_INPUT_CHARS)
-    attachment: str | None = _attachment_field()
-
-
-class AddSyntheticExamplesInput(MCPModel):
-    dataset: str = _dataset_field()
-    parent: str | None = version_field()
-    rows: list[dict[str, Any]] = Field(min_length=1, max_length=50)
-    instruction: str = Field(min_length=1, max_length=4_000)
-
-
-class DiffDatasetVersionsInput(MCPModel):
-    dataset: str = _dataset_field()
-    start: str | None = Field(default=None, min_length=1, max_length=80, alias="from")
-    to: str | None = version_field()
-
-
-class ActivateDatasetVersionInput(MCPModel):
-    dataset: str = _dataset_field()
-    version: str = Field(min_length=1, max_length=80)
-    expected_active: str | None = version_field()
-
-
-class UpdateDatasetInput(MCPModel):
-    dataset: str = _dataset_field()
-    name: str | None = Field(default=None, min_length=1, max_length=255)
-    intent: Literal["train", "eval"] | None = None
-    capability: str | None = Field(default=None, min_length=1, max_length=255)
-
-
-class ResumeDatasetImportInput(MCPModel):
-    dataset: str = _dataset_field()
-
-
-class CancelDatasetJobInput(MCPModel):
-    dataset: str = _dataset_field()
-    run: str | None = Field(
-        default=None,
-        min_length=36,
-        max_length=36,
-        description="Script run id; omit for the import.",
-    )
-
-
-class CancelDatasetJobOutput(MCPModel):
-    summary: str = Field(min_length=1, max_length=_SUMMARY_CHARS)
-    kind: Literal["dataset_import", "dataset_run"]
-    id: str
-    status: str = Field(min_length=1, max_length=16)
-    datasets: list[DatasetMutationRef] = Field(default_factory=list, max_length=2)
-    resource_links: list[ResourceLinkContract] = Field(default_factory=list, max_length=3)
-
-
-class RunReceipt(JobReceipt):
-    kind: Literal["dataset_run"] = "dataset_run"
-
-
-class ScriptRunOutput(MCPModel):
-    summary: str = Field(min_length=1, max_length=_SUMMARY_CHARS)
-    status: RunStatus
-    run: str | None = None
-    job: RunReceipt | None = None
-    transient: bool = False
-    error: str | None = None
-    stdout: str = Field(default="", max_length=_STDOUT_CHARS)
-    queued_at: datetime | None = None
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-    resource_links: list[ResourceLinkContract] = Field(default_factory=list, max_length=2)
-
-
-class TryDatasetScriptOutput(ScriptRunOutput):
-    rows: int | None = Field(default=None, ge=0)
-    columns: list[str] = Field(default_factory=list, max_length=200)
-    head: list[dict[str, Any]] = Field(default_factory=list, max_length=executions.PREVIEW_ROWS)
-
-
-class AddDatasetVersionOutput(ScriptRunOutput):
-    created: bool = False
-    version: VersionSummary | None = None
-
-
-class DiffDatasetVersionsOutput(MCPModel):
-    summary: str = Field(min_length=1, max_length=_SUMMARY_CHARS)
-    start: str = Field(alias="from", min_length=1, max_length=32)
-    to: str = Field(min_length=1, max_length=32)
-    diff: dict[str, Any] = Field(default_factory=dict)
-    resource_links: list[ResourceLinkContract] = Field(default_factory=list, max_length=2)
-
-
-class DatasetOutput(MCPModel):
-    summary: str = Field(min_length=1, max_length=_SUMMARY_CHARS)
-    dataset: DatasetListItem
-    resource_links: list[ResourceLinkContract] = Field(default_factory=list, max_length=2)
-
-
-def mutation_ref(dataset) -> DatasetMutationRef:
+def _mutation_ref(dataset) -> DatasetMutationRef:
     return DatasetMutationRef(
         id=str(dataset.id),
         name=dataset.name or "",
         state=dataset.state,
         resource=dataset_resource_link(dataset),
     )
-
-
-def import_receipt(dataset) -> DatasetImport | None:
-    return (
-        DatasetImport.objects.filter(Q(dataset=dataset) | Q(evaluation=dataset))
-        .order_by("-queued_at")
-        .first()
-    )
-
-
-STOPPED = "stopped"
-_LANDED_STATUS = {
-    Dataset.State.LANDING: DatasetImport.State.QUEUED,
-    Dataset.State.IDLE: "landed",
-    Dataset.State.ERROR: "failed",
-}
-
-
-def import_status(dataset, receipt: DatasetImport | None) -> str:
-    """The import's own state: queued, running, blocked, landed, failed or stopped."""
-    if receipt is None:
-        return _LANDED_STATUS.get(dataset.state, dataset.state)
-    if receipt.state == DatasetImport.State.COMPLETE:
-        return "landed"
-    if receipt.state == DatasetImport.State.CANCELLED:
-        return STOPPED
-    if receipt.state == DatasetImport.State.BLOCKED and not (
-        imports.resumable_imports(dataset.pk).filter(pk=receipt.pk).exists()
-    ):
-        return "failed"
-    return receipt.state
 
 
 def mutation_output(
@@ -568,29 +477,72 @@ def mutation_output(
     calls: int | None = None,
     eval_dataset=None,
 ) -> DatasetMutationOutput:
-    links = [dataset_resource_link(dataset), dataset_import_job_link(dataset)]
+    links = [dataset_resource_link(dataset), dataset_run_job_link(dataset)]
     if eval_dataset is not None:
-        links += [dataset_resource_link(eval_dataset), dataset_import_job_link(eval_dataset)]
+        links += [dataset_resource_link(eval_dataset), dataset_run_job_link(eval_dataset)]
     return DatasetMutationOutput(
         summary=_clip(summary, _SUMMARY_CHARS),
-        dataset=mutation_ref(dataset),
+        upload=DatasetUploadHandoff(
+            argv=[
+                "overmind",
+                "dataset",
+                "upload",
+                "FILE",
+                "--project-id",
+                str(dataset.project_id),
+                "--dataset",
+                str(dataset.id),
+                "--json",
+            ],
+            replace={
+                "FILE": "Absolute local file path; add --json-rows-field FIELD for a selected JSON wrapper array."
+            },
+        )
+        if dataset.source_kind == "pending"
+        else None,
+        dataset=_mutation_ref(dataset),
         job=DatasetJobReceipt(
+            kind="dataset_run",
             id=str(dataset.id),
-            status=import_status(dataset, import_receipt(dataset)),
+            status=dataset.state,
             resource=links[1],
         ),
-        eval_dataset=mutation_ref(eval_dataset) if eval_dataset is not None else None,
+        eval_dataset=_mutation_ref(eval_dataset) if eval_dataset is not None else None,
         traces=traces,
         calls=calls,
         resource_links=links,
     )
 
 
+class StartDatasetInput(MCPModel):
+    brief: str = Field(min_length=1, max_length=8000)
+    name: str = Field(default="Untitled dataset", min_length=1, max_length=255)
+    intent: Literal["train", "eval", "explore", "pending"] = "pending"
+    capability: str | None = Field(default=None, max_length=255)
+
+
+def _chain(dataset) -> list[Cell]:
+    cached = getattr(dataset, "_prefetched_objects_cache", {}).get("cells")
+    if cached is not None:
+        return sorted(cached, key=lambda cell: cell.position)
+    return dataset.chain
+
+
+def _active_cell(dataset, chain: list[Cell]) -> Cell | None:
+    ran = [cell for cell in chain if cell.state == Cell.State.OK and cell.fingerprint]
+    if dataset.active_id is not None:
+        for cell in ran:
+            if cell.id == dataset.active_id:
+                return cell
+    return ran[-1] if ran else None
+
+
+def _frozen_before(chain: list[Cell]) -> int:
+    used = [cell.position for cell in chain if cell.used_at is not None]
+    return max(used, default=-1)
+
+
 def _fit(cell: Cell, intent: str) -> FitReport:
-    decision = (cell.intent_report or {}).get("decision") or {}
-    if decision.get("reason") != "no decision rows" and decision:
-        ok, reason = cell.fits_decision()
-        return FitReport(ok=ok, reason=sanitize_error(reason, 500), format="decision")
     ok, reason = cell.fits(intent)
     return FitReport(ok=ok, reason=sanitize_error(reason, 500))
 
@@ -606,21 +558,22 @@ def _capability_ref(dataset) -> CapabilityRef | None:
     )
 
 
-def _active_version(dataset) -> ActiveVersion | None:
-    cell = dataset.active
+def _active_version(dataset, chain: list[Cell], versions: dict) -> ActiveVersion | None:
+    cell = _active_cell(dataset, chain)
     if cell is None:
         return None
     return ActiveVersion(
         id=str(cell.id),
-        version=cell.label,
-        title=cell.title.strip() or "Version",
+        version=versions.get(cell.id, "1.0"),
+        title=cell.title.strip() or "Cell",
         rows=int(cell.rows or 0),
         fingerprint=cell.fingerprint or "",
         fits=_fit(cell, public_intent(dataset.intent)),
     )
 
 
-def _list_fields(dataset) -> dict[str, Any]:
+def _list_fields(dataset, chain: list[Cell]) -> dict[str, Any]:
+    versions = dataset.versions(chain=chain)
     return {
         "id": str(dataset.id),
         "name": dataset.name or "",
@@ -628,74 +581,52 @@ def _list_fields(dataset) -> dict[str, Any]:
         "source_kind": dataset.source_kind,
         "state": dataset.state,
         "capability": _capability_ref(dataset),
-        "active": _active_version(dataset),
+        "active": _active_version(dataset, chain, versions),
         "resource": dataset_resource_link(dataset),
     }
 
 
 def serialize_dataset_list_item(dataset) -> DatasetListItem:
-    return DatasetListItem.model_validate(_list_fields(dataset))
+    return DatasetListItem.model_validate(_list_fields(dataset, _chain(dataset)))
 
 
-def version_row(dataset, cell: Cell) -> VersionRow:
-    attachment = cell.attachment or {}
-    return VersionRow(
-        id=str(cell.id),
-        version=cell.label,
-        parent=cell.parent.label if cell.parent_id else None,
-        title=cell.title.strip() or "Version",
-        rows=int(cell.rows or 0),
-        fits=_fit(cell, public_intent(dataset.intent)).ok,
-        used=cell.used_at is not None,
-        attachment=VersionAttachment(
-            filename=str(attachment.get("filename") or "")[:255], rows=attachment.get("rows")
-        )
-        if attachment
-        else None,
-        created_at=cell.created_at,
-    )
-
-
-_USE_KINDS = (
-    ("eval_runs", "eval_run"),
-    ("finetuning_jobs", "finetune_job"),
-    ("optimizer_experiments", "optimizer_experiment"),
-)
-
-
-def _used_by(cell: Cell) -> list[VersionUse]:
-    usage = lifecycle.usage(cell)
-    return [
-        VersionUse(kind=kind, id=row["id"], name=str(row.get("name") or "")[:255])
-        for key, kind in _USE_KINDS
-        for row in usage[key]
-    ][:_USED_BY_CAP]
-
-
-def version_summary(dataset, cell: Cell) -> VersionSummary:
+def _cell_summary(
+    dataset, cell: Cell, versions: dict, frozen_before: int, attribution: dict
+) -> CellSummary:
+    version = versions.get(cell.id, "1.0")
+    error = sanitize_error(cell.error) or None
     columns = [
         _jsonable(col) if isinstance(col, dict) else {"name": str(col)}
         for col in (cell.columns or [])[:100]
     ]
-    return VersionSummary(
+    return CellSummary(
         id=str(cell.id),
-        version=cell.label,
-        parent=cell.parent.label if cell.parent_id else None,
-        title=cell.title.strip() or "Version",
+        position=cell.position,
+        version=version,
+        title=cell.title.strip() or "Cell",
         script=_clip(cell.script or ""),
         script_truncated=len(cell.script or "") > _SCRIPT_CHARS,
+        transformation=attribution,
+        note=_clip(cell.note or "", 512),
+        note_truncated=len(cell.note or "") > 512,
+        state=cell.state,
+        error=error,
+        frozen=cell.used_at is not None or cell.position <= frozen_before,
         rows=int(cell.rows or 0),
         columns=columns,
         fingerprint=cell.fingerprint or "",
-        fits=_fit(cell, public_intent(dataset.intent)),
+        input_fingerprint=cell.input_fingerprint or "",
         intent_report=_jsonable(cell.intent_report or {}),
         capability_report=_jsonable(cell.capability_report or {}),
-        impact=_jsonable(cell.impact or {}),
-        analytics=_jsonable(cell.analytics or {}),
-        attachment=_jsonable(cell.attachment or {}),
-        used=cell.used_at is not None,
-        used_by=_used_by(cell),
-        created_at=cell.created_at,
+        review=_bounded(cell.review),
+        quality_report=_jsonable(_quality_summary(cell.quality_report)),
+        analytics=analytics.describe(cell),
+        preparation_plan=_bounded(cell.preparation_plan),
+        readiness=review.readiness(dataset, cell),
+        fits=_fit(cell, public_intent(dataset.intent)),
+        seconds=float(cell.seconds or 0),
+        used_at=cell.used_at,
+        resource=_cell_link(dataset, cell),
     )
 
 
@@ -727,9 +658,11 @@ def _sample_cell(value: Any) -> Any:
     return value
 
 
-def _sample(dataset, cell: Cell | None) -> DatasetSample | None:
-    if cell is None:
+def _sample(dataset, cell: Cell | None, versions: dict) -> DatasetSample | None:
+    if cell is None or not cell.ran:
         return None
+    from overbae.services.datasets import paths, store
+
     path = paths.cell_path(dataset.id, cell.id)
     if not path.exists():
         return None
@@ -738,413 +671,249 @@ def _sample(dataset, cell: Cell | None) -> DatasetSample | None:
     except Exception:  # noqa: BLE001 — sample is optional; never leak store errors
         return None
     return DatasetSample(
-        id=str(cell.id),
-        version=cell.label,
-        rows=[{str(k): _sample_cell(v) for k, v in row.items()} for row in rows],
+        version=versions.get(cell.id, "1.0"),
+        cell_id=str(cell.id),
+        rows=[
+            {str(k): _sample_cell(v) for k, v in row.items()}
+            if isinstance(row, dict)
+            else {"value": _sample_cell(row)}
+            for row in rows
+        ],
     )
 
 
 def _human_action(dataset, active: Cell | None) -> DatasetHumanAction | None:
+    project_id = str(dataset.project_id)
     if active is not None:
         return DatasetHumanAction(
-            command="overmind dataset export DATASET --cell VERSION --json",
-            arguments={"dataset": str(dataset.id), "version": active.label},
+            command="overmind dataset export DATASET --json",
+            arguments={"dataset": str(dataset.id), "project_id": project_id},
         )
-    if dataset.source_kind == Dataset.SourceKind.FILE:
+    if dataset.source_kind in {Dataset.SourceKind.FILE, Dataset.SourceKind.PENDING}:
         return DatasetHumanAction(
-            command="overmind dataset upload FILE --project-id PROJECT --json",
-            arguments={"file": "<path>", "project": str(dataset.project_id)},
+            command="overmind dataset upload FILE --project-id PROJECT --dataset DATASET --json",
+            arguments={"file": "<path>", "project_id": project_id, "dataset": str(dataset.id)},
         )
     return None
 
 
-def split_pair(dataset) -> SplitPair | None:
-    """The train/eval pair a split landing made, from the import that made it."""
-    receipt = (
-        DatasetImport.objects.filter(Q(dataset=dataset) | Q(evaluation=dataset))
-        .select_related("dataset", "evaluation")
-        .order_by("-queued_at")
-        .first()
-    )
-    split = (receipt.inputs or {}).get("split") if receipt is not None else None
-    if not split:
-        return None
-    role = "train" if receipt.dataset_id == dataset.pk else "eval"
-    sibling = receipt.evaluation if role == "train" else receipt.dataset
-    return SplitPair(
-        role=role,
-        sibling=SplitSibling(
-            id=str(sibling.id), name=sibling.name or "", resource=dataset_resource_link(sibling)
-        )
-        if sibling is not None
-        else None,
-        eval_percent=int(split.get("eval_percent") or 20),
-    )
-
-
-def _fits_for(dataset, cell: Cell) -> bool:
-    if cell.fits_decision()[0]:
-        return True
-    return cell.fits(public_intent(dataset.intent))[0]
-
-
-def _activation(dataset, active: Cell) -> NextAction | None:
-    newest = dataset.cells.order_by("-position").first()
-    if newest is None or newest.pk == active.pk or not _fits_for(dataset, newest):
-        return None
-    return NextAction(
-        tool="activate_dataset_version",
-        reason=f"{newest.label} is newer than the active {active.label} and fits; "
-        "activate it if the user agrees.",
-        arguments={
-            "dataset": str(dataset.id),
-            "version": newest.label,
-            "expected_active": active.label,
-        },
-    )
-
-
-def next_actions(dataset, active: Cell | None, pair: SplitPair | None = None) -> list[NextAction]:
-    """The one answer to "what now" for a dataset. The arguments are the ones Overmind
-    knows; the caller adds the rest (a title and script, an intent)."""
+def next_actions(dataset, chain: list[Cell], active: Cell | None) -> list[NextAction]:
     ds_id = str(dataset.id)
-    if dataset.state == Dataset.State.LANDING:
+    scoped = {"project_id": str(dataset.project_id)}
+    if dataset.state == Dataset.State.ERROR and not chain:
+        receipt = imports.status(dataset)
+        if receipt and receipt["state"] == "blocked":
+            return (
+                [
+                    NextAction(
+                        tool="resume_dataset_import",
+                        reason="Resume the retained source import.",
+                        arguments={**scoped, "dataset": ds_id},
+                    )
+                ]
+                if receipt["can_resume"]
+                else []
+            )
+    if dataset.state in _BUSY:
+        pipeline_run = (
+            dataset.pipeline_runs.filter(state__in=["queued", "running"])
+            .order_by("-created_at")
+            .values_list("id", flat=True)
+            .first()
+        )
         return [
             NextAction(
                 tool="get_job",
-                reason="The source is landing.",
-                arguments={"kind": "dataset_import", "id": ds_id},
+                reason="Inspect the current dataset operation.",
+                arguments={
+                    **scoped,
+                    "kind": "dataset_pipeline" if pipeline_run else "dataset_run",
+                    "id": str(pipeline_run) if pipeline_run else ds_id,
+                },
             )
         ]
-    if dataset.state == STOPPED:
-        if dataset.source_kind == Dataset.SourceKind.FILE:
-            return []
+    if active is None or dataset.intent == Dataset.Intent.PENDING:
         return [
             NextAction(
-                tool="create_dataset",
-                reason="The import was stopped; create the dataset again from its source.",
-                arguments={"name": dataset.name or "", "source": {"kind": dataset.source_kind}},
+                tool="inspect_dataset_workbench",
+                reason="Attach source data and explicitly set the requested intent with update_dataset.",
+                arguments={**scoped, "dataset": ds_id},
             )
         ]
-    if dataset.state != Dataset.State.IDLE:
-        if imports.resumable_imports(dataset.pk).exists():
-            return [
-                NextAction(
-                    tool="resume_dataset_import",
-                    reason="Resume the retained source import.",
-                    arguments={"dataset": ds_id},
-                )
-            ]
-        return []
-    if active is None:
-        return []
-    if dataset.intent == Dataset.Intent.PENDING:
+    ok, reason = active.fits(public_intent(dataset.intent))
+    if not ok or dataset.intent == Dataset.Intent.EXPLORE:
         return [
             NextAction(
-                tool="update_dataset",
-                reason="Choose train or eval with intent.",
-                arguments={"dataset": ds_id},
+                tool="inspect_dataset_workbench",
+                reason=sanitize_error(reason) or "Inspect available transformation operations.",
+                arguments={**scoped, "dataset": ds_id},
             )
         ]
-    activation = _activation(dataset, active)
-    actions = [activation] if activation is not None else []
-    sibling = pair.sibling.id if pair is not None and pair.sibling is not None else None
-    if active.fits_decision()[0]:
-        return actions + _decision_next_actions(dataset, active, sibling)
-    intent = public_intent(dataset.intent)
-    ok, reason = active.fits(intent)
-    if not ok:
-        return actions + [
-            NextAction(
-                tool="add_dataset_version",
-                reason=sanitize_error(reason) or "The active version does not fit.",
-                arguments={"dataset": ds_id, "parent": active.label},
-            )
-        ]
-    args = {"dataset": ds_id, "version": active.label}
-    if intent == Dataset.Intent.TRAIN:
-        if sibling:
-            args["eval_dataset"] = sibling
-        if dataset.capability_id:
-            args["capability"] = str(dataset.capability_id)
-        return actions + [
-            NextAction(
-                tool="check_finetune_readiness", reason="Active version fits train.", arguments=args
-            )
-        ]
-    actions.append(
-        NextAction(
-            tool="check_evaluation_readiness", reason="Active version fits eval.", arguments=args
-        )
+    tool = (
+        "check_finetune_readiness"
+        if dataset.intent == Dataset.Intent.TRAIN
+        else "check_evaluation_readiness"
     )
-    if dataset.capability_id:
-        actions.append(
-            NextAction(
-                tool="check_optimizer_readiness",
-                reason="Active version fits eval.",
-                arguments={**args, "capability": str(dataset.capability_id)},
-            )
-        )
-    return actions
-
-
-def _decision_next_actions(dataset, active: Cell, sibling: str | None) -> list[NextAction]:
-    """Decision rows are read only by decision models, so they take their own readiness check."""
-    if public_intent(dataset.intent) == Dataset.Intent.EVAL:
-        if sibling:
-            return [
-                NextAction(
-                    tool="check_decision_readiness",
-                    reason="Active version holds decision rows; its split sibling trains.",
-                    arguments={
-                        "dataset": sibling,
-                        "eval_dataset": str(dataset.id),
-                        "eval_version": active.label,
-                    },
-                )
-            ]
-        return [
-            NextAction(
-                tool="list_datasets",
-                reason=(
-                    "Active version holds decision rows; check it with a train dataset: "
-                    "check_decision_readiness with this as eval_dataset."
-                ),
-                arguments={},
-            )
-        ]
-    args = {"dataset": str(dataset.id), "version": active.label}
-    if sibling:
-        args["eval_dataset"] = sibling
     return [
         NextAction(
-            tool="check_decision_readiness",
-            reason="Active version holds decision rows.",
-            arguments=args,
+            tool=tool,
+            reason="Check the selected version for the intended consumer.",
+            arguments={**scoped, "dataset": ds_id, "cell": str(active.id)},
         )
     ]
 
 
-def _detail_summary(dataset, total: int, active: Cell | None, running: int) -> str:
-    if dataset.state == Dataset.State.LANDING:
-        return "The source is landing."
-    if dataset.state == STOPPED:
-        return "Import stopped; no rows were imported."
-    if dataset.state != Dataset.State.IDLE:
+def _detail_summary(dataset, chain: list[Cell], active: Cell | None) -> str:
+    if dataset.state == Dataset.State.ERROR:
         return _clip(
-            f"Dataset {dataset.state}: "
-            f"{sanitize_error(dataset.error) or 'The source did not land.'}",
+            f"Dataset error: {sanitize_error(dataset.error) or 'The dataset failed.'}",
             _SUMMARY_CHARS,
         )
-    noun = "version" if total == 1 else "versions"
-    text = f"{total} {noun}"
-    if active is not None:
-        text += f", active {active.label} with {int(active.rows)} rows"
-    if running:
-        text += f", {running} running"
-    return text + "."
-
-
-def _source_version(dataset) -> SourceVersion | None:
-    spec = dataset.source_spec or {}
-    if dataset.source_kind != Dataset.SourceKind.VERSION or not spec.get("cell_id"):
-        return None
-    ds_id = quote(str(spec["dataset_id"]), safe="")
-    return SourceVersion(
-        dataset=str(spec["dataset_id"]),
-        name=str(spec.get("dataset_name") or "")[:255],
-        version=str(spec.get("version") or "v0")[:32],
-        id=str(spec["cell_id"]),
-        fingerprint=str(spec.get("fingerprint") or "")[:64],
-        resource=_link(f"overmind://datasets/{ds_id}", spec.get("dataset_name") or "Dataset"),
-    )
-
-
-def _source(dataset, pair: SplitPair | None) -> DatasetSource:
-    spec = dataset.source_spec or {}
-    described = spec.get("files") or (
-        [{"filename": spec["filename"]}] if spec.get("filename") else []
-    )
-    return DatasetSource(
-        files=[
-            SourceFile(
-                filename=str(item.get("filename", ""))[:255],
-                bytes=item.get("bytes"),
-                rows=item.get("rows"),
-                extraction=_jsonable(item.get("extraction") or {}),
-            )
-            for item in described[:_LIST_CAP]
-        ],
-        limitations=list((spec.get("extraction") or {}).get("limitations", []))[:50],
-        version=_source_version(dataset),
-        split=pair,
-    )
-
-
-def run_job_link(run: Execution) -> ResourceLinkContract:
-    return _link(
-        f"overmind://jobs/dataset_run/{quote(str(run.id), safe='')}",
-        (run.title or f"{run.mode} run")[:160],
-    )
-
-
-def _live_run(run: Execution) -> LiveRun:
-    return LiveRun(
-        id=str(run.id),
-        mode=run.mode,
-        title=run.title or "",
-        state=run.state,
-        queued_at=run.queued_at,
-        job=run_job_link(run),
-    )
+    if dataset.state == Dataset.State.LANDING:
+        return "Dataset is landing."
+    if dataset.state == Dataset.State.RUNNING:
+        return "Dataset run is in progress."
+    n = len(chain)
+    rows = int(active.rows) if active is not None else 0
+    noun = "cell" if n == 1 else "cells"
+    return f"{n} {noun}, {dataset.state}, {rows} rows."
 
 
 def serialize_dataset_detail(
-    dataset, *, offset: int = 0, limit: int = _VERSION_DEFAULT, selected: Cell | None = None
-):
-    status = workshop.status(dataset, offset, limit, live=_LIVE_RUNS)
-    active = status["active"]
-    pair = split_pair(dataset)
-    links = [dataset_resource_link(dataset)]
-    if dataset.state == Dataset.State.LANDING:
-        links.append(dataset_import_job_link(dataset))
-    if pair is not None and pair.sibling is not None:
-        links.append(pair.sibling.resource)
-    return DatasetDetail.model_validate(
+    dataset,
+    *,
+    cell_offset: int = 0,
+    cell_limit: int = 5,
+    source_offset: int = 0,
+    source_limit: int = 10,
+) -> DatasetDetail:
+    chain = _chain(dataset)
+    versions = dataset.versions(chain=chain)
+    frozen_before = _frozen_before(chain)
+    active = _active_cell(dataset, chain)
+    page_cells = chain[cell_offset : cell_offset + cell_limit]
+    attributions = transformation.records(dataset, page_cells)
+    cells = [
+        _cell_summary(dataset, cell, versions, frozen_before, attributions[cell.pk])
+        for cell in page_cells
+    ]
+    fields = _list_fields(dataset, chain)
+    dataset_link = fields["resource"]
+    links = [dataset_link]
+    if dataset.state in _BUSY:
+        links.append(dataset_run_job_link(dataset))
+    error = sanitize_error(dataset.error) or None
+    sources = dataset.source_spec.get("sources", [])
+    result = DatasetDetail.model_validate(
         {
-            **_list_fields(dataset),
-            "active": version_summary(dataset, active) if active is not None else None,
-            "selected": version_summary(dataset, selected)
-            if selected is not None and (active is None or selected.pk != active.pk)
-            else None,
-            "source": _source(dataset, pair),
-            "preparation_context": _jsonable(workshop_context(dataset)),
+            **fields,
+            "operation": _jsonable({**dataset.operation, "source_import": imports.status(dataset)}),
+            "landing_progress": dataset.source_spec.get("landing_progress"),
+            "brief": _clip(dataset.brief, 8000),
+            "sources": [
+                _source_summary(item)
+                for item in sources[source_offset : source_offset + source_limit]
+            ],
+            "sources_total": len(sources),
+            "source_page": {
+                "limit": source_limit,
+                "offset": source_offset,
+                "total": len(sources),
+                "has_more": False,
+                "next_cursor": None,
+            },
+            "preparation_context": _bounded(workshop_context(dataset, measure_missing=False), 6000),
+            "preparation_plan": _bounded(dataset.preparation_plan, 3000),
             "capability_rank": _rank(dataset.capability_rank),
-            "contamination_report": _jsonable(dataset.source_spec.get("contamination_report", {})),
-            "versions": [version_row(dataset, cell) for cell in status["versions"]],
-            "versions_total": status["total"],
-            "running": [_live_run(run) for run in status["running"]],
-            "sample": _sample(dataset, selected or active),
-            "next_actions": next_actions(dataset, active, pair),
+            "contamination_report": _bounded(dataset.source_spec.get("contamination_report", {})),
+            "cells": cells,
+            "cells_truncated": cell_offset > 0 or cell_offset + len(cells) < len(chain),
+            "cell_page": {
+                "limit": cell_limit,
+                "offset": cell_offset,
+                "total": len(chain),
+                "has_more": cell_offset + len(cells) < len(chain),
+                "next_cursor": str(cell_offset + len(cells))
+                if cell_offset + len(cells) < len(chain)
+                else None,
+            },
+            "sample": _sample(dataset, active, versions),
+            "next_actions": next_actions(dataset, chain, active),
             "resource_links": links,
-            "summary": _detail_summary(dataset, status["total"], active, status["running_total"]),
+            "summary": _detail_summary(dataset, chain, active),
             "human_action": _human_action(dataset, active),
-            "error": sanitize_error(dataset.error) or None,
+            "error": error,
         }
     )
 
-
-_TERMINAL = (Execution.State.OK, Execution.State.FAILED, Execution.State.CANCELLED)
-
-
-def _run_fields(dataset, run: workshop.Run) -> dict[str, Any]:
-    execution = run.execution
-    fields: dict[str, Any] = {
-        "status": run.status,
-        "resource_links": [dataset_resource_link(dataset)],
-    }
-    if execution is not None:
-        fields.update(
-            run=str(execution.id),
-            transient=execution.transient,
-            error=sanitize_error(execution.error, 2_000) or None,
-            stdout=_clip(execution.stdout, _STDOUT_CHARS),
-            queued_at=execution.queued_at,
-            started_at=execution.started_at,
-            finished_at=execution.finished_at,
-        )
-        if execution.state not in _TERMINAL:
-            link = run_job_link(execution)
-            fields["job"] = RunReceipt(id=str(execution.id), status=execution.state, resource=link)
-            fields["resource_links"].append(link)
-    return fields
-
-
-def _run_summary(run: workshop.Run, done: str) -> str:
-    if run.status in (Execution.State.QUEUED, Execution.State.RUNNING):
-        return f"{run.status.capitalize()}. Poll get_job with kind dataset_run and this run id."
-    if run.status == Execution.State.CANCELLED:
-        return "Stopped. The identical call runs it again."
-    if run.status == Execution.State.FAILED:
-        execution = run.execution
-        if execution is not None and execution.transient:
-            return "The platform stopped the run; the identical call runs again."
-        if execution is not None and execution.mode == Execution.Mode.SYNTHETIC:
-            return "The rows were refused."
-        return "The script failed."
-    return _clip(done, _SUMMARY_CHARS)
-
-
-def try_output(dataset, run: workshop.Run) -> TryDatasetScriptOutput:
-    result = run.execution.result if run.execution is not None else {}
-    summary = _run_summary(run, f"{result.get('rows', 0)} rows. No version was created.")
-    return TryDatasetScriptOutput(
-        summary=summary,
-        **_run_fields(dataset, run),
-        rows=result.get("rows"),
-        columns=result.get("columns", []),
-        head=[{str(k): _sample_cell(v) for k, v in row.items()} for row in result.get("head", [])],
-    )
-
-
-def probe_output(dataset, run: workshop.Run) -> ScriptRunOutput:
-    return ScriptRunOutput(summary=_run_summary(run, "Done."), **_run_fields(dataset, run))
-
-
-def version_output(dataset, run: workshop.Run) -> AddDatasetVersionOutput:
-    cell = None
-    done = "Done."
-    if run.cell is not None:
-        cell = Cell.objects.select_related("parent").get(pk=run.cell.pk)
-        state = "active" if dataset.active_id == cell.pk else "not active"
-        done = f"{cell.label} from {cell.parent.label}: {cell.rows} rows, {state}."
-        if not run.created:
-            done = (
-                f"{cell.label} already holds this parent, script and attachment; "
-                f"nothing was created. {cell.rows} rows, {state}."
+    # Pagination preserves identities when rich summaries exceed the transport budget.
+    while (
+        len(json.dumps(result.model_dump(mode="json")).encode()) > 31_000 and len(result.cells) > 1
+    ):
+        result.cells.pop()
+    while (
+        len(json.dumps(result.model_dump(mode="json")).encode()) > 31_000
+        and len(result.sources) > 1
+    ):
+        result.sources.pop()
+    if len(json.dumps(result.model_dump(mode="json")).encode()) > 31_000:
+        result.truncated_fields.extend(["brief", "sample", "capability_rank"])
+        result.brief = _bounded(result.brief, 1024)
+        result.sample = None
+        result.capability_rank = result.capability_rank[:3]
+        for name in (
+            "operation",
+            "preparation_context",
+            "preparation_plan",
+            "contamination_report",
+        ):
+            setattr(result, name, _bounded(getattr(result, name), 1000))
+            result.truncated_fields.append(name)
+        for cell in result.cells:
+            cell.script = _bounded(cell.script, 1024)
+            cell.script_truncated = True
+            cell.note = _bounded(cell.note, 512)
+            cell.note_truncated = True
+            cell.columns = [_bounded(column, 200) for column in cell.columns[:10]]
+            result.truncated_fields.extend(
+                [f"cells.{cell.id}.script", f"cells.{cell.id}.note", f"cells.{cell.id}.columns"]
             )
-    return AddDatasetVersionOutput(
-        summary=_run_summary(run, done),
-        **_run_fields(dataset, run),
-        created=run.created and cell is not None,
-        version=version_summary(dataset, cell) if cell is not None else None,
+            for name in (
+                "analytics",
+                "review",
+                "quality_report",
+                "preparation_plan",
+                "readiness",
+                "intent_report",
+                "capability_report",
+            ):
+                setattr(
+                    cell,
+                    name,
+                    _bounded(
+                        getattr(cell, name),
+                        6000 if name in {"analytics", "quality_report"} else 500,
+                    ),
+                )
+                result.truncated_fields.append(f"cells.{cell.id}.{name}")
+    result.cell_page.has_more = cell_offset + len(result.cells) < len(chain)
+    result.cell_page.next_cursor = (
+        str(cell_offset + len(result.cells)) if result.cell_page.has_more else None
     )
-
-
-def dataset_output(dataset, summary: str) -> DatasetOutput:
-    dataset = Dataset.objects.select_related("capability", "active").get(pk=dataset.pk)
-    return DatasetOutput(
-        summary=_clip(summary, _SUMMARY_CHARS),
-        dataset=serialize_dataset_list_item(dataset),
-        resource_links=[dataset_resource_link(dataset)],
-    )
-
-
-def run_payload(run: Execution) -> dict[str, Any]:
-    """A script run as get_job and its resource report it."""
-    payload: dict[str, Any] = {
-        "run": str(run.id),
-        "mode": run.mode,
-        "title": run.title or "",
-        "status": run.state,
-        "dataset": str(run.dataset_id),
-        "parent": run.parent.label if run.parent_id else None,
-        "transient": run.transient,
-        "error": sanitize_error(run.error, 2_000) or None,
-        "stdout": _clip(run.stdout, _STDOUT_CHARS),
-        "queued_at": run.queued_at,
-        "started_at": run.started_at,
-        "finished_at": run.finished_at,
-    }
-    if run.state == Execution.State.OK and run.cell_id:
-        payload["version"] = VersionRef(id=str(run.cell_id), version=run.cell.label).model_dump()
-    if run.mode == Execution.Mode.TRY and run.state == Execution.State.OK:
-        result = run.result or {}
-        payload.update(
-            rows=result.get("rows"),
-            columns=list(result.get("columns", []))[:200],
-            head=[
-                {str(k): _sample_cell(v) for k, v in row.items()} for row in result.get("head", [])
-            ],
+    result.cells_truncated = cell_offset > 0 or result.cell_page.has_more
+    result.source_page.has_more = source_offset + len(result.sources) < len(sources)
+    if result.source_page.has_more:
+        result.source_page.next_cursor = str(source_offset + len(result.sources))
+        result.next_actions.append(
+            NextAction(
+                tool="inspect_dataset",
+                reason="Read the next source metadata page.",
+                arguments={
+                    "dataset": str(dataset.pk),
+                    "source_offset": source_offset + len(result.sources),
+                    "source_limit": source_limit,
+                    "project_id": str(dataset.project_id),
+                },
+            )
         )
-    return payload
+    return result

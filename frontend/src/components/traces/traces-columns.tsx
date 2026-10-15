@@ -70,15 +70,13 @@ export const tracesColumns: ColumnDef<TraceRow>[] = [
     accessorFn: (row) => row.score ?? null,
     cell: ({ row }) => (
       <TraceExecutionScore
-        conflict={row.original.conflict}
         evaluations={row.original.evaluations}
         score={row.original.score ?? null}
-        scoringPending={row.original.scoringPending}
       />
     ),
     header: "Score",
     id: "trace_scores",
-    meta: { label: "Score", orderingField: "trace_scores" },
+    meta: { label: "Score", orderingField: "eval_score" },
     size: 120,
   },
   {
@@ -259,7 +257,7 @@ export const tracesColumns: ColumnDef<TraceRow>[] = [
     cell: ({ row }) => <TraceSourceChip source={row.original.source ?? "overmind"} />,
     header: "Source",
     id: "source",
-    meta: { label: "Source" },
+    meta: { label: "Source", orderingField: "source" },
     size: 120,
   },
   {

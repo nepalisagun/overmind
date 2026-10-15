@@ -185,3 +185,13 @@ trajectory_sdk
 .claude/settings.local.json
 .impeccable/
 tests/journeys/.runs/
+
+# Local dataset preparation workspaces and installed copies of SDK skills
+/scratch/
+/data_preparation/
+/.agents/skills/overmind/
+/.agents/skills/overmind-*/
+
+# Local verification output; maintained regression inputs belong in tests/fixtures.
+/tests/evidence/*
+!/tests/evidence/README.md

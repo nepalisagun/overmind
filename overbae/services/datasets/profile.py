@@ -4,12 +4,15 @@ import hashlib
 import json
 from collections import Counter
 
-from sandbox.examples import (
+from modal_shared.decisions import decision_line
+from overbae.services.datasets.analytics import Analytics
+from overbae.services.datasets.examples import (
     decode,
     input_objects,
     instructions,
     messages,
     missing,
+    native_decision,
 )
 
 _GROUP_LIMIT = 16
@@ -54,11 +57,46 @@ def _example(record: dict, transcript: list) -> str:
 
 
 def profile_records(records) -> dict:
+    analytics = Analytics()
     groups = {}
+    columns = {}
     scanned = other = 0
     totals = Counter()
     for index, record in enumerate(records):
         scanned += 1
+        for name, raw in record.items():
+            if (
+                name in {"source_row", "_overmind_provenance"}
+                or name not in columns
+                and len(columns) >= 100
+            ):
+                continue
+            column = columns.setdefault(
+                name,
+                {
+                    "present_rows": 0,
+                    "empty_rows": 0,
+                    "types": Counter(),
+                    "examples": [],
+                    "min_length": None,
+                    "max_length": None,
+                },
+            )
+            value = decode(raw)
+            column["present_rows"] += 1
+            column["empty_rows"] += missing(value)
+            column["types"][type(value).__name__] += 1
+            if isinstance(value, (str, list, dict)):
+                length = len(value)
+                column["min_length"] = (
+                    length if column["min_length"] is None else min(length, column["min_length"])
+                )
+                column["max_length"] = (
+                    length if column["max_length"] is None else max(length, column["max_length"])
+                )
+            sample = _clip(_dump(value), 200)
+            if len(column["examples"]) < 2 and sample not in column["examples"]:
+                column["examples"].append(sample)
         transcript = messages(record.get("messages")) or messages(record.get("input"))
         prompt = instructions(record)
         objects = input_objects(record)
@@ -69,6 +107,29 @@ def profile_records(records) -> dict:
             if not missing(value.get(key))
         }
         payload = decode(record.get("input"))
+        decision = native_decision(record)
+        valid_decision = False
+        if isinstance(decision, dict):
+            totals["decision_rows"] += 1
+            probabilities = decision.get("target_probabilities")
+            try:
+                decision_line({"decision": decision})
+            except (ValueError, TypeError):
+                totals["invalid_decision_rows"] += 1
+            else:
+                valid_decision = True
+                totals["valid_decision_rows"] += 1
+                if probabilities is not None:
+                    totals["soft_target_rows"] += max(probabilities) < 1
+                    totals["hard_target_rows"] += max(probabilities) == 1
+                else:
+                    totals["mean_target_rows"] += 1
+                labels["target_semantics"] = decision.get("target_semantics", "unknown")
+            payload = {key: decision.get(key) for key in ("state", "question", "kind", "options")}
+            labels["kind"] = str(decision.get("kind", ""))
+            if record.get("source"):
+                labels["source"] = _clip(str(record["source"]), 120)
+        analytics.observe(decision, valid=valid_decision)
         raw_tools = record.get("tools")
         if missing(raw_tools) and isinstance(payload, dict):
             raw_tools = payload.get("tools")
@@ -80,11 +141,23 @@ def profile_records(records) -> dict:
             target = transcript[-1].get("tool_calls") or transcript[-1].get("content")
         if missing(target):
             target = record.get("output", record.get("response", record.get("completion")))
+        if missing(target) and isinstance(decision, dict):
+            target = decision.get(
+                "target_probabilities", decision.get("target_mean", decision.get("target"))
+            )
         output_shape = _shape(target)
         input_shape = (
             [_shape(turn.get("content")) for turn in transcript if turn["role"] == "user"][:4]
             if transcript
-            else _shape(payload)
+            else _shape(
+                payload
+                if payload is not None
+                else {
+                    k: v
+                    for k, v in record.items()
+                    if k not in {"source_row", "_overmind_provenance"}
+                }
+            )
         )
         key = hashlib.sha256(
             _dump([prompt, labels, input_shape, output_shape, tools]).encode()
@@ -131,10 +204,13 @@ def profile_records(records) -> dict:
     for family in families[_EXAMPLE_LIMIT:]:
         family["example"] = "Query example_row for full values."
     return {
+        "analytics": analytics.report(),
         "rows_scanned": scanned,
         "families": families,
         "unlisted_family_rows": other,
         "families_truncated": bool(other),
         "counts": dict(totals),
+        "columns": columns,
+        "column_limit": 100,
         "scope": "All rows counted; structural families and clipped examples, not a semantic audit.",
     }

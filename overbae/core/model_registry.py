@@ -335,10 +335,14 @@ def is_inference_model(model_id: str) -> bool:
 
 class Role(StrEnum):
     FAST = "fast"
+    AGENT = "agent"
+    EXPLAIN = "explain"
 
 
 ROLE_CHAINS: dict[Role, tuple[str, ...]] = {
     Role.FAST: ("gpt-5.6-luna", "claude-sonnet-5", "gemini-3.8-flash"),
+    Role.AGENT: ("gpt-5.6-terra", "claude-sonnet-5", "gemini-3.1-pro-preview"),
+    Role.EXPLAIN: ("gpt-5-mini", "claude-haiku-4-5", "gemini-3.8-flash"),
 }
 
 
@@ -346,6 +350,7 @@ class TaskType(StrEnum):
     JUDGE_SCORING = "judge_scoring"
     CRITERIA_GENERATION = "criteria_generation"
     EVAL_RECOMMENDATION = "eval_recommendation"
+    EVAL_EXPLANATION = "eval_explanation"
     DEFAULT = "default"
 
 
@@ -353,6 +358,7 @@ TASK_ROLES: dict[TaskType, Role] = {
     TaskType.JUDGE_SCORING: Role.FAST,
     TaskType.CRITERIA_GENERATION: Role.FAST,
     TaskType.EVAL_RECOMMENDATION: Role.FAST,
+    TaskType.EVAL_EXPLANATION: Role.EXPLAIN,
     TaskType.DEFAULT: Role.FAST,
 }
 
@@ -405,6 +411,10 @@ class Provider:
     name: str
     key_env: str
     base_url: str | None = None
+    openrouter_extras: bool = False
+    reasoning_effort: bool = False
+    tools_reasoning_effort: str | None = None
+    output_cap_param: str = "max_tokens"
     headers: dict[str, str] = field(default_factory=dict)
 
     def key(self) -> str:
@@ -421,7 +431,24 @@ PROVIDERS: dict[str, Provider] = {
         "openrouter",
         "OPENROUTER_API_KEY",
         OPENROUTER_BASE_URL,
+        openrouter_extras=True,
         headers={"HTTP-Referer": "https://overmindlab.ai", "X-Title": "Overmind Platform"},
+    ),
+    # OpenAI's reasoning models 400 on ``max_tokens``, and chat completions
+    # refuse function tools unless ``reasoning_effort`` is ``none``.
+    "openai": Provider(
+        "openai",
+        "OPENAI_API_KEY",
+        reasoning_effort=True,
+        tools_reasoning_effort="none",
+        output_cap_param="max_completion_tokens",
+    ),
+    "anthropic": Provider("anthropic", "ANTHROPIC_API_KEY", "https://api.anthropic.com/v1/"),
+    "gemini": Provider(
+        "gemini",
+        "GEMINI_API_KEY",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        reasoning_effort=True,
     ),
 }
 

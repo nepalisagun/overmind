@@ -24,33 +24,42 @@ import type { ModelSwapPrompt } from "./openapi";
 import {
   AgentApi,
   AuthApi,
-  BehavioursApi,
   BillingApi,
   CapabilitiesApi,
   Configuration,
   ConnectorCredentialsApi,
+  DataPartitionsApi,
+  DatasetPipelineBindingsApi,
+  DatasetPipelinePackagesApi,
+  DatasetPipelinesApi,
   DatasetsApi,
+  DatasetTransfersApi,
   DecisionJobsApi,
   DecisionModelsApi,
+  DecisionPerformanceApi,
   DeployedModelsApi,
+  EvalMatrixApi,
+  EvalRunRowsApi,
   EvalRunsApi,
-  EvalSamplesApi,
   EvalScoresApi,
   EvalSetsApi,
-  EvaluatorsApi,
   FeedbackApi,
   FinetuningJobsApi,
+  InferenceRequestsApi,
   McpOauthApi,
   ModelsApi,
+  NativeEvaluationsApi,
   OptimizerExperimentsApi,
   ProjectsApi,
   ResponseError,
   SessionsApi,
-  TaskExecutionsApi,
+  SignalEventsApi,
+  SignalSubscriptionsApi,
   TracesApi,
+  TrainingExperimentsApi,
+  TrainingPlansApi,
   TrainingPreparationsApi,
   UploadsApi,
-  VerdictsApi,
 } from "./openapi";
 import type { Middleware } from "./openapi/runtime";
 
@@ -89,7 +98,13 @@ export function clearTokens() {
   localStorage.removeItem(EMAIL_KEY);
   clearGuestSession();
 }
-const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const configuredBaseURL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const BASE_URL =
+  import.meta.env.VITE_SELF_HOSTED === "true" &&
+  typeof window !== "undefined" &&
+  window.location.hostname === "127.0.0.1"
+    ? configuredBaseURL.replace(/^http:\/\/localhost(?=[:/]|$)/, "http://127.0.0.1")
+    : configuredBaseURL;
 
 const LOGIN_REDIRECT_GUARD_KEY = "login_redirect_at";
 
@@ -407,62 +422,80 @@ export class API {
   agent: AgentApi;
   capabilities: CapabilitiesApi;
   auth: AuthApi;
-  behaviours: BehavioursApi;
   billing: BillingApi;
   connectorCredentials: ConnectorCredentialsApi;
   datasets: DatasetsApi;
-  decisionJobs: DecisionJobsApi;
-  decisionModels: DecisionModelsApi;
+  datasetPipelines: DatasetPipelinesApi;
+  datasetPipelinePackages: DatasetPipelinePackagesApi;
+  datasetPipelineBindings: DatasetPipelineBindingsApi;
+  datasetTransfers: DatasetTransfersApi;
   deployedModels: DeployedModelsApi;
+  inferenceRequests: InferenceRequestsApi;
   feedback: FeedbackApi;
   finetuningJobs: FinetuningJobsApi;
   uploads: UploadsApi;
   trainingPreparations: TrainingPreparationsApi;
+  dataPartitions: DataPartitionsApi;
+  nativeEvaluations: NativeEvaluationsApi;
+  trainingExperiments: TrainingExperimentsApi;
+  trainingPlans: TrainingPlansApi;
+  decisionJobs: DecisionJobsApi;
+  decisionModels: DecisionModelsApi;
+  decisionPerformance: DecisionPerformanceApi;
   optimizerExperiments: OptimizerExperimentsApi;
   /** OTLP trace ingestion (`POST /api/v1/traces`). */
   projects: ProjectsApi;
   /** Traces grouped by `conversation.id`. */
   sessions: SessionsApi;
-  taskExecutions: TaskExecutionsApi;
   traces: TracesApi;
-  verdicts: VerdictsApi;
   request = request;
   /** OpenRouter catalogue proxy — not this project's deployed models. */
   models: ModelsApi;
-  evaluators: EvaluatorsApi;
+  evalMatrix: EvalMatrixApi;
   evalSets: EvalSetsApi;
   evalRuns: EvalRunsApi;
-  evalSamples: EvalSamplesApi;
+  evalRunRows: EvalRunRowsApi;
   evalScores: EvalScoresApi;
+  signalEvents: SignalEventsApi;
+  signalSubscriptions: SignalSubscriptionsApi;
 
   constructor(private cfg: Configuration) {
     this.mcpOauth = new McpOauthApi(this.cfg);
     this.agent = new AgentApi(this.cfg);
     this.capabilities = new CapabilitiesApi(this.cfg);
     this.auth = new AuthApi(this.cfg);
-    this.behaviours = new BehavioursApi(this.cfg);
     this.billing = new BillingApi(this.cfg);
     this.connectorCredentials = new ConnectorCredentialsApi(this.cfg);
     this.datasets = new DatasetsApi(this.cfg);
-    this.decisionJobs = new DecisionJobsApi(this.cfg);
-    this.decisionModels = new DecisionModelsApi(this.cfg);
+    this.datasetPipelines = new DatasetPipelinesApi(this.cfg);
+    this.datasetPipelinePackages = new DatasetPipelinePackagesApi(this.cfg);
+    this.datasetPipelineBindings = new DatasetPipelineBindingsApi(this.cfg);
+    this.datasetTransfers = new DatasetTransfersApi(this.cfg);
     this.deployedModels = new DeployedModelsApi(this.cfg);
+    this.inferenceRequests = new InferenceRequestsApi(this.cfg);
     this.feedback = new FeedbackApi(this.cfg);
     this.finetuningJobs = new FinetuningJobsApi(this.cfg);
     this.uploads = new UploadsApi(this.cfg);
     this.trainingPreparations = new TrainingPreparationsApi(this.cfg);
+    this.dataPartitions = new DataPartitionsApi(this.cfg);
+    this.nativeEvaluations = new NativeEvaluationsApi(this.cfg);
+    this.trainingExperiments = new TrainingExperimentsApi(this.cfg);
+    this.trainingPlans = new TrainingPlansApi(this.cfg);
+    this.decisionJobs = new DecisionJobsApi(this.cfg);
+    this.decisionModels = new DecisionModelsApi(this.cfg);
+    this.decisionPerformance = new DecisionPerformanceApi(this.cfg);
     this.optimizerExperiments = new OptimizerExperimentsApi(this.cfg);
     this.projects = new ProjectsApi(this.cfg);
     this.sessions = new SessionsApi(this.cfg);
-    this.taskExecutions = new TaskExecutionsApi(this.cfg);
     this.traces = new TracesApi(this.cfg);
-    this.verdicts = new VerdictsApi(this.cfg);
     this.models = new ModelsApi(this.cfg);
-    this.evaluators = new EvaluatorsApi(this.cfg);
+    this.evalMatrix = new EvalMatrixApi(this.cfg);
     this.evalSets = new EvalSetsApi(this.cfg);
     this.evalRuns = new EvalRunsApi(this.cfg);
-    this.evalSamples = new EvalSamplesApi(this.cfg);
+    this.evalRunRows = new EvalRunRowsApi(this.cfg);
     this.evalScores = new EvalScoresApi(this.cfg);
+    this.signalEvents = new SignalEventsApi(this.cfg);
+    this.signalSubscriptions = new SignalSubscriptionsApi(this.cfg);
   }
 }
 

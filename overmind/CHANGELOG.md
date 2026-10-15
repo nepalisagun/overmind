@@ -15,42 +15,45 @@ entries here cover the SDK surface.
 - The dataset skills cancel a script run with `run`, call a stopped import
   `stopped`, and poll `get_job(kind=dataset_run)`. Skills version 1.5.1.
 
-### Added
-
-- `overmind dataset attach FILE --json` uploads a table without creating a
-  dataset and prints its `upload_id`, rows and sha256; a dataset script reads it
-  as the frame `attachment` through `try_dataset_script` or `add_dataset_version`.
-
 ### Changed
 
-- The dataset skills describe `create_dataset` (traces, LLM calls or a version as
-  the source), attachments, version analytics, `cancel_dataset_job` and one
-  `version` field for every version reference. Skills version 1.5.0.
-
-- The datasets, training and inference skills describe decision models: decision
-  rows, per-model limits, and the `check_decision_readiness` → `start_decision_job`
-  → `get_job` → `run_decision_model` sequence. Skills version 1.4.0.
-
-- `overmind dataset upload --wait` waits only until the source has landed, and
-  the next MCP step is `get_job(kind=dataset_import)`.
-
-- `overmind dataset export --cell` takes a version label such as `v3`.
-
-- The dataset skills describe versions added by scripts in Overmind's sandbox;
-  the Data Workshop agent and its tools are gone. Skills version 1.3.0.
-
-- `overmind dataset upload` names the dataset after the file without its
-  extension (`tickets.csv.gz` → `tickets`), as the Console does.
-
+- Every span started under a span that carries `overmind.intent` is stamped with the same
+  intent unless it declares its own, and `overmind.intent(text)` sets the attribute on the
+  current span as well as emitting its event. The platform scores a span from its own
+  attributes instead of waiting for its ancestors to arrive.
+- The bundled skills use the MCP tools `create_eval_matrix_row` and `delete_eval_matrix_row`
+  in place of `upsert_eval_matrix_row`; matrix rows are created and deleted, never edited.
+- `/overmind setup` no longer asks the scan for judge metrics. After `overmind sync` it
+  decorates every function, tool, retrieval step, mode and helper the card names and
+  declares each span's `expectations` in code. The scan's `eval_matrix` holds only
+  deterministic checks (`check` plus `params`), which sync turns into rows; a bad
+  `check` or `params` makes sync return a 400 naming the entry.
+- `overmind sync` reads the `expectations=` declared on the checkout's `entry_point`,
+  `workflow` and `observe` decorators and sends them with each synced capability; they never
+  enter `overmind.toml`. The platform adds them to the capability's Default eval set, so
+  `overmind backtest`, optimiser runs and training evaluations judge the same criteria as
+  live scoring. Run `overmind sync` again after decorating.
+- `overmind backtest` creates one run per target in a single eval-run group
+  (`targets`, a `recorded` baseline plus one `generate` run per model) and gates
+  on each candidate's `/comparison/` against the baseline.
 - `overmind dataset upload` inspects the upload before creating the dataset; the
   server now refuses an uninspected upload, so older CLI versions must upgrade.
 
 ### Added
 
-- `overmind dataset upload FILE --json-rows-field FIELD` imports one top-level
-  array from a JSON object.
-- `overmind dataset upload` lands PDF, DOCX, Markdown, text and PNG, JPEG or
-  WebP documents as text rows, within the server's per-type size limit.
+- `overmind dataset attach FILE --json` uploads a table without creating a
+  dataset and prints its `upload_id`, rows and sha256; a dataset script reads it
+  as the frame `attachment` through `try_dataset_script` or `add_dataset_version`.
+- `observe(self_attrs=[...])` (and the decorator variants) records named attributes of
+  `self`/`cls` as inputs next to the call's arguments, for methods whose request lives on
+  the instance. `verify_instrumentation` now reports an empty captured input as missing.
+- `observe(intent=, expectations=[...], reference_trajectory=[...])` (and the
+  `entry_point` / `workflow` / `tool` / `retrieval` variants) stamp
+  `overmind.intent`, `overmind.expectations` and
+  `overmind.reference_trajectory` for live scoring.
+- `overmind.session(conversation_id)`: scoped `conversation.id` for a block.
+- `overmind.record_llm_call(model, total_tokens, cost)`: usage on the current
+  span for LLM clients without a provider instrumentation.
 - Codex (`.agents/plugins/marketplace.json`) and Cursor (`.cursor-plugin/marketplace.json`)
   marketplaces at the repository root, so all three clients install the plugin
   from `overmind-core/overmind`.
@@ -80,14 +83,6 @@ entries here cover the SDK surface.
   signatures.
 - Docs: the pinned wire contract in [tracing-attributes](docs/tracing-attributes.md);
   integration guidance lives in the `overmind` skill's telemetry reference.
-
-### Fixed
-
-- `overmind model download-checkpoint` does not follow a redirect on the request
-  that carries the API key, so the key never reaches another host, and only a 2xx
-  reply counts as success.
-- `overmind dataset export --json` reports the version, cell and fingerprint
-  whatever case the server sends its headers in.
 
 ### Removed
 

@@ -18,6 +18,7 @@ import { findCatalogModel } from "@/components/finetuning/train/model-picker";
 import { useCapabilityEvalPreload } from "@/hooks/use-capability-eval-preload";
 import {
   useEvalSetsQuery,
+  useModelCatalogQuery as useEvaluationModelCatalogQuery,
   useProjectCapabilitiesQuery,
   useProjectDatasetsForEvalQuery,
 } from "@/hooks/use-evaluations";
@@ -64,6 +65,7 @@ const EMPTY_CATALOG: ModelCatalog = {
   hasToolCalling: false,
   maxContext: null,
   models: {},
+  monitoring: {},
   tiers: [...TIER_ORDER],
 };
 
@@ -95,15 +97,17 @@ export function useTrainWizard({
 }: TrainWizardArgs) {
   const [capabilityId, setCapabilityIdState] = useState(initialCapabilityId ?? "");
   const [datasetId, setDatasetIdState] = useState(initialDatasetId ?? "");
+  const [preTrainingBaseline, setPreTrainingBaseline] = useState(true);
   const [validation, setValidation] = useState<DatasetValidationResponse | null>(null);
   const [validating, setValidating] = useState(false);
   const [evalDatasetId, setEvalDatasetId] = useState(initialEvalDatasetId ?? "");
+  const [evaluationEnabled, setEvaluationEnabled] = useState(Boolean(initialEvalDatasetId));
+  const [benchmarkingEnabled, setBenchmarkingEnabled] = useState(false);
   const [evalSetId, setEvalSetId] = useState("");
   const [judgeChoice, setJudgeChoice] = useState<{ setId: string; model: string } | null>(null);
   const judgeModel = judgeChoice?.setId === evalSetId ? judgeChoice.model : "";
   const setJudgeModel = (model: string) => setJudgeChoice({ model, setId: evalSetId });
-  const [evaluationOverrides, setEvaluationOverrides] = useState<Partial<EvaluationPlan>>({});
-  const [benchmarkChoice, setBenchmarkChoice] = useState<string | null>(null);
+  const [benchmarkSelection, setBenchmarkSelection] = useState<string[] | null>(null);
   const [drafts, setDrafts] = useState<ModelDraft[]>([]);
   const [deselected, setDeselected] = useState<Set<string>>(new Set());
   const [runName, setRunName] = useState("");
@@ -121,12 +125,18 @@ export function useTrainWizard({
   );
   const capability = capabilities.find((a) => a.id === capabilityId);
   const benchmarksQuery = useTrainingBenchmarksQuery(projectId);
+  const evaluationCatalogQuery = useEvaluationModelCatalogQuery();
   const benchmarkOptions = useMemo<
     { kind: string; label: string; value: string; baseModelId?: string }[]
   >(() => {
     const incumbent = capability?.model?.trim();
-    return [
+    const options = [
       ...(incumbent ? [{ kind: "Codebase incumbent", label: incumbent, value: incumbent }] : []),
+      ...(evaluationCatalogQuery.data?.models ?? []).map((model) => ({
+        kind: "OpenRouter",
+        label: model.name,
+        value: model.id,
+      })),
       ...(benchmarksQuery.data ?? [])
         .filter((model) => model.modelId !== incumbent)
         .map((model) => ({
@@ -136,26 +146,45 @@ export function useTrainWizard({
           value: model.modelId,
         })),
     ];
-  }, [capability?.model, benchmarksQuery.data]);
-  const benchmarkModel = benchmarkChoice ?? capability?.model?.trim() ?? "";
+    return options.filter(
+      (option, index) => options.findIndex((row) => row.value === option.value) === index
+    );
+  }, [capability?.model, benchmarksQuery.data, evaluationCatalogQuery.data]);
+  const benchmarkModels =
+    benchmarkSelection ?? (capability?.model?.trim() ? [capability.model.trim()] : []);
+  const benchmarkModel = benchmarkModels[0] ?? "";
   const selectedBenchmark = benchmarkOptions.find((option) => option.value === benchmarkModel);
-  const hasIncumbent = Boolean(selectedBenchmark);
+  const nativeDecision = validation?.format === "decision";
+  const hasIncumbent =
+    evaluationEnabled && benchmarkingEnabled && !nativeDecision && Boolean(selectedBenchmark);
   const evaluationPlan = useMemo<EvaluationPlan>(
     () => ({
-      evalIncumbentAfter: hasIncumbent && (evaluationOverrides.evalIncumbentAfter ?? false),
-      evalIncumbentBefore: hasIncumbent && (evaluationOverrides.evalIncumbentBefore ?? false),
-      evalModelAfter: evaluationOverrides.evalModelAfter ?? true,
-      evalModelBefore: evaluationOverrides.evalModelBefore ?? true,
+      evalIncumbentAfter: false,
+      evalIncumbentBefore: hasIncumbent,
+      evalModelAfter: evaluationEnabled && !nativeDecision,
+      evalModelBefore: evaluationEnabled && benchmarkingEnabled && !nativeDecision,
     }),
-    [hasIncumbent, evaluationOverrides]
+    [hasIncumbent, evaluationEnabled, benchmarkingEnabled, nativeDecision]
   );
-  const setEvaluationChoice = useCallback((field: keyof EvaluationPlan, value: boolean) => {
-    setEvaluationOverrides((previous) => ({ ...previous, [field]: value }));
-  }, []);
+  const toggleBenchmarkModel = useCallback(
+    (model: string) => {
+      setBenchmarkSelection((previous) => {
+        const selected = previous ?? (capability?.model?.trim() ? [capability.model.trim()] : []);
+        return selected.includes(model)
+          ? selected.filter((id) => id !== model)
+          : [...selected, model];
+      });
+    },
+    [capability?.model]
+  );
 
   const datasetsQuery = useProjectDatasetsQuery(projectId);
   const datasets = useMemo(() => datasetsQuery.data?.results ?? [], [datasetsQuery.data]);
   const dataset = datasets.find((d) => d.id === datasetId);
+  const decisionObjective =
+    dataset?.cells?.find((cell) => cell.id === dataset.active)?.intentReport?.train?.objective ??
+    "decision_cross_entropy";
+  const validationSelection = VALIDATION_SPLIT;
 
   const evalDatasetsQuery = useProjectDatasetsForEvalQuery(projectId);
   const evalDatasets = useMemo(
@@ -186,7 +215,7 @@ export function useTrainWizard({
     setEvalSetId((evalSets.find((s) => s.isActive) ?? evalSets[0]).id);
   }, [evalSets, evalSetId]);
   const evalPreload = useCapabilityEvalPreload(capabilityId, {
-    enabled: !!capabilityId,
+    enabled: evaluationEnabled && !!capabilityId,
     projectId,
   });
 
@@ -197,15 +226,19 @@ export function useTrainWizard({
   useEffect(() => {
     if (!datasetId) {
       setValidation(null);
+      setValidating(false);
       return;
     }
     let cancelled = false;
     setValidating(true);
     void validateRef.current
       .mutateAsync({
+        cellId: dataset?.active ?? undefined,
         datasetId,
-        ...VALIDATION_SPLIT,
+        splitMethod: validationSelection.splitMethod,
         validationDatasetId: null,
+        validationEnabled: validationSelection.validationEnabled,
+        validationSplitRatio: validationSelection.validationSplitRatio,
       })
       .then((result) => {
         if (!cancelled) setValidation(result);
@@ -219,7 +252,7 @@ export function useTrainWizard({
     return () => {
       cancelled = true;
     };
-  }, [datasetId]);
+  }, [datasetId, dataset?.active]);
 
   const datasetValid = validation?.valid === true;
 
@@ -230,7 +263,7 @@ export function useTrainWizard({
   const recommendQuery = useRecommendModelsQuery(
     dataReady ? datasetId : "",
     dataReady ? capabilityId || undefined : undefined,
-    dataReady ? evalDatasetId || undefined : undefined
+    dataReady && evaluationEnabled && !nativeDecision ? evalDatasetId || undefined : undefined
   );
   const rec = recommendQuery.data;
 
@@ -241,6 +274,20 @@ export function useTrainWizard({
     (hasToolCalling ? toolCatalogQuery.data : baseCatalogQuery.data) ??
     baseCatalogQuery.data ??
     EMPTY_CATALOG;
+  const monitoring = useMemo(
+    () => ({
+      early_stopping: null,
+      interval_steps: null,
+      loss_sample: 2048,
+      max_checks: 12,
+      mode: catalog.backend === "together" ? "off" : "adaptive",
+      overhead_fraction: 0.1,
+      selection: "last",
+      target_seconds: 300,
+      train_sample: 256,
+    }),
+    [catalog.backend]
+  );
 
   // Every constraint-passing model, ranked by grade; `shown` names the opening line-up.
   const candidates = useMemo(() => rec?.candidates ?? [], [rec]);
@@ -254,7 +301,7 @@ export function useTrainWizard({
 
   const overlapQuery = useDatasetOverlapQuery(
     dataReady ? datasetId : "",
-    dataReady ? evalDatasetId || undefined : undefined
+    dataReady && evaluationEnabled && !nativeDecision ? evalDatasetId || undefined : undefined
   );
   const overlapCount = overlapQuery.data?.overlapCount ?? 0;
 
@@ -336,9 +383,7 @@ export function useTrainWizard({
     ...(evaluationPlan.evalModelBefore || evaluationPlan.evalModelAfter
       ? selectedDrafts.map((draft) => draft.model)
       : []),
-    ...(evaluationPlan.evalIncumbentBefore || evaluationPlan.evalIncumbentAfter
-      ? [benchmarkModel]
-      : []),
+    ...(evaluationPlan.evalIncumbentBefore ? benchmarkModels : []),
   ];
   const contextOutput = candidateByModel.get(selectedDrafts[0]?.model)?.servingContext
     ?.outputTokens;
@@ -355,12 +400,11 @@ export function useTrainWizard({
     queryFn: () =>
       apiClient.evalRuns.evalRunsContextCheckCreate({
         evaluationContextRequestRequest: {
-          capability: capabilityId || null,
           dataset: evalDatasetId,
-          evalSet: evalSetId,
+          evalSet: nativeDecision ? null : evalSetId,
           judgeModel: judgeModel as EvaluationContextRequestRequest["judgeModel"],
           project: projectId,
-          variants: contextVariants,
+          targets: contextVariants,
         },
       }),
     queryKey: [
@@ -394,9 +438,21 @@ export function useTrainWizard({
         apiClient.finetuningJobs.finetuningJobsEstimateCreate({
           finetuningEstimateRequestRequest: {
             baseModel: draft.model,
+            cell: dataset?.active ?? undefined,
             datasetId,
             nEpochs: draft.hyperparams.n_epochs ?? 1,
             useLora: draft.useLora,
+            ...validationSelection,
+            hyperparameters: {
+              ...buildHyperparameters(draft),
+              monitoring: {
+                ...monitoring,
+                ...(nativeDecision ? { initial: preTrainingBaseline } : {}),
+              },
+              ...(nativeDecision
+                ? { objective: decisionObjective, pre_training_baseline: preTrainingBaseline }
+                : {}),
+            },
           },
         }),
       queryKey: [
@@ -405,6 +461,12 @@ export function useTrainWizard({
         draft.model,
         draft.hyperparams.n_epochs,
         draft.useLora,
+        draft.hyperparams,
+        nativeDecision,
+        preTrainingBaseline,
+        monitoring,
+        dataset?.active,
+        validationSelection,
       ] as const,
       staleTime: 30_000,
     })),
@@ -421,12 +483,33 @@ export function useTrainWizard({
   const totals = useMemo(() => {
     const rows = selectedDrafts.map((d) => estimates.get(d.id));
     const priced = rows.filter((e) => e?.costEstimate != null);
+    const timings = rows.map((row) => {
+      const range = row?.forecast?.training_seconds;
+      if (
+        Array.isArray(range) &&
+        range.length === 2 &&
+        range.every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0) &&
+        range[1] >= range[0]
+      ) {
+        return { human: row?.timeEstimate.human, lower: range[0], range: true, upper: range[1] };
+      }
+      const seconds = row?.timeEstimate.seconds;
+      return typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0
+        ? { human: row?.timeEstimate.human, lower: seconds, range: false, upper: seconds }
+        : null;
+    });
+    let longest: string | null = null;
+    if (timings.length && timings.every((time) => time !== null)) {
+      if (timings.some((time) => time.range)) {
+        const lower = Math.floor(Math.max(...timings.map((time) => time.lower)) / 60);
+        const upper = Math.ceil(Math.max(...timings.map((time) => time.upper)) / 60);
+        longest = `${lower === upper ? lower : `${lower}–${upper}`} min`;
+      } else {
+        longest = timings.sort((a, b) => b.upper - a.upper)[0].human ?? null;
+      }
+    }
     return {
-      longest:
-        rows
-          .map((e) => e?.timeEstimate)
-          .filter(Boolean)
-          .sort((a, b) => (b?.seconds ?? 0) - (a?.seconds ?? 0))[0]?.human ?? null,
+      longest,
       pricedCount: priced.length,
       usd: priced.reduce((sum, e) => sum + (e?.costEstimate?.usd ?? 0), 0),
     };
@@ -445,7 +528,7 @@ export function useTrainWizard({
 
   const setCapabilityId = useCallback((id: string) => {
     setCapabilityIdState(id);
-    setBenchmarkChoice(null);
+    setBenchmarkSelection(null);
     // Eval sets and recommendations are both capability-scoped.
     setEvalSetId("");
     setDrafts([]);
@@ -498,9 +581,21 @@ export function useTrainWizard({
     if (!datasetId) return "Select a training dataset";
     if (validating) return "Validating the dataset";
     if (!datasetValid) return "This dataset can't be trained on yet";
-    if (!evalDatasetId) return "Select an eval dataset";
-    if (!evalSetId) return "Select an eval set";
-    if (benchmarkModel && !selectedBenchmark) return "Select an available benchmark model";
+    if (evaluationEnabled && !nativeDecision && !evalDataset) return "Select an eval dataset";
+    if (evaluationEnabled && !nativeDecision && !evalSet) return "Select an eval set";
+    if (nativeDecision && catalog.backend !== "modal") return "Native decisions require Modal LoRA";
+    if (nativeDecision && selectedDrafts.some((draft) => !draft.useLora))
+      return "Native decisions require LoRA";
+    if (
+      evaluationEnabled &&
+      benchmarkingEnabled &&
+      benchmarkModels.some(
+        (model) =>
+          !benchmarkOptions.some((option) => option.value === model) &&
+          !selectedDrafts.some((draft) => draft.model === model)
+      )
+    )
+      return "Select an available benchmark model";
     if (recommendQuery.isLoading) return "Checking model compatibility";
     if (drafts.length === 0) return "Add a model";
     if (selectedDrafts.length === 0) return "Select an experiment";
@@ -525,15 +620,32 @@ export function useTrainWizard({
         const fixed = applyCatalogTrainingFlags(draft, catalogModelById(draft.model)?.model);
         return {
           baseModel: fixed.model,
-          ...(benchmarkModel ? { baselineModel: benchmarkModel } : {}),
+          ...(evaluationPlan.evalIncumbentBefore && benchmarkModel
+            ? { baselineModel: benchmarkModel }
+            : {}),
+          benchmarkModels: evaluationPlan.evalIncumbentBefore ? benchmarkModels : [],
           capability: capabilityId || null,
+          cell: dataset?.active ?? undefined,
           dataset: datasetId,
-          evalDataset: evalDatasetId,
-          evalJudgeModel: judgeModel as FinetuningJobRequest["evalJudgeModel"],
-          evalSet: evalSetId,
+          evalCell:
+            evaluationEnabled && !nativeDecision ? (evalDataset?.active ?? undefined) : undefined,
+          evalDataset: evaluationEnabled && !nativeDecision ? evalDatasetId : null,
+          evalJudgeModel: (evaluationEnabled && !nativeDecision
+            ? judgeModel
+            : "") as FinetuningJobRequest["evalJudgeModel"],
+          evalSet: evaluationEnabled && !nativeDecision ? evalSetId : null,
           ...evaluationPlan,
           groupId,
-          hyperparameters: buildHyperparameters(fixed),
+          hyperparameters: {
+            ...buildHyperparameters(fixed),
+            monitoring: {
+              ...monitoring,
+              ...(nativeDecision ? { initial: preTrainingBaseline } : {}),
+            },
+            ...(nativeDecision
+              ? { objective: decisionObjective, pre_training_baseline: preTrainingBaseline }
+              : {}),
+          },
           modelTier: fixed.tier as FinetuningJobRequestModelTierEnum,
           // Job names are `base · dataset · capability`: the run name is
           // model-independent, so prepend this job's own base model. Pages strip
@@ -543,7 +655,8 @@ export function useTrainWizard({
             .filter(Boolean)
             .join(" · "),
           project: projectId,
-          ...VALIDATION_SPLIT,
+          requestKey: `${groupId}:${draft.id}`,
+          ...validationSelection,
           validationDataset: null,
         };
       });
@@ -557,7 +670,15 @@ export function useTrainWizard({
     }
   }, [
     canLaunch,
+    monitoring,
+    preTrainingBaseline,
+    decisionObjective,
+    evaluationEnabled,
+    dataset?.active,
+    evalDataset?.active,
+    nativeDecision,
     benchmarkModel,
+    benchmarkModels,
     capabilityId,
     catalogModelById,
     computedName,
@@ -575,9 +696,10 @@ export function useTrainWizard({
   ]);
 
   const dirty =
+    evaluationEnabled !== Boolean(initialEvalDatasetId) ||
     Boolean(judgeModel) ||
-    benchmarkChoice !== null ||
-    Object.keys(evaluationOverrides).length > 0 ||
+    benchmarkSelection !== null ||
+    benchmarkingEnabled ||
     datasetId !== (initialDatasetId ?? "") ||
     capabilityId !== (initialCapabilityId ?? "") ||
     runNameDirty ||
@@ -585,7 +707,9 @@ export function useTrainWizard({
 
   return {
     addModel,
+    benchmarkingEnabled,
     benchmarkModel,
+    benchmarkModels,
     benchmarkOptions,
     benchmarksQuery,
     candidateByModel,
@@ -603,6 +727,7 @@ export function useTrainWizard({
     datasetId,
     datasets,
     datasetsQuery,
+    decisionObjective,
     dirty,
     drafts,
     estimates,
@@ -615,6 +740,7 @@ export function useTrainWizard({
     evalSetId,
     evalSets,
     evalSetsQuery,
+    evaluationEnabled,
     evaluationPlan,
     excluded,
     hasIncumbent,
@@ -623,7 +749,9 @@ export function useTrainWizard({
     launchBlocker,
     launchError,
     launching,
+    nativeDecision,
     overlapCount,
+    preTrainingBaseline,
     rec,
     recommendQuery,
     removeModel,
@@ -631,17 +759,19 @@ export function useTrainWizard({
     runName,
     selectedBenchmark,
     selectedDrafts,
-    setBenchmarkModel: setBenchmarkChoice,
+    setBenchmarkingEnabled,
     setCapabilityId,
     setDatasetId,
     setEvalDatasetId,
     setEvalSetId,
-    setEvaluationChoice,
+    setEvaluationEnabled,
     setJudgeModel,
+    setPreTrainingBaseline,
     setRunName: (value: string) => {
       setRunNameDirty(true);
       setRunName(value);
     },
+    toggleBenchmarkModel,
     toggleSelected,
     totals,
     updateDraft,

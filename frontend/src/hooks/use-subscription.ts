@@ -22,10 +22,10 @@ export function useCommercialBilling() {
   return { enabled: me?.billingEnabled === true, ready: isSuccess };
 }
 
-export function useBillingLedgerQuery(page = 1, pageSize = 25) {
+export function useBillingLedgerQuery(page = 1, pageSize = 25, ordering?: string) {
   return useQuery({
-    queryFn: () => api.billing.billingLedgerList({ page, pageSize }),
-    queryKey: [...billingLedgerQueryKey, page, pageSize],
+    queryFn: () => api.billing.billingLedgerList({ ordering, page, pageSize }),
+    queryKey: [...billingLedgerQueryKey, page, pageSize, ordering],
   });
 }
 

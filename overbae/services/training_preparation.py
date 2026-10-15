@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import json
-import os
+import math
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 
@@ -13,65 +16,82 @@ from django.utils import timezone
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import InternalError, NotFoundError, ServiceError
 
+from modal_shared.decisions import DECISION_OBJECTIVES
 from modal_shared.preparation import processor_fingerprint as asset_fingerprint
 from modal_shared.preparation import validate_preparation_report
-from modal_shared.stacks import train_function_name
+from modal_shared.stacks import TRAIN_DECISION, train_function_name
+from modal_shared.training_data import file_digest
 from overbae.core.errors import InputValidationError
+from overbae.modal.decision_catalog import get as decision_catalog_model
 from overbae.modal.model_registry import (
     get_hf_base,
     get_model_config_any_backend,
     get_unsloth_image,
 )
 from overbae.modal.training_type import training_context_length, training_enabled
-from overbae.models import TrainingPreparation
-from overbae.services import finetuning_tool_validation, finetuning_validator
+from overbae.models import DecisionJob, FinetuningJob, Project, TrainingPreparation
+from overbae.services import operational_progress, training_release
 from overbae.services.datasets import rows as row_store
 from overbae.services.datasets import use as dataset_use
 from overbae.services.finetuning_policy import (
     baseten_context_length,
     estimated_training_context_length,
+    validate_requested_context_length,
 )
 from overbae.services.finetuning_validator import row_to_finetuning_line
-from sandbox import examples
+from overbae.services.training_contract import dataset_objective
 
 
 def processor_fingerprint():
     return asset_fingerprint(Path(__file__).parent / "sft_assets")
 
 
-def data_format_fingerprint():
-    digest = hashlib.sha256()
-    for module in (examples, finetuning_validator, finetuning_tool_validation):
-        digest.update(Path(module.__file__).read_bytes())
-    return digest.hexdigest()
-
-
 def request_preparation(
-    cell, model: str, context_length: int, *, validation_cell=None, training_type="lora"
+    cell,
+    model: str,
+    context_length: int,
+    *,
+    validation_cell=None,
+    training_type="lora",
+    runtime=None,
 ):
-    if settings.FINETUNING_BACKEND != "modal":
+    if runtime is None and settings.FINETUNING_BACKEND != "modal":
         raise InputValidationError(
             "Exact preprocessing is available for the Modal training backend."
         )
     model_config = get_model_config_any_backend(model)
     if not model_config:
         raise InputValidationError("Choose a catalog training model.")
+    decision_model = decision_catalog_model(model)
+    if decision_model and not decision_model["training_available"]:
+        raise InputValidationError(
+            "This decision family does not yet have exact preparation and verified deployment."
+        )
     if training_type not in {"lora", "full"} or not training_enabled(model_config, training_type):
         raise InputValidationError("This model does not support the selected training type.")
     maximum = training_context_length(model_config, training_type)
-    if maximum is not None and context_length > maximum:
-        raise InputValidationError(
-            f"This training configuration supports at most {maximum} context tokens."
-        )
-    if not 128 <= context_length <= 2_000_000:
-        raise InputValidationError("Context length must be between 128 and 2,000,000 tokens.")
-    context_length = baseten_context_length(model_max=maximum, requested=context_length)
+    validate_requested_context_length(context_length, model_max=maximum)
     for target in (cell, validation_cell):
         if target is not None:
             if target.dataset.project_id != cell.dataset.project_id:
                 raise InputValidationError("Both datasets must belong to the same project.")
             dataset_use.check(target.dataset, "train", cell=target)
+    objective = dataset_objective(cell)
+    if objective in DECISION_OBJECTIVES and training_type != "lora":
+        raise InputValidationError("Native decision training currently supports LoRA only.")
+    if validation_cell is not None:
+        validation_objective = dataset_objective(validation_cell)
+        if (
+            objective != validation_objective
+            and not {objective, validation_objective} <= DECISION_OBJECTIVES
+        ):
+            raise InputValidationError(
+                "Training and validation must use the same inference contract."
+            )
+    runtime = runtime or training_release.current()
     config = {
+        "runtime": runtime,
+        "objective": objective,
         "model": model,
         "tokenizer_model": get_hf_base(model),
         "context_length": context_length,
@@ -80,9 +100,9 @@ def request_preparation(
         "fingerprint": cell.fingerprint,
         "validation_cell": str(validation_cell.id) if validation_cell else None,
         "validation_fingerprint": validation_cell.fingerprint if validation_cell else None,
-        "processor": processor_fingerprint(),
-        "data_format": data_format_fingerprint(),
-        "stack": get_unsloth_image(model),
+        "processor": runtime["processor"] if runtime else processor_fingerprint(),
+        "data_format": runtime["data_format"],
+        "stack": TRAIN_DECISION if objective in DECISION_OBJECTIVES else get_unsloth_image(model),
     }
     signature = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     preparation, _ = TrainingPreparation.objects.get_or_create(
@@ -91,7 +111,7 @@ def request_preparation(
             "cell": cell,
             "validation_cell": validation_cell,
             "config": config,
-            "deadline": timezone.now() + timedelta(minutes=20),
+            "deadline": timezone.now() + timedelta(hours=24),
         },
     )
     return preparation
@@ -109,11 +129,160 @@ def retry_preparation(preparation):
         remote_id="",
         report={},
         error="",
-        deadline=timezone.now() + timedelta(minutes=20),
+        deadline=timezone.now() + timedelta(hours=24),
         touched_at=timezone.now(),
     )
     preparation.refresh_from_db()
+    sync_setup_jobs(preparation)
     return preparation
+
+
+@transaction.atomic
+def begin_preparation(cell, model, context_length, *, user, **kwargs):
+    Project.objects.select_for_update().get(pk=cell.dataset.project_id)
+    prep = request_preparation(cell, model, context_length, **kwargs)
+    if not prep.training_jobs.exists():
+        FinetuningJob.objects.create(
+            project_id=prep.cell.dataset.project_id,
+            dataset=prep.cell.dataset,
+            cell=prep.cell,
+            validation_cell=prep.validation_cell,
+            validation_dataset=prep.validation_cell.dataset if prep.validation_cell_id else None,
+            triggered_by=user,
+            preparation=prep,
+            base_model=prep.config["model"],
+            provider=FinetuningJob.Provider.MODAL,
+            name=f"{prep.cell.dataset.name} · {prep.config['model'].split('/')[-1]}",
+            hyperparameters={
+                "context_length": prep.config["context_length"],
+                "objective": prep.config["objective"],
+                "training_type": {
+                    "type": "Full" if prep.config["training_type"] == "full" else "Lora"
+                },
+            },
+            status=FinetuningJob.Status.PREPROCESSING,
+            eval_model_before=False,
+            eval_model_after=False,
+        )
+    if decision_catalog_model(model):
+        for training_job in prep.training_jobs.all():
+            DecisionJob.objects.get_or_create(finetuning_job=training_job)
+    sync_setup_jobs(prep)
+    return prep
+
+
+def sync_setup_jobs(prep):
+    failed = prep.state in {"failed", "incompatible"}
+    status = (
+        FinetuningJob.Status.FAILED
+        if failed
+        else FinetuningJob.Status.AWAITING_LAUNCH
+        if prep.state == "ready"
+        else FinetuningJob.Status.PREPROCESSING
+    )
+    progress = {
+        "phase": "awaiting_launch" if prep.state == "ready" else "preprocessing",
+        "preparation": {
+            "id": str(prep.pk),
+            "state": prep.state,
+            "report": prep.report,
+            **(prep.report.get("progress") or {}),
+        },
+    }
+    # Only setup jobs follow the tokenization receipt; launched and cancelled jobs own their state.
+    prep.training_jobs.filter(requested_configuration={}).exclude(status="cancelled").update(
+        status=status,
+        progress=progress,
+        error_message=preparation_error(prep) if failed else "",
+        completed_at=prep.touched_at if failed else None,
+        updated_at=timezone.now(),
+    )
+
+
+def setup_job_for_launch(values, runtime):
+    hp = values.get("hyperparameters") or {}
+    return (
+        FinetuningJob.objects.filter(
+            project=values["project"],
+            cell=values["cell"],
+            validation_cell=values.get("validation_cell")
+            if values.get("validation_enabled", True)
+            else None,
+            base_model=values["base_model"],
+            status__in=[FinetuningJob.Status.PREPROCESSING, FinetuningJob.Status.AWAITING_LAUNCH],
+            requested_configuration={},
+            preparation__config__runtime=runtime,
+            preparation__config__context_length=hp.get("context_length"),
+            preparation__config__training_type="full"
+            if (hp.get("training_type") or {}).get("type") == "Full"
+            else "lora",
+        )
+        .select_for_update()
+        .first()
+    )
+
+
+def observe_progress(prep):
+    try:
+        volume = modal.Volume.from_name(
+            "overmind-sft", environment_name=prep.config["runtime"]["environment"]
+        )
+        content = bytearray()
+        for chunk in volume.read_file(f"/preparations/{prep.id}/progress.json"):
+            content.extend(chunk)
+            if len(content) > 65536:
+                return
+        raw = json.loads(content)
+        progress = {
+            key: raw[key]
+            for key in ("completed_rows", "reused_rows", "committed_shards", "updated_at")
+            if isinstance(raw.get(key), (int, float)) and math.isfinite(raw[key]) and raw[key] >= 0
+        }
+        progress["stage"] = str(raw.get("stage", "tokenizing"))[:80]
+        progress["total_rows"] = prep.cell.rows + (
+            prep.validation_cell.rows if prep.validation_cell_id else 0
+        )
+        TrainingPreparation.objects.filter(
+            pk=prep.pk, state="running", remote_id=prep.remote_id
+        ).update(report={"progress": progress}, touched_at=timezone.now())
+        operational_progress.preparation(prep, progress)
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        ModalConnectionError,
+        InternalError,
+        ServiceError,
+        NotFoundError,
+    ):
+        return
+
+
+def live_progress_for_job(job):
+    progress = dict(job.progress) if isinstance(job.progress, dict) else {}
+    binding = progress.get("preparation")
+    if (
+        job.status not in {"preparing", "preprocessing", "awaiting_launch"}
+        or not isinstance(binding, dict)
+        or not binding.get("id")
+    ):
+        return progress
+    current = (
+        TrainingPreparation.objects.filter(
+            pk=binding["id"], cell__dataset__project_id=job.project_id
+        )
+        .values("state", "report")
+        .first()
+    )
+    if current:
+        report = current["report"] or {}
+        progress["preparation"] = {
+            **binding,
+            "state": current["state"],
+            "report": report,
+            **(report.get("progress") or {}),
+        }
+    return progress
 
 
 def advance(preparation_id):
@@ -128,11 +297,11 @@ def advance(preparation_id):
             return
         if prep.deadline <= now:
             prep.report = {"retryable": prep.state == "queued" or bool(prep.remote_id)}
-            prep.state, prep.error = "failed", "Preprocessing exceeded its 20-minute deadline."
+            prep.state, prep.error = "failed", "Preprocessing exceeded its 24-hour deadline."
             prep.save(update_fields=["state", "error", "report", "touched_at"])
             return
         if prep.state == "starting":
-            if prep.touched_at < now - timedelta(minutes=2):
+            if prep.touched_at < now - timedelta(minutes=30):
                 prep.state, prep.error = (
                     "failed",
                     "Preprocessing submission was interrupted before acknowledgement.",
@@ -145,7 +314,7 @@ def advance(preparation_id):
             prep.save(update_fields=["state", "touched_at"])
     try:
         if starting:
-            records = []
+            training_release.verify(prep.config["runtime"])
             for cell in (prep.cell, prep.validation_cell):
                 if cell is None:
                     continue
@@ -155,20 +324,74 @@ def advance(preparation_id):
                 ]
                 if cell.fingerprint != expected:
                     raise ValueError("Dataset version changed before preprocessing.")
-                for row in row_store.iter_rows(cell):
-                    records.append(
-                        {
-                            **row_to_finetuning_line(row),
-                            "source_row": row.extra.get("source_row", row.index),
-                            "cell": str(cell.id),
+            total_rows = prep.cell.rows + (prep.validation_cell.rows if prep.validation_cell else 0)
+            report_interval = max(1, min(1000, total_rows // 10))
+
+            def report_export(stage, completed_rows):
+                TrainingPreparation.objects.filter(
+                    pk=prep.pk, state="starting", deadline=prep.deadline
+                ).update(
+                    report={
+                        "progress": {
+                            "stage": stage,
+                            "completed_rows": completed_rows,
+                            "total_rows": total_rows,
                         }
-                    )
+                    },
+                    touched_at=timezone.now(),
+                )
+                operational_progress.preparation(
+                    prep,
+                    {"stage": stage, "completed_rows": completed_rows, "total_rows": total_rows},
+                )
+
+            completed_rows = 0
+            report_export("exporting", completed_rows)
+            with tempfile.TemporaryDirectory(prefix="training-preparation-") as directory:
+                source = Path(directory) / "rows.jsonl.gz"
+                with (
+                    source.open("wb") as raw,
+                    gzip.GzipFile(
+                        filename="", fileobj=raw, mode="wb", compresslevel=1, mtime=0
+                    ) as compressed,
+                    io.TextIOWrapper(compressed, encoding="utf-8") as stream,
+                ):
+                    for cell in (prep.cell, prep.validation_cell):
+                        if cell is None:
+                            continue
+                        for row in row_store.iter_rows(cell):
+                            stream.write(
+                                json.dumps(
+                                    {
+                                        **row_to_finetuning_line(row),
+                                        "source_row": row.extra.get("source_row", row.index),
+                                        "cell": str(cell.id),
+                                    }
+                                )
+                                + "\n"
+                            )
+                            completed_rows += 1
+                            if (
+                                completed_rows % report_interval == 0
+                                or completed_rows == total_rows
+                            ):
+                                report_export("exporting", completed_rows)
+                digest = file_digest(source)
+                report_export("uploading", completed_rows)
+                remote = f"/preparations/{prep.id}/rows.jsonl.gz"
+                volume = modal.Volume.from_name(
+                    "overmind-sft", environment_name=prep.config["runtime"]["environment"]
+                )
+                with volume.batch_upload(force=True) as batch:
+                    batch.put_file(source, remote)
             function = modal.Function.from_name(
-                "overmind-sft",
+                prep.config["runtime"]["app"],
                 "prepare_" + train_function_name(prep.config["stack"]),
-                environment_name=os.environ.get("MODAL_ENVIRONMENT") or None,
+                environment_name=prep.config["runtime"]["environment"],
             )
-            call = function.spawn(str(prep.id), {**prep.config, "rows": records})
+            call = function.spawn(
+                str(prep.id), {**prep.config, "rows_path": "/data" + remote, "rows_sha256": digest}
+            )
             TrainingPreparation.objects.filter(
                 pk=prep.pk, state="starting", deadline=prep.deadline
             ).update(state="running", remote_id=call.object_id, touched_at=timezone.now())
@@ -188,6 +411,8 @@ def advance(preparation_id):
                 touched_at=timezone.now(),
             )
     except TimeoutError:
+        if not starting:
+            observe_progress(prep)
         return
     except (ModalConnectionError, InternalError, ServiceError):
         # An observer failure is not a remote failure. Keep its handle until the deadline.
@@ -208,6 +433,7 @@ def ready_for_job(job, context_length):
         job.cell,
         job.base_model,
         context_length,
+        runtime=training_release.for_job(job),
         validation_cell=job.validation_cell if job.validation_enabled else None,
         training_type="full"
         if (job.hyperparameters or {}).get("training_type", {}).get("type") == "Full"
@@ -217,6 +443,7 @@ def ready_for_job(job, context_length):
         raise ValueError(
             prep.error or "Exact preprocessing is not ready for this training configuration."
         )
+    FinetuningJob.objects.filter(pk=job.pk).update(preparation=prep)
     return prep
 
 
@@ -231,21 +458,33 @@ def for_job(job):
         for cell in (job.cell, validation)
         if cell is not None
     )
-    context = estimated_training_context_length(
-        estimated_tokens,
-        model_max=maximum,
-        requested=int(hp.get("context_length") or 0) or None,
+    explicit_context = (
+        (getattr(job, "requested_configuration", {}) or {})
+        .get("configuration", {})
+        .get("hyperparameters", {})
+        or {}
+    ).get("context_length")
+    context = (
+        int(explicit_context)
+        if explicit_context
+        else estimated_training_context_length(
+            estimated_tokens,
+            model_max=maximum,
+            requested=int(hp.get("context_length") or 0) or None,
+        )
     )
     prep = request_preparation(
         job.cell,
         job.base_model,
         context,
         validation_cell=validation,
+        runtime=training_release.for_job(job),
         training_type=kind,
     )
     exact_tokens = int(prep.report.get("max_tokens") or 0)
     if (
         prep.state == "incompatible"
+        and not explicit_context
         and exact_tokens > context
         and (maximum is None or exact_tokens <= maximum)
     ):
@@ -256,8 +495,10 @@ def for_job(job):
             job.base_model,
             context,
             validation_cell=validation,
+            runtime=training_release.for_job(job),
             training_type=kind,
         )
+    FinetuningJob.objects.filter(pk=job.pk).update(preparation=prep)
     return prep
 
 
@@ -270,8 +511,8 @@ def preparation_error(prep):
         return (
             f"The longest training or validation row needs {longest:,} tokens; "
             f"the selected training context is {context:,}. "
-            "Choose a model with a larger training context or add a dataset version that "
-            "shortens the affected rows. No rows were truncated or dropped."
+            "Choose a model with a larger training context or restructure the affected rows "
+            "in the data workshop. No rows were truncated or dropped."
         )
     return (
         f"{prep.report.get('incompatible_rows', 0)} rows are incompatible with this "

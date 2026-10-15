@@ -13,6 +13,7 @@ export const deployedModelsPollInterval = (models?: { status?: string }[]): numb
   !models || models.some((m) => !SETTLED_MODEL_STATUSES.has(m.status ?? "")) ? 10_000 : false;
 
 export type DeployedModelsQueryParams = {
+  ordering?: string;
   projectId?: string;
   /** Capability id — resolved server-side through the model's fine-tuning job. */
   capability?: string;
@@ -26,6 +27,7 @@ export type DeployedModelsQueryParams = {
 /** Returns the DRF page as-is — scoping is the request's job, so `count` and
  *  `results` describe the same set. */
 export const useDeployedModelsQuery = ({
+  ordering,
   projectId,
   capability,
   page,
@@ -37,6 +39,7 @@ export const useDeployedModelsQuery = ({
     queryFn: () =>
       apiClient.deployedModels.deployedModelsList({
         capability: capability || undefined,
+        ordering,
         page,
         pageSize,
         project: projectId || undefined,
@@ -45,6 +48,7 @@ export const useDeployedModelsQuery = ({
       }),
     queryKey: [
       "deployed-models",
+      ordering,
       projectId || null,
       capability || null,
       page ?? null,

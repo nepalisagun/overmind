@@ -5,9 +5,10 @@ description: Connect and set up Overmind, discover capabilities from a local rep
 
 # Overmind MCP
 
-Overmind models production work as **Capability > behaviour > task
-execution**. A capability is the product AI surface, a behaviour is a
-scanned contract, and a task execution is a carved, scored unit of a trace.
+Overmind models production work as **capabilities** scored by an **eval
+matrix**. A capability is the product AI surface; each of its spans is scored
+live against the matrix rows that apply, and each trace's trajectory is scored
+once its spans are.
 
 MCP prompts are the native guided workflows. Invoke the matching prompt when
 the client lets the agent invoke prompts. Otherwise, or when local repository
@@ -23,6 +24,7 @@ reference and follow it:
 - `setup` — [references/setup.md](references/setup.md)
 - `ensure-tracing` — [references/telemetry.md](references/telemetry.md)
 - `dataset` — [references/datasets.md](references/datasets.md)
+- `model-workflows` — [references/model-workflows.md](references/model-workflows.md)
 - `finetune` — [references/finetuning.md](references/finetuning.md)
 - `optimise` — [references/optimizer.md](references/optimizer.md)
 - `backtest` — [references/backtest.md](references/backtest.md)
@@ -31,13 +33,15 @@ reference and follow it:
 
 Route guided work to these exact prompt names:
 
-- `investigate-capability` — health, failures, traces, task executions, and instrumentation gaps.
+- `investigate-capability` — health, failures, traces, and instrumentation gaps.
 - `instrument-repository` — translate an instrumentation plan into a human-applied code change and verify supplied spans.
 - `upload-dataset-file` — upload local data through the CLI, then land the dataset through MCP or REST.
+- `author-dataset-transformation` — retain, inspect, test, reuse and adapt versioned transformations with explicit conditional flow.
 - `export-dataset` — download a dataset version through the local CLI; MCP carries guidance, not file bytes.
 - `download-checkpoint` — download an archived fine-tuned deployment checkpoint through the local CLI; MCP carries guidance, not checkpoint bytes.
 - `connect-traces` — connect a tracing provider, review capability boundaries and verify imported traces.
-- `prepare-evaluation` — check evaluation dataset, evaluators, eval set, bindings, and credits.
+- `develop-model-from-data` — establish a generative or decision task, retain a training plan and data evidence, train and evaluate the requested recipe, with bounded quality pilots only when requested.
+- `prepare-evaluation` — check evaluation dataset, eval matrix rows, eval set, and credits.
 - `evaluate-change` — run an evaluation and compare it with a supplied baseline.
 - `finetune-capability` — check, estimate, launch, and verify fine-tuning.
 - `optimize-capability` — schedule and inspect prompt/code optimization.
@@ -65,98 +69,73 @@ The plugin and `overmind init` include these focused workflows. Select the one
 that matches the user's task; do not load all of them for a single operation.
 Each works directly with the configured MCP connection and can be used on its own.
 
-| Skill                                               | Use it for                                                   |
-| --------------------------------------------------- | ------------------------------------------------------------ |
-| [Agent](../overmind-agent/SKILL.md)                 | Capability map, behaviour coverage and repository provenance |
-| [Observability](../overmind-observability/SKILL.md) | Traces, failures, latency and instrumentation gaps           |
-| [Datasets](../overmind-datasets/SKILL.md)           | Data Workshop versions, scripts, documents and export        |
-| [Evaluations](../overmind-evaluations/SKILL.md)     | Rubrics, eval sets, runs and baseline comparisons            |
-| [Optimiser](../overmind-optimiser/SKILL.md)         | Prompt/code experiments and model comparisons                |
-| [Training](../overmind-training/SKILL.md)           | Model selection, exact preparation, cost and fine-tuning     |
-| [Inference](../overmind-inference/SKILL.md)         | Serving metrics, worker state and approved activation        |
-| [Integrations](../overmind-integrations/SKILL.md)   | Provider connectors, boundary mapping and trace import       |
+| Skill                                               | Use it for                                                    |
+| --------------------------------------------------- | ------------------------------------------------------------- |
+| [Agent](../overmind-agent/SKILL.md)                 | Capability map, eval coverage and repository provenance       |
+| [Observability](../overmind-observability/SKILL.md) | Traces, failures, latency and instrumentation gaps            |
+| [Datasets](../overmind-datasets/SKILL.md)           | Native-authored transformations, lineage, versions and export |
+| [Evaluations](../overmind-evaluations/SKILL.md)     | Eval matrix, eval sets, runs and baseline comparisons         |
+| [Optimiser](../overmind-optimiser/SKILL.md)         | Prompt/code experiments and model comparisons                 |
+| [Training](../overmind-training/SKILL.md)           | Model selection, exact preparation, cost and fine-tuning      |
+| [Inference](../overmind-inference/SKILL.md)         | Serving metrics, worker state and approved activation         |
+| [Integrations](../overmind-integrations/SKILL.md)   | Provider connectors, boundary mapping and trace import        |
 
 ## Connection and safety
 
-- `overmind sync` stores the **project-scoped API key** locally and configures
-  each initialized MCP client with `X-Api-Key`. Plugin connections use OAuth;
-  account API keys also work. Never ask the user to paste a key into chat.
-- The public server supports read and write permissions for the curated
-  surface and returns structured errors as values. Start with `list_projects`.
-  Account connections require `project_id` for every project operation and
-  resource URI query. Follow returned resource links; selection is per request.
-  Project keys remain limited to their configured project.
-- There are no public product tools for deletion or removal. The lifecycle
-  tools are `retry_deployment` for failed or deleted deployments and
-  `cancel_dataset_job` for a dataset import or script run; do not invent
-  others.
-- Treat dataset landing, evaluator writes, job starts, deployment changes, and
-  active-model changes as mutations. Confirm user intent where the workflow
-  requires approval; the server does not add a confirmation dialog.
+Global Codex connection setup is `overmind connection configure --api-url URL --project-id PROJECT --json`, using an account key already available locally.
+It writes the MCP and transfer configuration together without pinning a global
+project. It does not grant sandbox network permissions. Verify from the actual
+coding environment with `overmind connection check --project-id PROJECT --json`;
+configuration alone is not readiness. Follow the Datasets skill for durable
+upload recovery and scoped host approvals.
+
+Use the connected catalog and `overmind://interface/current` as the authority for available operations and the current contract version. OAuth/account API keys discover projects with `list_projects` and pass `project_id` on every operation and resource; project API keys retain narrower scope. Never put credentials in chat.
+
+Data-first projects do not require repository scanning, capabilities or instrumentation. Use `develop-model-from-data` when starting with uploaded data. Repository discovery remains a local workflow only for code-backed projects. Installed skills assist discovery; they are not a correctness prerequisite.
+
+The catalog exposes deliberate lifecycle operations including `cancel_dataset`, `retry_data_partition`, and comparison pause/resume. Follow their schemas. Pausing a comparison stops new work; it does not acknowledge cancellation of an already-submitted provider call. Stopping observation does not stop execution.
 
 ## Core principles
 
-Follow these for ALL Overmind work:
-
-1. **Local setup, then MCP.** Capability discovery is local: scan the repo,
-   write `overmind.toml`, run `overmind sync` — see
-   [references/setup.md](references/setup.md). After that, all platform work
-   goes through the Overmind
-   MCP server. Do not curl REST endpoints, do not invent base URLs, and do not
-   hardcode hosts. The server is already configured (plugin, or `overmind init`)
-   and authenticated through OAuth or an account/project API key. Call the named
-   tools; inspect each tool's schema for arguments. If tools are missing, tell
-   the user to run `overmind init` for the IDE and `overmind sync` to install
-   its project credential. Do not paste a URL or ask them to paste the raw key
-   into chat.
+1. **Discover the connected product.** Read `overmind://interface/current`, select an authorized project, and use named MCP operations. Keep platform-owned training, evaluation and serving on their named tools. The native agent authors dataset transformations as staged Python packages. Upload the package, save its immutable revision, validate and preview, then publish through the restricted Workshop runner. Import genuine external/provider results with separate attribution; output-only uploads are not a substitute for retained transformation code. Use the upload/export CLI for local file transport. Draft comparisons and experiments do not submit paid work; preparation returns a background receipt, and launch records the authorized saved scope. Check actual schemas rather than assuming an installed skill has the newest catalog.
 1. **Reference file per use case.** Check the relevant reference below before
    implementing. This file holds conventions that apply everywhere; the
    workflow lives in the reference.
 1. **Discover, then pass the id the schema asks for.** There are no
    `list_capabilities`, `list_traces`, `get_trace`, `get_capability`,
-   `list_eval_sets`, `list_evaluators`, `list_eval_runs`, `list_finetune_jobs`,
+   `list_eval_sets`, `list_eval_runs`, `list_finetune_jobs`,
    `list_deployed_models`, or `job_status` tools. Use `list_datasets`,
    `query_*`, `inspect_*`, `get_job`, and resource reads. Never paste raw
    UUIDs to the user when a name/slug exists.
-   Dataset names are not unique: every dataset tool accepts a name only when
-   it is unique, so prefer the UUID from `list_datasets`. Versions are always
-   `version` (label such as `v3`, or the version id), with `eval_version` and
-   `validation_version` beside them.
+   Dataset names are not unique: `list_datasets` then pass that UUID to
+   `inspect_dataset` / `query_dataset` (those two reject names). Fine-tune,
+   eval, and optimizer tools also accept a unique dataset name.
    Capability tools accept name, slug, or id. Stamp the capability resource
    `id` into the SDK. Pass a READY deployed-model UUID to `set_active_model`
    (omit to clear), then poll the returned `model_activation` job until verification and routing complete. See [references/capabilities.md](references/capabilities.md).
-1. **Behaviours have no resource.** There is no
-   `overmind://behaviours/...`; read them from `query_task_executions`.
-1. **Contracts gate every dataset workflow.** Intent is **`train`**,
+1. **Datasets may start from written intent.** Use `start_dataset` with a brief when no source or capability is chosen. Attach data later with `overmind dataset upload FILE --dataset ID --json`. Original documents and row evidence remain inspectable; extraction does not establish answer correctness.
+1. **Contracts gate dataset consumption.** Intent is **`train`**,
    **`eval`**, or **`pending`** — never `ft` or `surface`. Fine-tuning needs
    `train`; eval runs and optimizer experiments need `eval`. `pending` is
    refused. There is no reingest tool and no dual-intent dataset. Set intent
    at upload (`overmind dataset upload FILE --json --intent train|eval`), at
-   create (`create_dataset`), or later with `update_dataset(intent=...)`.
-   Intent and capability are fixed once a version was used; create a new
-   dataset from that version to change them.
-   `create_dataset` with `split` lands one source (traces, LLM calls or a
-   version) as a train dataset and an eval dataset with disjoint rows; so does
-   `--split PERCENT` on `overmind dataset upload`.
+   create (`create_dataset_from_traces` / `_failures`), or later with
+   `update_dataset(intent="train")` if no version has been used.
+   `create_dataset_from_traces` with `split` lands one selection as a train
+   dataset and an eval dataset with disjoint rows; so does `--split PERCENT`
+   on `overmind dataset upload`. A used cell freezes intent:
+   derive a separate dataset or create role-specific partitions instead of retagging a used chain.
    Read the contracts section below.
-1. **Errors are values; mutations run immediately.** Every tool returns
-   `{"error": "..."}` instead of raising — follow `fields` when present.
-   There is no confirmation gate, so verify arguments (and ask the user when
-   destructive) before create/delete/cancel. There are no delete or cancel
-   tools.
-1. **Ticketed instrumentation.** Call `get_instrumentation_plan` with no
+1. **Follow structured errors and durable receipts.** Read the error code, fields and retryability. Creation and paid launch are separate where the schema specifies a draft. Authorization already granted for an unchanged saved scope persists through routine continuation. Unresolved provider submissions require receipt recovery; never blindly repeat them.
+1. **Planned instrumentation.** Call `get_instrumentation_plan` with no
    capability for project-wide work, or with a capability for scoped work, and
-   treat each placement as an edit ticket. If the result has `human_action` or
-   no placements, report its instruction and stop this attempt. Copy every
-   ticket field verbatim, including `key`, `behaviour_id`, `version_id`,
-   `version_analyzed_sha`, `contract_fingerprint`, `capability`,
-   `capability_id`, `placement_mode`, `allowed_keys`, `grain`, `target`,
-   `required_scope`, `required_spans`, and `required_identity`. File + qualname
-   is enough to locate the function. Keep a primary scope outermost when a
-   specialized span targets the same function. When coding subagents are
-   available and permitted, group tickets by every file they touch, including
-   `required_spans[].target.file`, so one worker owns each overlapping group.
-1. **Explicit run approval.** After applying the ticketed code changes, report
+   treat each placement as one edit. If the result has `human_action` or
+   no placements, report its instruction and stop this attempt. Apply each
+   `required_decorator` verbatim at `target.qualname` in `target.file`, keeping
+   `capability_id` exact. When coding subagents are available and permitted,
+   group placements by file so one worker owns each file. See
+   [references/instrumentation.md](references/instrumentation.md).
+1. **Explicit run approval.** After applying the placements, report
    the changed files and local checks, generate a unique verification
    correlation, then ask the user to choose a real run or bounded smoke run.
    Present each choice's exact command or input, capability, environment,
@@ -175,19 +154,18 @@ Follow these for ALL Overmind work:
 ## Use-case references
 
 - Local setup (`overmind chassis` → scan repo → capability cards / trajectory
-  maps / eval matrix → `overmind.toml` → `overmind sync`):
+  maps → `overmind.toml` → `overmind sync` → decorators with span expectations):
   [references/setup.md](references/setup.md)
 - Resolving / updating agents, prompts, and eval spec:
   [references/capabilities.md](references/capabilities.md)
-- Tasks (behaviour registry, task executions, eval coverage):
-  [references/behaviours.md](references/behaviours.md)
+- Instrumentation (decorator placements, declared expectations, verification):
+  [references/instrumentation.md](references/instrumentation.md)
 - Telemetry (add tracing, inspect traces / sessions / health, connectors):
   [references/telemetry.md](references/telemetry.md)
 - Landing datasets (from traces, failures, a file or rows), handing a
   version to a consumer, and pulling a version to disk:
   [references/datasets.md](references/datasets.md)
-- Authoring evaluators, grouping them into eval sets, running and comparing
-  eval runs:
+- Live scoring, eval matrix rows, eval sets, running and comparing eval runs:
   [references/evals.md](references/evals.md)
 - Fine-tuning a model (prerequisites, recommended-model sweep, deploy, swap PR):
   [references/finetuning.md](references/finetuning.md)
@@ -201,15 +179,15 @@ Follow these for ALL Overmind work:
 ## Conventions (read before any workflow)
 
 - **List first.** `list_datasets` for datasets. Everything else:
-  `inspect_capability_health`, `query_traces`, `query_task_executions`,
-  `query_failures`, or a resource read. Pass the UUID `list_datasets`
+  `inspect_capability_health`, `query_traces`, `query_failures`, or a
+  resource read. Pass the UUID `list_datasets`
   returned into dataset inspect/query.
   Capability name/slug/id, eval-set name, and unique dataset names work on
   the tools whose schemas accept them. Read
   `overmind://capabilities/{capability}` for capability `id` and
   `active_model`.
 - **Async jobs.** Poll returned job references with `get_job(kind, id)`.
-  Dataset landing uses `kind=dataset_import`; other supported kinds include
+  Source landing uses `kind=dataset_run`; transformations use the returned `kind=dataset_pipeline` and run ID. Other supported kinds include
   `eval_run`, `finetune_job`, `deployment`, `model_activation`, and `optimizer_experiment`.
 - Chat-UI-only helpers (`propose_plan`, `suggest_navigation`) are not exposed
   on MCP.
@@ -220,31 +198,42 @@ Use only these implemented names and inspect their schemas at call time.
 
 Observability:
 
-`inspect_capability_health`, `query_failures`, `query_traces`,
-`query_task_executions`, `get_job`.
+`inspect_capability_health`, `query_failures`, `query_traces`, `get_job`.
+
+`inspect_operation` reads a linked operational receipt, with `after`/`limit`
+pagination over its durable events. It never wakes a worker. Distinguish observed
+state, heartbeat and forward progress; shared-pool telemetry does not prove a
+particular adapter or application is ready.
 
 Datasets:
 
-`list_datasets`, `inspect_dataset`, `query_dataset`, `create_dataset`,
-`try_dataset_script`, `probe_dataset_version`, `add_dataset_version`,
-`add_synthetic_examples`, `diff_dataset_versions`, `activate_dataset_version`,
-`update_dataset`, `resume_dataset_import`, `cancel_dataset_job`.
-
-Decision models:
-
-`check_decision_readiness`, `start_decision_job`, `run_decision_model`.
+`list_datasets`, `inspect_dataset`, `query_dataset`,
+`start_dataset`, `create_dataset_from_traces`, `create_dataset_from_llm_calls`,
+`inspect_dataset_workbench`, `save_dataset_pipeline`, `run_dataset_pipeline`,
+`import_dataset_version`, `update_dataset`, `cancel_dataset`.
 
 Evaluations:
 
-`check_evaluation_readiness`, `upsert_evaluator`, `create_eval_set`, `run_evaluation`,
-`compare_evaluations`, `annotate_evaluation_sample`.
+`check_evaluation_readiness`, `create_eval_matrix_row`, `delete_eval_matrix_row`,
+`create_eval_set`, `run_evaluation`, `compare_evaluations`.
+
+Signals:
+
+`list_signals`, `set_signal_subscription`.
 
 Fine-tuning and serving:
+
+`save_training_plan` retains immutable task, data, audit, baseline, sanity and optional pilot-selection evidence. Plan-bound `create_training_experiment` uses explicit `pilot` or `full` stages. Full training does not require a pilot or pilot-selection evidence. Pilots are optional and should run only when requested; any supplied pilot selection must match the task and data. Direct training remains available. Follow [model workflows](references/model-workflows.md) for both generative and decision training.
 
 `get_model_catalog`,
 `check_finetune_readiness`, `estimate_finetune`, `start_finetune`,
 `retry_deployment`, `set_active_model`, `set_benchmark_model`, `run_inference`,
 `get_model_swap_prompt`.
+
+`run_inference` requires a stable `request_key` and returns an `inference_request`
+job promptly. Read `get_job` for its answer, usage and finish reason. Reusing the
+same key/input recovers the receipt; changed inputs conflict. Never invent a new
+key to repeat an unknown provider submission.
 
 Call `get_model_catalog` before choosing a fine-tuning model. It is
 dataset-independent and reports the active backend, tier, context limits,
@@ -263,77 +252,75 @@ Instrumentation:
 
 `get_instrumentation_plan`, `verify_instrumentation`.
 
-The server does not expose delete or generic API tools. The only lifecycle
-tools are `retry_deployment`, for its documented failed/deleted deployment
-recovery case, and `cancel_dataset_job`, which stops a dataset import or
-script run.
+The server does not expose generic delete or API-proxy tools. `cancel_dataset`
+prevents pipeline publication or requests source-landing cancellation, not remote termination. Use
+`retry_deployment` only for its documented failed/deleted deployment recovery
+case.
 Use the returned structured fields and resource links rather than guessing
 older endpoint-shaped names.
 
 ## Dataset contracts — read first, they gate every workflow
 
-A dataset is a landed source (`v0`) and an immutable tree of **versions**
-(`v1`, `v2`, … in the order they were added, each with one parent). You add a
-version by running a Python script on a parent in Overmind's sandbox. The
-dataset has an **intent** (`train` or `eval`, proposed at landing) and a
-**capability**, and every version carries two measured contracts
-(`list_datasets` shows the active version's):
+A dataset is a landed source and a linear chain of cells; every cell that
+ran is a **version** (1.0 is the source, then 1.1, 1.2, …), the dataset has
+an **intent** (`train`, `eval`, or `explore`, chosen by the user) and a **capability**,
+and every version carries two measured contracts (`list_datasets` shows the
+active version's):
 
 - **`train`** ("Train") — a `messages` column whose every row is a chat
-  transcript with an assistant turn (`tools` optional).
+  transcript with an assistant turn (`tools` optional), or a native `decision` with preserved probability/ordinal targets.
 - **`eval`** ("Eval") — an `input` on every row plus an `expected_output`
   column with at least one reference.
-- **`pending`** — the intent is not decided yet; refused by every run.
+- **`explore`** — data exploration, without automatic train/eval preparation.
+- **`pending`** — no user purpose yet. Obtain their choice of Training, Eval or Data exploration and set it with `update_dataset`; never infer intent from rows.
 - There is no `ft` intent. A leftover stored `ft` is **train**.
 
-Capability prompt/schema mismatches and train/eval overlap are advisory
-warnings, not technical-format errors. Explain them and offer a new version as
-the repair; users can continue without an approval step. A passing format
-contract is not a claim that the answers are supported by the inputs: report
-technical fit and task suitability separately.
+Capability prompt/schema mismatches, incomplete quality reviews and train/eval
+overlap are advisory warnings, not technical-format errors. Explain the remaining
+work and offer the workshop for repairs; users can continue without a quality
+approval step. Inspect cell `warnings` and `readiness.quality_reason`. A passing
+format contract is not a claim that the answers are supported by the inputs.
 
 What each workflow accepts:
 
 - **Eval runs** (`run_evaluation`) and **optimizer experiments**
-  (`start_optimizer`) use an **eval** dataset at the `version` you pass, else
-  its active version. Pass the version explicitly when launching.
+  (`start_optimizer`) use the active version of an **eval** dataset.
 - **Fine-tuning** (`start_finetune`) uses a **train** version, plus a
-  separate **eval** dataset for in-training judge evals.
+  separate **eval** dataset only when chat judge evaluations are requested. Native decision comparisons use their frozen calibration/final plan.
 
-A run that uses a version marks it **Used**; it cannot be deleted. A contract
-is measured, never declared. If a consumer rejects a dataset for its contract,
-`inspect_dataset` names the reason: add a version that fixes it
-(`try_dataset_script`, then `add_dataset_version`) and activate it after the
-user agrees. Rows are never cleaned locally: land them raw, shape them with
-scripts on the server. Local loops pull one version with
-`overmind dataset export` ([datasets.md](references/datasets.md#local-export)).
+A use freezes the version and everything before it, and starts a new major
+(2.0). A contract is measured, never declared. The native coding agent authors
+transformations. New recipes require uploaded Python packages; historical package-free
+revisions are read-only. Import genuine external results with source-bound attribution.
+Poll the exact returned job kind and ID, then inspect the
+new cell. See [Datasets](../overmind-datasets/SKILL.md) for lineage and limits.
 
 ## How the workflows chain
 
 Typical loop (local setup once, then MCP):
 
 1. **See what's happening** — [telemetry.md](references/telemetry.md)
-   (`inspect_capability_health` → `query_failures` → `query_task_executions`
-   → `query_traces` / `overmind://traces/{trace_id}`). The task-execution layer
-   ([behaviours.md](references/behaviours.md)) sits between the agent and its
-   spans: check it before walking traces by hand, and treat
-   `binding_source: "unbound"` as an instrumentation gap, not a scoring one.
-   Offline `scores.overall_pass_rate` and live `live_trace_scores` are
-   different systems; do not treat a 1.0 offline rate as "no live failures."
+   (`inspect_capability_health` → `query_failures` → `query_traces` /
+   `overmind://traces/{trace_id}`). Span and trajectory scores come from live
+   scoring; eval-run scores come from a frozen dataset version. They are
+   different observations; do not treat a 1.0 eval run as "no live failures."
    Resolve / retarget capabilities via [capabilities.md](references/capabilities.md)
    (`overmind://capabilities/{capability}`, `inspect_capability_health`,
    `set_active_model`). If none
    exist, run [setup.md](references/setup.md) (`overmind chassis` →
    `overmind.toml` → `overmind sync`). If nothing is landing, add tracing in the same file —
-   stamp the capability's `id` and use the ticket fan-out workflow in
+   stamp the capability's `id` and use the placement workflow in
    [references/telemetry.md](references/telemetry.md).
 1. **Turn traces into data** — [datasets.md](references/datasets.md)
-   (`create_dataset` with a traces source, or CLI upload).
-1. **Shape it** — `inspect_dataset`, then `try_dataset_script` and
-   `add_dataset_version`; activate with `activate_dataset_version` only after
-   the user agrees.
-1. **Grade it** — [evals.md](references/evals.md) when you want an
-   eval-vs-eval comparison you drive yourself. Finetune and optimizer runs
+   (`create_dataset_from_traces`, or CLI upload).
+1. **Shape it** — author a saved pipeline or an external transformation; publish
+   with `run_dataset_pipeline` or `import_dataset_version`. Poll its exact job,
+   inspect the new version and report impact and unmeasured quality.
+1. **Grade it** — the capability's active eval set (its Default set, built by
+   `overmind sync` from decorator expectations and toml checks) grades live
+   traces, eval runs, backtests, the optimizer and training alike; change it in
+   code or the toml and sync. [evals.md](references/evals.md) covers that and
+   the eval-vs-eval comparisons you drive yourself. Finetune and optimizer runs
    create their own incumbent / experiment baselines automatically — do not
    spend a manual eval run just to give them a comparison point.
 1. **Improve** — [finetuning.md](references/finetuning.md) (**train** dataset;
@@ -382,6 +369,7 @@ The implemented resource templates are:
 - `overmind://datasets/{dataset}`
 - `overmind://eval-runs/{eval_run}`
 - `overmind://eval-sets/{eval_set}`
+- `overmind://signal-events`
 - `overmind://finetunes/{job_id}`
 - `overmind://deployments/{deployment}`
 - `overmind://optimizer-runs/{experiment}`
@@ -422,7 +410,8 @@ Read the smallest matching reference only when the native prompt is missing or
 local work is needed:
 
 - local repository setup: [references/setup.md](references/setup.md)
-- capability and behaviour orientation: [references/capabilities.md](references/capabilities.md) and [references/behaviours.md](references/behaviours.md)
+- capability orientation: [references/capabilities.md](references/capabilities.md)
+- decorator placement and verification: [references/instrumentation.md](references/instrumentation.md)
 - telemetry and code instrumentation: [references/telemetry.md](references/telemetry.md)
 - dataset landing and shaping: [references/datasets.md](references/datasets.md)
 - evaluation authoring and runs: [references/evals.md](references/evals.md)
@@ -435,22 +424,22 @@ local work is needed:
 - `/overmind setup` scans the local repository and writes capability metadata;
   `overmind sync` sends that snapshot to the configured project. MCP cannot
   scan or edit the repository.
-- `get_instrumentation_plan` is read-only. Apply its exact tickets locally;
+- `get_instrumentation_plan` is read-only. Apply its exact placements locally;
   the MCP server cannot edit files or ingest a smoke trace. Verify an ingested
   run with `verify_instrumentation(trace_id=...)`.
 - MCP does not carry local file bytes. From a coding agent with filesystem
   access, run `overmind dataset upload FILE --json` with optional
   `--intent train|eval` and `--project-id`. The command returns the dataset
-  UUID; poll it with `get_job(kind=dataset_import)`, then inspect it. Land raw
-  rows; shape them with scripts on the server.
+  UUID; poll it with `get_job(kind=dataset_run)`, then inspect it. Land raw
+  rows; this coding agent authors each transformation through the Workshop tools.
 - MCP does not carry dataset export bytes. After the active version fits, run
   `overmind dataset export DATASET --json` locally, optionally adding
   `--format jsonl|csv`, `--cell`, or `--output PATH`. Use the dataset id
   supplied by MCP; the CLI does not resolve names, uses the server filename when
   no output path is given, and refuses overwrite. For traces, select traces,
-  call `create_dataset`, poll `get_job(kind=dataset_import)`,
-  shape and activate a version, then run the local export. There is no
-  `export_trace` MCP tool.
+  call `create_dataset_from_traces`, wait for landing, author any requested
+  transformations through the Workshop tools, then run the local export.
+  There is no `export_trace` MCP tool.
 - MCP does not carry checkpoint bytes or presigned URLs. Resolve and read the
   deployment through the existing MCP resource/tool flow, then run
   `overmind model download-checkpoint DEPLOYMENT --json` locally with the
@@ -491,3 +480,5 @@ local work is needed:
 Follow [references/telemetry.md](references/telemetry.md) for instrumentation
 verification. Real application tasks are allowed only after explicit user
 approval with the exact run details and correlation value presented first.
+
+For native uploaded-data training, follow [model workflows](references/model-workflows.md). Use exact cell UUIDs after Workshop reaches idle. Dataset inspection has cell_offset/cell_limit pagination and reports omitted detail; absent cached profiles are unmeasured and can be requested with explore_dataset.

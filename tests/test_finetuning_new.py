@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import uuid
 from types import SimpleNamespace
@@ -8,16 +9,22 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import EVAL_ROWS, frozen_dataset
 from django.urls import reverse
-from factories import auth_client, make_capability, make_project, make_user, prepare_training
+from factories import (
+    auth_client,
+    make_capability,
+    make_matrix_row,
+    make_project,
+    make_user,
+    prepare_training,
+)
 from rest_framework.test import APIClient
 
+from modal_shared.training_data import row_key
 from overbae.modal.model_registry import baseten_finetuning_catalog
 from overbae.models import (
     Capability,
     Dataset,
     EvalSet,
-    EvalSetMember,
-    Evaluator,
     FinetuningJob,
     FinetuningJobEvent,
     Project,
@@ -62,6 +69,7 @@ def _dataset_with_messages(
             for i in range(n)
         ],
         capability=capability,
+        contract="train",
     )
     return ds
 
@@ -71,22 +79,15 @@ def _dataset_with_pairs(capability: Capability, *, n: int = 3) -> Dataset:
         capability.project,
         [{"input": f"input {i}", "expected_output": f"output {i}"} for i in range(n)],
         capability=capability,
+        contract="train",
     )
     return ds
 
 
 def _ft_job_payload(project: Project, dataset: Dataset, **overrides) -> dict:
-    evaluation = frozen_dataset(project, EVAL_ROWS)
+    evaluation = frozen_dataset(project, EVAL_ROWS, contract="eval")
     eval_set = EvalSet.objects.create(project=project, name="Training evals")
-    evaluator = Evaluator.objects.create(
-        project=project,
-        name="Exact match",
-        kind=Evaluator.Kind.DETERMINISTIC,
-        config={"check": "exact_match"},
-    )
-    EvalSetMember.objects.create(
-        eval_set=eval_set, evaluator=evaluator, role=EvalSetMember.Role.GENERATIVE
-    )
+    eval_set.rows.add(make_matrix_row(eval_set.project))
     payload = {
         "project": str(project.id),
         "dataset": str(dataset.id),
@@ -1192,13 +1193,24 @@ class TestFinetuningMaterialisation:
         prepare_training(job, fake_modal)
         assert run_finetuning(job_id=str(job.id))["status"] == "running"
         [(_, _, args, kwargs)] = [e for e in fake_modal.log if e[1] == "upload_dataset"]
-        call = dict(zip(("run_id", "data_jsonl", "val_jsonl"), args, strict=False)) | kwargs
+        call = dict(zip(("run_id",), args, strict=False)) | kwargs
+        content = [
+            json.loads(line)
+            for line in gzip.decompress(
+                fake_modal.files[f"/preparations/{call['preparation_id']}/rows.jsonl.gz"]
+            ).splitlines()
+        ]
+        by_key = {row_key(row): row for row in content}
+        selected = {}
+        for name in call["selections"]:
+            keys = fake_modal.files[f"/runs/{call['run_id']}/selected-{name}.keys"]
+            selected[name] = [
+                json.dumps(by_key[keys[i : i + 32].hex()]) for i in range(0, len(keys), 32)
+            ]
         event = FinetuningJobEvent.objects.get(
             job=job, event_type="log", message__startswith="Materialised"
         )
-        train = call["data_jsonl"].splitlines()
-        validation = call.get("val_jsonl")
-        return train, (validation.splitlines() if validation else None), event.data
+        return selected["data"], selected.get("val"), event.data
 
     def test_a_split_holds_out_the_validation_rows(self, sft, fake_modal):
         _, p, a = _setup()

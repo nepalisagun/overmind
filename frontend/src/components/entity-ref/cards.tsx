@@ -4,14 +4,14 @@
 import { useQuery } from "@tanstack/react-query";
 
 import apiClient from "@/client";
-import { sourceKindLabel } from "@/components/datasets/badges";
+import { SOURCE_KIND_LABEL } from "@/components/datasets/badges";
 import {
   EntityCardMissing,
   EntityCardShell,
   EntityCardSkeleton,
   Row,
 } from "@/components/entity-ref/shell";
-import { type ComparisonSummary, overallAggregate } from "@/components/evaluations/run-comparison";
+import { asRunSummary } from "@/components/evaluations/run-comparison";
 import { userFacingJobError } from "@/components/finetuning/train/model-config";
 import { CreditsAmount } from "@/components/ui/credits";
 import { DateTime } from "@/components/ui/datetime";
@@ -20,6 +20,7 @@ import { INTENT_LABEL, intentOf } from "@/hooks/use-datasets";
 import { jobCostUsd } from "@/lib/finetuning-cost";
 import { StatusBadge } from "@/lib/job-status";
 import { scorePct } from "@/lib/utils";
+import type { EvalRunProgress } from "@/openapi";
 
 const TERMINAL = new Set(["cancelled", "completed", "failed", "partially_completed", "succeeded"]);
 
@@ -35,46 +36,16 @@ function isTerminal(status: unknown) {
   return typeof status === "string" && TERMINAL.has(status);
 }
 
-export type EvalProgressSnapshot = {
-  phase?: string | null;
-  prepared?: number;
-  total?: number;
-  scored?: number;
-  scoreTotal?: number;
+const PHASE_LABEL: Record<string, string> = {
+  generating: "Generating",
+  preparing: "Preparing",
+  scoring: "Scoring",
 };
 
-export function evalProgressCounts(
-  progress: EvalProgressSnapshot | null
-): { done: number; total: number } | null {
-  if (!progress?.phase) return null;
-  const phase = progress.phase;
-  const isGenerating = phase === "generating" || phase === "pending";
-  const done = isGenerating ? (progress.prepared ?? 0) : (progress.scored ?? 0);
-  const total = isGenerating ? (progress.total ?? 0) : (progress.scoreTotal ?? 0);
-  if (total <= 0) return null;
-  return { done, total };
-}
-
-/** Mirrors the runs-table RunRowProgress labelling. */
-export function evalProgressLabel(progress: EvalProgressSnapshot | null): string | null {
-  if (!progress?.phase) return null;
-  const phase = progress.phase;
-  const counts = evalProgressCounts(progress);
-  if (phase === "pending") return "Queued";
-  if (phase === "generating" && counts) return `Generating ${counts.done}/${counts.total}`;
-  if (phase === "scoring" && counts) return `Scoring ${counts.done}/${counts.total}`;
-  if (phase === "aggregating") return "100%";
-  return phase;
-}
-
-export function evalHeadlineScore(
-  summary: ComparisonSummary | null | undefined
-): { label: "Score" | "Pass rate"; pct: number } | null {
-  if (!summary?.metrics?.length) return null;
-  const agg = overallAggregate(summary);
-  if (agg.mean != null) return { label: "Score", pct: scorePct(agg.mean) };
-  if (agg.passRate != null) return { label: "Pass rate", pct: scorePct(agg.passRate) };
-  return null;
+export function evalProgressLabel(progress: EvalRunProgress | null): string | null {
+  if (!progress) return null;
+  const phase = PHASE_LABEL[progress.phase] ?? progress.phase;
+  return progress.rows > 0 ? `${phase} ${progress.done}/${progress.rows}` : phase;
 }
 
 type JudgeRow = {
@@ -123,17 +94,56 @@ export function DatasetCard({ id, name }: { id: string; name: string }) {
     <EntityCardShell
       kind="dataset"
       name={data.name || name}
-      subtitle={data.activeVersion ? `active ${data.activeVersion}` : "no version yet"}
+      subtitle={data.activeVersion ? `version ${data.activeVersion}` : "no version yet"}
     >
       <Row label="Rows">{(data.rows ?? 0).toLocaleString()}</Row>
-      <Row label="Purpose">{INTENT_LABEL[intentOf(data)]}</Row>
-      <Row label="Source">{sourceKindLabel(data.sourceKind)}</Row>
+      <Row label="Intent">{INTENT_LABEL[intentOf(data)]}</Row>
+      <Row label="Source">{SOURCE_KIND_LABEL[data.sourceKind] ?? data.sourceKind}</Row>
       <Row label="Created">{data.createdAt ? <DateTime value={data.createdAt} /> : null}</Row>
     </EntityCardShell>
   );
 }
 
-export function EvalRunCard({ id, name }: { id: string; name: string }) {
+export function EvalRunCard({
+  id,
+  name,
+  evaluationFormat,
+}: {
+  id: string;
+  name: string;
+  evaluationFormat?: "decision";
+}) {
+  return evaluationFormat === "decision" ? (
+    <DecisionEvalRunCard id={id} name={name} />
+  ) : (
+    <ChatEvalRunCard id={id} name={name} />
+  );
+}
+
+function DecisionEvalRunCard({ id, name }: { id: string; name: string }) {
+  const { data, isPending } = useQuery({
+    queryFn: () => apiClient.nativeEvaluations.nativeEvaluationsRetrieve({ id }),
+    queryKey: ["native-evaluation", id],
+    refetchInterval: (query) =>
+      query.state.data?.deletedAt ? false : livePoll(query.state.data?.state),
+  });
+  if (isPending) return <EntityCardSkeleton kind="evalRun" name={name} />;
+  if (!data) return <EntityCardMissing kind="evalRun" name={name} />;
+  return (
+    <EntityCardShell
+      footer={<StatusBadge fallback="pending" status={data.deletedAt ? "deleted" : data.state} />}
+      kind="evalRun"
+      name={data.name || name}
+    >
+      <Row label="Dataset">{data.finalSuite?.datasetName}</Row>
+      <Row label="Calibration">{data.calibrationSuite?.datasetName}</Row>
+      <Row label="Models">{data.config?.participants?.length}</Row>
+      <Row label="Decisions">{data.finalSuite?.rows}</Row>
+    </EntityCardShell>
+  );
+}
+
+function ChatEvalRunCard({ id, name }: { id: string; name: string }) {
   const { data, isPending } = useQuery({
     queryFn: () => apiClient.evalRuns.evalRunsRetrieve({ id }),
     queryKey: ["eval-run", id],
@@ -144,12 +154,8 @@ export function EvalRunCard({ id, name }: { id: string; name: string }) {
 
   const terminal = isTerminal(data.status);
   const progressLabel = !terminal ? evalProgressLabel(data.progress) : null;
-  const headline = terminal
-    ? evalHeadlineScore(data.summary as ComparisonSummary | null | undefined)
-    : null;
-  const partialMean = !terminal
-    ? data.progress?.evaluatorStats?.find((s) => s.mean != null)?.mean
-    : null;
+  const score = terminal ? asRunSummary(data.summary).score : null;
+  const headline = score != null ? { label: "Score", pct: scorePct(score) } : null;
 
   return (
     <EntityCardShell
@@ -168,7 +174,6 @@ export function EvalRunCard({ id, name }: { id: string; name: string }) {
     >
       <Row label="Capability">{data.capabilityName}</Row>
       <Row label="Dataset">{data.datasetName}</Row>
-      {partialMean != null ? <Row label="Partial">{`${scorePct(partialMean)}%`}</Row> : null}
       {headline ? <Row label={headline.label}>{`${headline.pct}%`}</Row> : null}
     </EntityCardShell>
   );

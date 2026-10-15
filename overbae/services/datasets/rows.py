@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from overbae.services.datasets import paths, store
+from overbae.services.datasets.examples import missing, normalize_record
 from overbae.services.datasets.partition import contamination_keys
-from sandbox.examples import missing, normalize_record
 
 
 class RowStoreError(RuntimeError):
@@ -150,9 +150,9 @@ def contamination(train, evaluation) -> dict:
     }
 
 
-def sample_records(dataset: Any, limit: int, cell: Any = None) -> list[dict[str, Any]]:
-    """The first ``limit`` rows of ``cell``, or of the active one; [] when there is none."""
-    cell = cell or dataset.active_cell
+def sample_records(dataset: Any, limit: int) -> list[dict[str, Any]]:
+    """The first ``limit`` rows of the dataset's active cell; [] when there is none."""
+    cell = dataset.active_cell
     if cell is None:
         return []
     try:
@@ -161,8 +161,8 @@ def sample_records(dataset: Any, limit: int, cell: Any = None) -> list[dict[str,
         return []
 
 
-def sample_rows(dataset: Any, limit: int, cell: Any = None) -> list[DatasetRow]:
-    return [row_from_record(i, rec) for i, rec in enumerate(sample_records(dataset, limit, cell))]
+def sample_rows(dataset: Any, limit: int) -> list[DatasetRow]:
+    return [row_from_record(i, rec) for i, rec in enumerate(sample_records(dataset, limit))]
 
 
 def sample_expected_outputs(dataset: Any, limit: int) -> list[Any]:

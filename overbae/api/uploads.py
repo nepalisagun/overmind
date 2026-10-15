@@ -6,17 +6,16 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import BaseParser, JSONParser
 from rest_framework.response import Response
 
-from overbae.models import APIToken, ProjectMembership
+from overbae.models import DatasetTransfer
 from overbae.services.datasets import files
 
 
 class BeginUploadSerializer(serializers.Serializer):
     filename = serializers.CharField(max_length=255)
-    project = serializers.UUIDField(required=False)
 
 
 class UploadStateSerializer(serializers.Serializer):
@@ -33,14 +32,12 @@ class UploadReservedSerializer(serializers.Serializer):
 
 class InspectUploadSerializer(serializers.Serializer):
     size = serializers.IntegerField(min_value=0, max_value=files.MAX_UPLOAD_BYTES)
-    json_rows_field = serializers.CharField(max_length=200, required=False)
 
 
 class UploadInspectionSerializer(serializers.Serializer):
     filename = serializers.CharField()
     bytes = serializers.IntegerField()
     rows = serializers.IntegerField(allow_null=True)
-    sha256 = serializers.CharField()
 
 
 class OctetStreamParser(BaseParser):
@@ -53,24 +50,6 @@ class OctetStreamParser(BaseParser):
         return stream.read()
 
 
-def _upload_project(request, requested):
-    """The project the upload is bound to: a project key's own, or a project the caller
-    belongs to. Without either, the upload is bound to the caller alone."""
-    token = request.auth if isinstance(request.auth, APIToken) else None
-    if token is not None and not token.is_account_scoped:
-        allowed = {str(project) for project in token.allowed_project_ids()}
-        if requested is None and len(allowed) == 1:
-            return next(iter(allowed))
-        if requested is not None and str(requested) in allowed:
-            return requested
-        raise ValidationError({"project": "This API key cannot upload to that project."})
-    if requested is None:
-        return None
-    if not ProjectMembership.objects.filter(user=request.user, project_id=requested).exists():
-        raise ValidationError({"project": "Project not found."})
-    return requested
-
-
 class UploadViewSet(viewsets.ViewSet):
     """Parsers must stay declared on the class: ``@action`` initkwargs only apply
     through the router, so an action-level parser silently reverts elsewhere."""
@@ -78,8 +57,13 @@ class UploadViewSet(viewsets.ViewSet):
     parser_classes = [JSONParser, OctetStreamParser]
     lookup_value_regex = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if kwargs.get("pk") and DatasetTransfer.objects.filter(upload_id=kwargs["pk"]).exists():
+            raise PermissionDenied("Use the project-scoped dataset transfer receipt.")
+
     @extend_schema(
-        summary="Validate an uploaded file and count a table's rows",
+        summary="Validate an uploaded file and count its rows",
         request=InspectUploadSerializer,
         responses={200: UploadInspectionSerializer},
     )
@@ -89,11 +73,7 @@ class UploadViewSet(viewsets.ViewSet):
         payload = InspectUploadSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         try:
-            result = files.inspect_upload(
-                upload_id,
-                size=payload.validated_data["size"],
-                json_rows_field=payload.validated_data.get("json_rows_field"),
-            )
+            result = files.inspect_upload(upload_id, size=payload.validated_data["size"])
         except files.FileError as exc:
             raise ValidationError({"detail": exc.detail}) from exc
         return Response(UploadInspectionSerializer(result).data)
@@ -106,20 +86,19 @@ class UploadViewSet(viewsets.ViewSet):
     def create(self, request):
         payload = BeginUploadSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        project = _upload_project(request, payload.validated_data.get("project"))
         try:
-            upload_id, name = files.begin_upload(
-                payload.validated_data["filename"], project=project, user=request.user.pk
-            )
+            upload_id, name = files.begin_upload(payload.validated_data["filename"])
         except files.FileError as exc:
             raise ValidationError({"detail": exc.detail}) from exc
         return Response(
-            {
-                "upload_id": upload_id,
-                "filename": name,
-                "chunk_bytes": files.CHUNK_BYTES,
-                "max_bytes": files.upload_byte_limit(name),
-            },
+            UploadReservedSerializer(
+                {
+                    "upload_id": upload_id,
+                    "filename": name,
+                    "chunk_bytes": files.CHUNK_BYTES,
+                    "max_bytes": files.upload_byte_limit(name),
+                }
+            ).data,
             status=status.HTTP_201_CREATED,
         )
 

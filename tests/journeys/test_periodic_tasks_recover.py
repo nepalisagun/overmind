@@ -1,10 +1,20 @@
 import multiprocessing
 import os
 import time
+import uuid
 
 import redis
 
+from overbae.celery import app
 from overbae.tasks.utils.task_lock import acquire_task_lock, with_task_lock
+
+from .stack import drain
+
+
+def test_evidence_collection_for_a_missing_training_job_stops(worker, fake_modal):
+    app.send_task("overbae.tasks.finetuning.collect_training_evidence", args=[str(uuid.uuid4())])
+    drain(worker)
+    assert not fake_modal.log
 
 
 def test_a_task_lock_expires_on_its_timeout_and_releases_after_the_task(settings):

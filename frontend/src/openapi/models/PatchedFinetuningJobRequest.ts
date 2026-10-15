@@ -13,13 +13,13 @@
  */
 
 import { mapValues } from '../runtime';
-import type { SplitMethodEnum } from './SplitMethodEnum';
+import type { SplitMethodE87Enum } from './SplitMethodE87Enum';
 import {
-    SplitMethodEnumFromJSON,
-    SplitMethodEnumFromJSONTyped,
-    SplitMethodEnumToJSON,
-    SplitMethodEnumToJSONTyped,
-} from './SplitMethodEnum';
+    SplitMethodE87EnumFromJSON,
+    SplitMethodE87EnumFromJSONTyped,
+    SplitMethodE87EnumToJSON,
+    SplitMethodE87EnumToJSONTyped,
+} from './SplitMethodE87Enum';
 
 /**
  *
@@ -27,6 +27,18 @@ import {
  * @interface PatchedFinetuningJobRequest
  */
 export interface PatchedFinetuningJobRequest {
+    /**
+     *
+     * @type {string}
+     * @memberof PatchedFinetuningJobRequest
+     */
+    requestKey?: string | null;
+    /**
+     *
+     * @type {any}
+     * @memberof PatchedFinetuningJobRequest
+     */
+    acceptedFindings?: any | null;
     /**
      *
      * @type {string}
@@ -50,7 +62,7 @@ export interface PatchedFinetuningJobRequest {
      * @type {string}
      * @memberof PatchedFinetuningJobRequest
      */
-    evalDataset?: string;
+    evalDataset?: string | null;
     /**
      *
      * @type {string}
@@ -62,13 +74,19 @@ export interface PatchedFinetuningJobRequest {
      * @type {string}
      * @memberof PatchedFinetuningJobRequest
      */
-    evalSet?: string;
+    evalSet?: string | null;
     /**
      *
      * @type {string}
      * @memberof PatchedFinetuningJobRequest
      */
     evalJudgeModel?: PatchedFinetuningJobRequestEvalJudgeModelEnum;
+    /**
+     *
+     * @type {Array<string>}
+     * @memberof PatchedFinetuningJobRequest
+     */
+    benchmarkModels?: Array<string>;
     /**
      *
      * @type {boolean}
@@ -125,10 +143,10 @@ export interface PatchedFinetuningJobRequest {
     validationCell?: string | null;
     /**
      *
-     * @type {SplitMethodEnum}
+     * @type {SplitMethodE87Enum}
      * @memberof PatchedFinetuningJobRequest
      */
-    splitMethod?: SplitMethodEnum;
+    splitMethod?: SplitMethodE87Enum;
     /**
      *
      * @type {string}
@@ -225,6 +243,8 @@ export function PatchedFinetuningJobRequestFromJSONTyped(json: any, ignoreDiscri
     }
     return {
 
+        'requestKey': json['request_key'] == null ? undefined : json['request_key'],
+        'acceptedFindings': json['accepted_findings'] == null ? undefined : json['accepted_findings'],
         'project': json['project'] == null ? undefined : json['project'],
         'capability': json['capability'] == null ? undefined : json['capability'],
         'dataset': json['dataset'] == null ? undefined : json['dataset'],
@@ -232,6 +252,7 @@ export function PatchedFinetuningJobRequestFromJSONTyped(json: any, ignoreDiscri
         'evalCell': json['eval_cell'] == null ? undefined : json['eval_cell'],
         'evalSet': json['eval_set'] == null ? undefined : json['eval_set'],
         'evalJudgeModel': json['eval_judge_model'] == null ? undefined : json['eval_judge_model'],
+        'benchmarkModels': json['benchmark_models'] == null ? undefined : json['benchmark_models'],
         'evalIncumbentBefore': json['eval_incumbent_before'] == null ? undefined : json['eval_incumbent_before'],
         'evalIncumbentAfter': json['eval_incumbent_after'] == null ? undefined : json['eval_incumbent_after'],
         'evalModelBefore': json['eval_model_before'] == null ? undefined : json['eval_model_before'],
@@ -241,7 +262,7 @@ export function PatchedFinetuningJobRequestFromJSONTyped(json: any, ignoreDiscri
         'validationDataset': json['validation_dataset'] == null ? undefined : json['validation_dataset'],
         'cell': json['cell'] == null ? undefined : json['cell'],
         'validationCell': json['validation_cell'] == null ? undefined : json['validation_cell'],
-        'splitMethod': json['split_method'] == null ? undefined : SplitMethodEnumFromJSON(json['split_method']),
+        'splitMethod': json['split_method'] == null ? undefined : SplitMethodE87EnumFromJSON(json['split_method']),
         'name': json['name'] == null ? undefined : json['name'],
         'useCase': json['use_case'] == null ? undefined : json['use_case'],
         'baseModel': json['base_model'] == null ? undefined : json['base_model'],
@@ -264,6 +285,8 @@ export function PatchedFinetuningJobRequestToJSONTyped(value?: PatchedFinetuning
 
     return {
 
+        'request_key': value['requestKey'],
+        'accepted_findings': value['acceptedFindings'],
         'project': value['project'],
         'capability': value['capability'],
         'dataset': value['dataset'],
@@ -271,6 +294,7 @@ export function PatchedFinetuningJobRequestToJSONTyped(value?: PatchedFinetuning
         'eval_cell': value['evalCell'],
         'eval_set': value['evalSet'],
         'eval_judge_model': value['evalJudgeModel'],
+        'benchmark_models': value['benchmarkModels'],
         'eval_incumbent_before': value['evalIncumbentBefore'],
         'eval_incumbent_after': value['evalIncumbentAfter'],
         'eval_model_before': value['evalModelBefore'],
@@ -280,7 +304,7 @@ export function PatchedFinetuningJobRequestToJSONTyped(value?: PatchedFinetuning
         'validation_dataset': value['validationDataset'],
         'cell': value['cell'],
         'validation_cell': value['validationCell'],
-        'split_method': SplitMethodEnumToJSON(value['splitMethod']),
+        'split_method': SplitMethodE87EnumToJSON(value['splitMethod']),
         'name': value['name'],
         'use_case': value['useCase'],
         'base_model': value['baseModel'],

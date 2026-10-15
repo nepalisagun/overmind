@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
+from modal_shared.training_telemetry import record_stage
+
 _GB = 1024**3
 
 
@@ -196,6 +198,7 @@ def bt(prefix: str, payload: dict) -> None:
 
 def emit_stage(stage: str, **extra) -> None:
     bt("BT_STAGE", {"stage": stage, **extra})
+    record_stage(RUN_DIR, stage, **extra)
 
 
 class ProgressCallback(TrainerCallback):
@@ -208,6 +211,8 @@ class ProgressCallback(TrainerCallback):
     def __init__(self, run_dir: Path | str | None = None) -> None:
         self._train_start: float | None = None
         self._total_steps: int = 0
+        self._start_step: int = 0
+        self._start_tokens: int = 0
         self._vram_static_gb: float = 0.0
         self._last_log_mono: float | None = None
         # Real tokens per micro-step (sum of input_ids lengths). Falls back to
@@ -217,6 +222,7 @@ class ProgressCallback(TrainerCallback):
         self.run_dir = Path(run_dir) if run_dir is not None else None
         self.metrics_path = None
         self.progress_path = None
+        self.evaluation_split = "development"
         if self.run_dir is not None:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             self.metrics_path = self.run_dir / "metrics.jsonl"
@@ -233,6 +239,12 @@ class ProgressCallback(TrainerCallback):
         self._tokens_per_step = int(tokens)
         self._tokens_per_step_assumed = False
 
+    def exclude_monitoring_time(self, seconds: float) -> None:
+        if self._train_start is not None:
+            self._train_start += seconds
+        if self._last_log_mono is not None:
+            self._last_log_mono += seconds
+
     def _emit(self, prefix: str, record: dict[str, Any]) -> None:
         sys.stdout.write(f"{prefix} {json.dumps(record)}\n")
         sys.stdout.flush()
@@ -243,6 +255,14 @@ class ProgressCallback(TrainerCallback):
             with self.metrics_path.open("a") as f:
                 f.write(json.dumps(payload) + "\n")
             self.progress_path.write_text(json.dumps(payload, indent=2) + "\n")
+            if prefix == "BT_PROGRESS":
+                record_stage(
+                    self.run_dir,
+                    "training",
+                    completed=record.get("step"),
+                    total=record.get("total_steps"),
+                    unit="steps",
+                )
 
     def on_train_begin(
         self,
@@ -254,16 +274,31 @@ class ProgressCallback(TrainerCallback):
         self._train_start = time.monotonic()
         self._last_log_mono = self._train_start
         self._total_steps = state.max_steps
+        self._start_step = state.global_step
+        self._start_tokens = int(
+            kwargs.get("tokens_seen", getattr(state, "num_input_tokens_seen", 0))
+        )
+        self._emit("BT_STAGE", {"stage": "training"})
+        record_stage(
+            self.run_dir,
+            "training",
+            completed=self._start_step,
+            total=self._total_steps,
+            unit="steps",
+        )
 
         # Static footprint (weights + adapters) before the first step. Peak −
         # static later isolates activations for ACTIVATION_BYTES calibration.
         self._vram_static_gb = _vram_gb(torch.cuda.memory_allocated)
         model = kwargs.get("model")
-        cfg = getattr(model, "config", None)
+        cfg = getattr(getattr(model, "encoder", model), "config", None)
+        cfg = getattr(cfg, "text_config", None) or cfg
         self._emit(
             "BT_MEMORY",
             {
                 "phase": "train_begin",
+                "start_step": self._start_step,
+                "start_tokens": self._start_tokens,
                 "vram_static_gb": self._vram_static_gb,
                 "host_rss_gb": _host_rss_gb(),
                 "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -298,7 +333,8 @@ class ProgressCallback(TrainerCallback):
         elapsed = now - (self._train_start or now)
         total = self._total_steps or 1
         done = state.global_step
-        eta = (elapsed / done * (total - done)) if done > 0 else 0.0
+        attempt_steps = done - self._start_step
+        eta = (elapsed / attempt_steps * (total - done)) if attempt_steps > 0 else 0.0
         step_s = now - (self._last_log_mono or now)
         self._last_log_mono = now
 
@@ -319,8 +355,9 @@ class ProgressCallback(TrainerCallback):
             record["token_accuracy"] = round(float(logs["mean_token_accuracy"]), 4)
         if "num_tokens" in logs:
             record["num_tokens"] = int(float(logs["num_tokens"]))
-            if elapsed > 0:
-                record["tokens_per_s"] = round(record["num_tokens"] / elapsed, 1)
+            attempt_tokens = record["num_tokens"] - self._start_tokens
+            if elapsed > 0 and attempt_tokens >= 0:
+                record["tokens_per_s"] = round(attempt_tokens / elapsed, 1)
 
         record["vram_peak_gb"] = _vram_gb(torch.cuda.max_memory_allocated)
         record["vram_reserved_gb"] = _vram_gb(torch.cuda.max_memory_reserved)
@@ -337,7 +374,7 @@ class ProgressCallback(TrainerCallback):
         **kwargs,
     ) -> None:
         metrics = metrics or {}
-        if "eval_loss" not in metrics:
+        if self.evaluation_split != "development" or "eval_loss" not in metrics:
             return
         record: dict[str, Any] = {
             "step": state.global_step,
@@ -347,6 +384,20 @@ class ProgressCallback(TrainerCallback):
         }
         if "eval_mean_token_accuracy" in metrics:
             record["eval_token_accuracy"] = round(float(metrics["eval_mean_token_accuracy"]), 4)
+        for key in (
+            "cross_entropy",
+            "argmax_target_agreement",
+            "hard_label_accuracy",
+            "hard_label_decisions",
+            "brier",
+            "expected_score_mae",
+            "distribution_decisions",
+            "mean_decisions",
+            "decisions",
+            "runtime_seconds",
+        ):
+            if metrics.get(key) is not None:
+                record[key] = metrics[key]
         self._emit("BT_EVAL", record)
 
     def on_train_end(

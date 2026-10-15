@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from factories import make_matrix_row
 from rest_framework.exceptions import ValidationError
 
 from overbae.api.serializers import FinetuningJobSerializer
@@ -9,16 +10,15 @@ from overbae.models import (
     Capability,
     Dataset,
     EvalSet,
-    EvalSetMember,
-    Evaluator,
     FinetuningJob,
     Project,
     ProjectMembership,
     User,
 )
 from overbae.services.datasets import alignment, land, review, use
+from overbae.services.datasets.context import context_fingerprint
 from overbae.services.mcp.contracts.datasets import serialize_dataset_detail
-from overbae.services.mcp.errors import version_contract
+from overbae.services.mcp.errors import mcp_cell_contract
 from overbae.services.training_preparation import request_preparation
 
 pytestmark = pytest.mark.django_db
@@ -54,6 +54,12 @@ def capability():
     )
 
 
+def complete_review(dataset, *, failed=None, unknown=None):
+    from conftest import review_fixture
+
+    return review_fixture(dataset, failed=failed, unknown=unknown)
+
+
 def make_dataset(capability, *, intent="eval", evidence=True, case_id="case1"):
     ds = Dataset.objects.create(
         project=capability.project, capability=capability, name="Cases", intent=intent
@@ -85,7 +91,7 @@ def test_id_only_eval_and_invalid_final_packet_fail_declared_schema(capability, 
     ds = make_dataset(capability, evidence=False)
     assert ds.active_cell.fits("eval")[0]
     assert not ds.active_cell.capability_report["ok"]
-    assert "documents" in ds.active_cell.capability_report["reason"]
+    assert "documents" in "; ".join(review.warnings(ds, ds.active_cell))
     assert use.use(ds, "eval").used_at is not None
     frame = frame_of(
         [{"input": {"onboarding_id": "a", "documents": []}, "expected_output": {"escalate": "yes"}}]
@@ -112,59 +118,71 @@ def test_worker_prompt_reports_capability_mismatch(capability, frame_of):
     assert not report["ok"] and "system turn differs" in report["reason"]
 
 
-def test_a_fitting_eval_version_leads_to_evaluation_readiness_without_warnings(capability):
+@pytest.mark.parametrize("failure", [None, "input_evidence", "answer_support"])
+def test_missing_or_failed_review_warns_without_blocking_use(capability, failure):
     ds = make_dataset(capability)
-    assert review.warnings(ds, ds.active_cell) == []
+    if failure:
+        complete_review(ds, failed=failure)
+    assert review.warnings(ds, ds.active_cell)
+    assert use.use(ds, "eval").used_at is not None
     detail = serialize_dataset_detail(ds)
-    assert [action.tool for action in detail.next_actions] == [
-        "check_evaluation_readiness",
-        "check_optimizer_readiness",
-    ]
-    assert detail.versions[0].fits is True
-    contract = version_contract(ds, ds.active_cell, "eval")
-    assert contract.fits and contract.warnings == []
+    assert detail.next_actions[0].tool == "check_evaluation_readiness"
+    assert any(action.tool == "check_evaluation_readiness" for action in detail.next_actions)
+    assert not detail.cells[0].readiness["quality_passed"]
+    contract = mcp_cell_contract(ds, ds.active_cell, "eval")
+    assert contract.fits and contract.warnings
+
+
+def test_sampled_or_unknown_answer_support_cannot_pass(capability):
+    ds = make_dataset(capability)
+    complete_review(ds, unknown="answer_support")
+    assert "Answer support: unknown" in "; ".join(review.warnings(ds, ds.active_cell))
     assert use.use(ds, "eval").used_at is not None
 
 
-def test_a_version_that_does_not_fit_suggests_a_new_version(capability):
-    ds = make_dataset(capability, intent="train")
-    ds.intent = "eval"
-    ds.save(update_fields=["intent"])
-    [action] = serialize_dataset_detail(ds).next_actions
-    assert action.tool == "add_dataset_version"
-    assert action.arguments == {"dataset": str(ds.id), "parent": "v0"}
+def test_context_changes_make_review_stale_without_blocking_use(capability):
+    ds = make_dataset(capability)
+    complete_review(ds)
+    assert review.readiness(ds, ds.active_cell)["quality_passed"]
+    assert use.check(ds, "eval").used_at is None
+    assert use.use(ds, "eval").used_at is not None
+    before = context_fingerprint(capability)
+    capability.improvement_metadata["capability_card"]["output_schema"]["required_keys"].append(
+        "evidence"
+    )
+    capability.save(update_fields=["improvement_metadata"])
+    ds.refresh_from_db()
+    assert context_fingerprint(capability) != before
+    assert not review.readiness(ds, ds.active_cell)["quality_passed"]
+    assert review.warnings(ds, ds.active_cell)
+    assert use.use(ds, "eval").used_at is not None
 
 
-def test_data_can_start_model_preprocessing_without_a_use(capability, settings):
+def test_unreviewed_data_can_start_model_preprocessing(capability, settings):
     settings.FINETUNING_BACKEND = "modal"
     ds = make_dataset(capability, intent="train")
     prep = request_preparation(ds.active_cell, "Qwen/Qwen3-8B", 4096)
     assert prep.state == "queued" and ds.active_cell.used_at is None
 
 
-def test_unbound_data_can_be_used_and_warns_about_the_capability(capability):
+def test_unbound_data_still_uses_dataset_quality_contract(capability):
     ds = make_dataset(capability, intent="train")
     ds.capability = None
     ds.save(update_fields=["capability"])
     assert use.use(ds, "train").used_at is not None
-    assert review.warnings(ds, ds.active_cell, capability=capability) == [
-        "This dataset is not attached to Screener."
-    ]
+    assert "not been reviewed for Screener" in "; ".join(
+        review.warnings(ds, ds.active_cell, capability=capability)
+    )
 
 
-def test_training_create_freezes_the_pair_atomically(capability):
+def test_training_create_allows_warnings_and_freezes_pair_atomically(capability):
     train = make_dataset(capability, intent="train")
     evaluation = make_dataset(capability)
+    complete_review(train)
     user = User.objects.create_user(email="validation@example.com", password="test")
     ProjectMembership.objects.create(user=user, project=capability.project)
-    evaluator = Evaluator.objects.create(
-        project=capability.project,
-        name="Match",
-        kind="deterministic",
-        config={"check": "exact_match"},
-    )
     eval_set = EvalSet.objects.create(project=capability.project, name="Screening")
-    EvalSetMember.objects.create(eval_set=eval_set, evaluator=evaluator, role="generative")
+    eval_set.rows.add(make_matrix_row(eval_set.project))
 
     payload = {
         "project": str(capability.project_id),
@@ -199,7 +217,9 @@ def test_training_create_freezes_the_pair_atomically(capability):
     job = serializer.save(triggered_by=user)
     assert job.eval_cell_id == evaluation.active_cell.id
     assert job.cell.used_at and job.eval_cell.used_at
+    assert review.warnings(evaluation, job.eval_cell)
     replacement = make_dataset(capability, case_id="new-eval")
+    complete_review(replacement)
     update = FinetuningJobSerializer(job, data={"eval_dataset": str(replacement.id)}, partial=True)
     assert not update.is_valid() and "eval_dataset" in update.errors
     assert replacement.active_cell.used_at is None

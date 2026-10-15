@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 from asgiref.sync import SyncToAsync, async_to_sync
-from django.db import connections
+from django.db import connections, transaction
 from fakes.clerk import ClerkAPI
 from fakes.http import ScriptedAPI
 from fakes.llm import FakeLLM, Network
@@ -73,47 +73,14 @@ def _no_outside_sockets(monkeypatch):
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
 
 
-@pytest.fixture(scope="session")
-def sandbox_server():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    url, token = f"http://127.0.0.1:{port}", secrets.token_hex(16)
-    scratch = tempfile.TemporaryDirectory(prefix="sandbox-test-")
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "SANDBOX_TOKEN": token,
-        "SANDBOX_ALLOW_SHARED_UID": "1",
-        # Its own memory ledger: parallel test servers must not share /tmp/sandbox.
-        "TMPDIR": scratch.name,
-    }
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "sandbox", "--host", "127.0.0.1", "--port", str(port)],
-        cwd=Path(__file__).resolve().parents[1],
-        env=env,
-    )
-    deadline = time.monotonic() + 30
-    while True:
-        try:
-            if httpx.get(f"{url}/health", timeout=1).status_code == 200:
-                break
-        except httpx.TransportError:
-            pass
-        if proc.poll() is not None or time.monotonic() > deadline:
-            proc.kill()
-            proc.wait(timeout=10)
-            scratch.cleanup()
-            raise RuntimeError("The test sandbox did not start.")
-        time.sleep(0.1)
-    yield url, token
-    proc.terminate()
-    proc.wait(timeout=10)
-    scratch.cleanup()
+@pytest.fixture
+def eager(monkeypatch):
+    """Celery tasks and on-commit hooks run inline; the test transaction never commits."""
+    from overbae.celery import app as celery_app  # noqa: PLC0415 — Django is configured per test
 
-
-@pytest.fixture(autouse=True)
-def _sandbox(settings, sandbox_server):
-    settings.SANDBOX_URL, settings.SANDBOX_TOKEN = sandbox_server
+    monkeypatch.setattr(celery_app.conf, "task_always_eager", True)
+    monkeypatch.setattr(celery_app.conf, "task_eager_propagates", True)
+    monkeypatch.setattr(transaction, "on_commit", lambda func, *args, **kwargs: func())
 
 
 @pytest.fixture(autouse=True)
@@ -165,20 +132,15 @@ def read_table(path):
     """A small frame file as one pandas frame."""
     from overbae.services.datasets import store
 
-    return store.frame_rows(path, range(store.row_count(path)))
+    return store.read_frame(path)
 
 
 @pytest.fixture
-def frame_of(tmp_path):
-    """Rows written to a frame file, read back as the store's Frame."""
-    from overbae.services.datasets import store
+def frame_of():
+    """Small pandas frames for the retained dataset contract API."""
+    import pandas as pd
 
-    def make(rows: list[dict]) -> store.Frame:
-        path = tmp_path / f"frame-{len(list(tmp_path.glob('frame-*')))}.parquet"
-        store.write_rows(path, rows)
-        return store.Frame(path)
-
-    return make
+    return pd.DataFrame
 
 
 @pytest.fixture
@@ -222,6 +184,35 @@ def _openrouter_key(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _offline_compute_prices(monkeypatch):
+    monkeypatch.setattr(
+        "overbae.services.provider_pricing.current_rates",
+        lambda: {
+            "source": "offline-test-fixture",
+            "status": "current",
+            "fetched_at": "2026-10-04T00:00:00+00:00",
+            "rates": {
+                "gpu_hour_cost_h100": 3.95,
+                "gpu_hour_cost_h200": 4.54,
+                "cpu_hour_cost": 0.0473,
+                "mem_gib_hour_cost": 0.008,
+            },
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _offline_operational_provider(monkeypatch):
+    async def absent(*args, **kwargs):
+        return None, []
+
+    monkeypatch.setattr("overbae.services.provider_progress.read_page", absent)
+    monkeypatch.setattr(
+        "modal_shared.operational_events.Journal.emit", lambda *args, **kwargs: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _commercial_billing(settings):
     """Remaining-credit billing is on in tests unless a case clears the key."""
     settings.STRIPE_SECRET_KEY = "sk_test_billing"
@@ -252,11 +243,11 @@ def _media_root(settings, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _inline_dataset_tasks(monkeypatch):
-    """Landing and script runs execute in-process: no worker in tests, and the API's
-    202 answers still leave a finished landing or run behind."""
+    """Landing and runs execute in-process: no worker in tests, and the API's
+    202 answers still leave a finished version behind."""
     from overbae.tasks import datasets as dataset_tasks
 
-    for task in (dataset_tasks.land, dataset_tasks.execute):
+    for task in (dataset_tasks.land,):
         monkeypatch.setattr(
             task,
             "apply_async",
@@ -264,23 +255,23 @@ def _inline_dataset_tasks(monkeypatch):
         )
 
 
-def add_versions(dataset, steps, *, user=None):
-    """Add each ``(title, script)`` as a child of the one before, through the sandbox,
-    and make the last one active."""
-    from overbae.models import Execution
-    from overbae.services.datasets import executions, versions
-
-    parent = dataset.active_cell
-    for title, script in steps:
-        done = executions.run_now(
-            dataset, mode=Execution.Mode.CELL, parent=parent, script=script, title=title, user=user
-        )
-        assert done.cell is not None, done.run.error
-        parent = done.cell
-    if steps:
-        versions.activate(dataset, parent)
-    dataset.refresh_from_db()
-    return dataset
+def _lift_messages(row):
+    """The old canonical shape kept the transcript under ``input``; the product
+    table carries it as a ``messages`` column."""
+    row = dict(row)
+    inp = row.get("input")
+    if isinstance(inp, dict) and isinstance(inp.get("messages"), list) and "messages" not in row:
+        row["messages"] = inp["messages"]
+        if inp.get("tools"):
+            row["tools"] = inp["tools"]
+        rest = {k: v for k, v in inp.items() if k not in ("messages", "tools")}
+        if rest:
+            row["input"] = rest
+        else:
+            row.pop("input")
+        if row.get("expected_output") is None:
+            row.pop("expected_output", None)
+    return row
 
 
 def frozen_dataset(project, rows=None, *, capability=None, name="ds", contract=None, user=None):
@@ -291,57 +282,238 @@ def frozen_dataset(project, rows=None, *, capability=None, name="ds", contract=N
 
     if rows is None:
         rows = TRAIN_ROWS if contract == "train" else EVAL_ROWS
-    dataset = Dataset.objects.create(
-        project=project, capability=capability, name=name, intent=contract or "pending"
+    # This fixture declares an intent; production landing intentionally never infers it.
+    contract = contract or (
+        "train" if rows and "messages" in rows[0] and "input" not in rows[0] else "eval"
     )
-    land.land_rows(dataset, list(rows), user=user)
+    dataset = Dataset.objects.create(
+        project=project, capability=capability, name=name, intent=contract
+    )
+    land.land_rows(dataset, [_lift_messages(r) for r in rows], user=user)
     dataset.refresh_from_db()
+    review_fixture(dataset)
     return dataset
 
 
-@pytest.fixture(autouse=True)
-def _rubric_compiler(fake_llm):
-    fake_llm.on_json(
-        lambda r: r.schema_name == "_Checklist",
-        lambda r: {
-            "items": [
-                {"id": "criterion_1", "q": "Does the output satisfy the rubric?", "weight": 0.5},
-                {"id": "criterion_2", "q": "Is the output free of errors?", "weight": 0.5},
-            ],
-            "variables": ["input", "output"],
+def plan_fixture(dataset, cell=None):
+    from overbae.models import Cell
+
+    cell = cell or dataset.active_cell
+    plan = {
+        "id": str(cell.pk),
+        "specification": {
+            "checks": [
+                {
+                    "name": name,
+                    "category": category,
+                    "method": "deterministic",
+                    "question": "Controlled fixture",
+                }
+                for name, category in {
+                    "task_alignment": "semantic",
+                    "input_evidence": "preservation",
+                    "answer_support": "semantic",
+                    "output_schema": "technical",
+                }.items()
+            ]
         },
-    )
+    }
+    cell.preparation_plan = plan
+    Cell.objects.filter(pk=cell.pk).update(preparation_plan=plan)
+    return plan
 
 
-@pytest.fixture
-def make_dataset(settings, tmp_path):
-    """Land rows and add versions in-process, so a test gets a version back
-    synchronously without a worker. ``cells`` is a list of ``(title, script)`` added as
-    a chain of children; the last one becomes active."""
+def review_fixture(dataset, cell=None, *, failed=None, unknown=None):
+    from overbae.models import Cell
+    from overbae.services.datasets.context import context_fingerprint
 
-    def _make(
-        project,
-        rows,
-        *,
-        name="rows",
-        capability=None,
-        cells=None,
-        user=None,
-        source_kind="file",
-        target=None,
-    ):
+    cell = cell or dataset.active_cell
+    plan = plan_fixture(dataset, cell)
+    # Consumer tests load a recorded review; the platform no longer runs semantic judges.
+    report = {
+        "fingerprint": cell.fingerprint,
+        "context_fingerprint": context_fingerprint(dataset.capability),
+        "intent": dataset.intent,
+        "plan_id": plan["id"],
+        "audit": {"method": "row_results"},
+        "checks": [
+            {
+                "name": name,
+                "result": "fail" if name == failed else "unknown" if name == unknown else "pass",
+                "evidence": "Known test fixture.",
+                "rows_checked": cell.rows,
+            }
+            for name in ("task_alignment", "input_evidence", "answer_support", "output_schema")
+        ],
+    }
+    cell.quality_report = report
+    Cell.objects.filter(pk=cell.pk).update(quality_report=report)
+    return report
+
+
+def import_version(dataset, records, *, name="Native transformation"):
+    from unittest.mock import patch
+    from uuid import uuid4
+
+    from overbae.services.datasets import workbench
+
+    source = dataset.active_cell
+    imported = {"imported_rows": records}
+    if len(records) > 2000:
         from overbae.models import Dataset
         from overbae.services.datasets import land
 
-        dataset = Dataset.objects.create(
-            project=project,
-            capability=capability,
-            name=name,
-            source_kind=source_kind,
-            intent=target or "pending",
+        artifact = Dataset.objects.create(
+            project=dataset.project, name="Native artifact", intent="explore"
         )
-        land.land_rows(dataset, list(rows), user=user)
-        dataset.refresh_from_db()
-        return add_versions(dataset, cells or [], user=user)
+        land.land_rows(artifact, records)
+        imported = {
+            "artifact_cell": artifact.source.pk,
+            "artifact_fingerprint": artifact.source.fingerprint,
+        }
+    with patch("overbae.tasks.datasets.execute_pipeline.delay"):
+        run = workbench.submit(
+            dataset,
+            None,
+            source_cell=source.pk,
+            source_fingerprint=source.fingerprint,
+            request_key=str(uuid4()),
+            name=name,
+            **imported,
+            provenance="Explicit transformation supplied by the test's native-agent fixture.",
+        )
+    workbench.execute(run.pk)
+    run.refresh_from_db()
+    assert run.state == "completed", run.error
+    dataset.refresh_from_db()
+    return dataset.active_cell
 
-    return _make
+
+@pytest.fixture(scope="session")
+def sandbox_server():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    url, token = f"http://127.0.0.1:{port}", secrets.token_hex(16)
+    scratch = tempfile.TemporaryDirectory(prefix="sandbox-test-")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "SANDBOX_TOKEN": token,
+        "SANDBOX_ALLOW_SHARED_UID": "1",
+        # Its own memory ledger: parallel test servers must not share /tmp/sandbox.
+        "TMPDIR": scratch.name,
+    }
+    command = [sys.executable, "-m", "sandbox", "--host", "127.0.0.1", "--port", str(port)]
+    container = None
+    proxy = None
+    if sys.platform == "darwin" or os.environ.get("SANDBOX_CONTAINER_TESTS") == "1":
+        container = "overmind-parser-test-" + secrets.token_hex(6)
+        subprocess.run(
+            ["docker", "network", "create", "--internal", container],
+            check=True,
+            capture_output=True,
+        )
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            container,
+            "--network",
+            container,
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--init",
+            "--tmpfs",
+            "/tmp:size=4g",
+            "-v",
+            f"{Path(__file__).resolve().parents[1] / 'sandbox'}:/code/sandbox:ro",
+            "-e",
+            f"SANDBOX_TOKEN={token}",
+            "--entrypoint",
+            "python",
+        ]
+        for capability in (
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "KILL",
+            "SETGID",
+            "SETUID",
+            "SYS_PTRACE",
+        ):
+            command += ["--cap-add", capability]
+        command += [os.environ.get("SANDBOX_TEST_IMAGE", "overmind-dev"), "-m", "sandbox"]
+    proc = subprocess.Popen(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+    )
+    try:
+        if container:
+            # Docker Desktop cannot publish an internal-only container to macOS.
+            # This fixed-destination proxy gives the test client ingress without giving scripts egress.
+            proxy = container + "-ingress"
+            forwarding = """import select,socket,socketserver,sys
+class Relay(socketserver.BaseRequestHandler):
+    def handle(self):
+        with socket.create_connection((sys.argv[1],8080)) as upstream:
+            peers={self.request:upstream,upstream:self.request}
+            while True:
+                for source in select.select(list(peers),[],[])[0]:
+                    data=source.recv(65536)
+                    if not data: return
+                    peers[source].sendall(data)
+socketserver.ThreadingTCPServer(('0.0.0.0',8080),Relay).serve_forever()
+"""
+            subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-d",
+                    "--name",
+                    proxy,
+                    "--network",
+                    "bridge",
+                    "-p",
+                    f"127.0.0.1:{port}:8080",
+                    "--entrypoint",
+                    "python",
+                    os.environ.get("SANDBOX_TEST_IMAGE", "overmind-dev"),
+                    "-c",
+                    forwarding,
+                    container,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["docker", "network", "connect", container, proxy], check=True, capture_output=True
+            )
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                if httpx.get(f"{url}/health", timeout=1).status_code == 200:
+                    break
+            except httpx.TransportError:
+                pass
+            if proc.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError("The test sandbox did not start.")
+            time.sleep(0.1)
+        yield url, token
+    finally:
+        if container:
+            if proxy:
+                subprocess.run(["docker", "rm", "-f", proxy], check=False, capture_output=True)
+            subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True)
+            subprocess.run(["docker", "network", "rm", container], check=False, capture_output=True)
+        elif proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=10)
+        scratch.cleanup()
+
+
+@pytest.fixture(autouse=True)
+def _sandbox(settings, sandbox_server):
+    settings.SANDBOX_URL, settings.SANDBOX_TOKEN = sandbox_server

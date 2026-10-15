@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment-options {"url":"http://127.0.0.1:5173"}
+
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   authLocalCreate: vi.fn(),
@@ -9,7 +11,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/client", () => ({
-  default: { auth: { authLocalCreate: mocks.authLocalCreate } },
+  default: {
+    auth: { authLocalCreate: mocks.authLocalCreate },
+  },
   setTokens: mocks.setTokens,
 }));
 
@@ -19,13 +23,16 @@ vi.mock("@/integrations/tanstack-query", () => ({
 
 import { LocalLoginForm } from "./components/local-login-form";
 
-describe("LocalLoginForm", () => {
-  beforeEach(() => {
-    mocks.authLocalCreate.mockReset();
-    mocks.setTokens.mockReset();
-    mocks.invalidateQueries.mockReset();
-  });
+afterEach(cleanup);
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.authLocalCreate.mockReset();
+  mocks.setTokens.mockReset();
+  mocks.invalidateQueries.mockReset();
+});
+
+describe("LocalLoginForm", () => {
   it("posts email and password to authLocalCreate and stores tokens", async () => {
     mocks.authLocalCreate.mockResolvedValue({
       access: "access-token",

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Literal
 
@@ -11,7 +13,6 @@ from asgiref.sync import sync_to_async
 from mcp import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from overbae.services.mcp import request_keys
 from overbae.services.mcp.annotations import annotations_for
 from overbae.services.mcp.context import MCPContext, project_context
 from overbae.services.mcp.errors import MCPError, error_result, internal_error
@@ -24,7 +25,17 @@ CostClass = Literal["free", "compute", "llm", "gpu"]
 AsyncMode = Literal["sync", "job", "task"]
 _TOOL_NAME = r"^[a-z][a-z0-9_]{0,63}$"
 _FORBIDDEN_NAME_PARTS = ("delete", "remove", "cancel", "retry", "undeploy")
-_ALLOWED_LIFECYCLE_TOOLS = frozenset({"retry_deployment", "cancel_dataset_job"})
+_ALLOWED_LIFECYCLE_TOOLS = frozenset(
+    {
+        "retry_deployment",
+        "delete_eval_matrix_row",
+        "cancel_dataset",
+        "retry_data_partition",
+        "cancel_dataset_pipeline_run",
+        "cancel_finetune",
+    }
+)
+_DESTRUCTIVE_TOOLS = frozenset({"cancel_dataset", "delete_eval_matrix_row"})
 _SCHEMA_NOISE_KEYS = frozenset({"default", "discriminator", "title"})
 _KNOWN_SCOPES = frozenset(
     {
@@ -82,15 +93,16 @@ class ToolDefinition(BaseModel):
             part in self.name for part in _FORBIDDEN_NAME_PARTS
         ):
             raise CatalogError("destructive lifecycle tools are not supported")
-        if self.destructive:
+        if self.destructive != (self.name in _DESTRUCTIVE_TOOLS):
             raise CatalogError("destructive tools are not supported")
 
     def as_mcp_tool(self) -> types.Tool:
         schema = _compact_schema(self.input_model.model_json_schema(by_alias=True))
         if self.project_scoped:
-            # The server instructions explain project_id once; repeating it per tool would
-            # spend the manifest budget.
-            schema.setdefault("properties", {})["project_id"] = {"type": "string", "format": "uuid"}
+            schema.setdefault("properties", {})["project_id"] = {
+                "type": "string",
+                "format": "uuid",
+            }
         return types.Tool(
             name=self.name,
             title=self.title,
@@ -107,13 +119,7 @@ def _compact_schema(value: Any) -> Any:
         return value
 
     compacted = {
-        key: (
-            {name: _compact_schema(child) for name, child in item.items()}
-            if key == "properties" and isinstance(item, dict)
-            else _compact_schema(item)
-        )
-        for key, item in value.items()
-        if key not in _SCHEMA_NOISE_KEYS
+        key: _compact_schema(item) for key, item in value.items() if key not in _SCHEMA_NOISE_KEYS
     }
     any_of = compacted.get("anyOf")
     if isinstance(any_of, list) and len(any_of) == 2:
@@ -167,7 +173,19 @@ class ToolCatalog:
             if self._visible(entry.definition, permissions)
         ]
 
-    async def call(
+    async def call(self, name, arguments, context):
+        started = time.monotonic()
+        result = await self.invoke(name, arguments, context)
+        logger.info(
+            "MCP operation name=%s elapsed_ms=%.1f response_bytes=%d is_error=%s",
+            name,
+            (time.monotonic() - started) * 1000,
+            len(json.dumps(result.model_dump(mode="json"), separators=(",", ":")).encode()),
+            result.isError,
+        )
+        return result
+
+    async def invoke(
         self,
         name: str,
         arguments: dict[str, Any],
@@ -204,49 +222,22 @@ class ToolCatalog:
                 )
             )
 
-        key = getattr(payload, "request_key", None)
-        keyed = (
-            (
-                context.project,
-                name,
-                key,
-                payload.model_dump(mode="json", by_alias=True, exclude={"request_key"}),
-            )
-            if key
-            else None
-        )
-        try:
-            replay = await sync_to_async(request_keys.claim)(*keyed) if keyed else None
-        except MCPError as error:
-            return error_result(error)
-        if replay is not None:
-            return self._result(entry, context, replay)
         try:
             result = entry.handler(payload, context)
             if inspect.isawaitable(result):
                 result = await result
             output = entry.definition.output_model.model_validate(result)
-        except Exception as error:
-            if keyed:
-                await sync_to_async(request_keys.release)(*keyed[:3])
-            if isinstance(error, MCPError):
-                return error_result(error)
-            if isinstance(error, ValidationError):
-                return error_result(
-                    MCPError("invalid_output", "The tool returned an invalid result.")
-                )
+        except MCPError as error:
+            return error_result(error)
+        except ValidationError:
+            return error_result(MCPError("invalid_output", "The tool returned an invalid result."))
+        except Exception:
             logger.exception(
                 "MCP tool %s failed for project %s", name, getattr(context.project, "id", None)
             )
             return error_result(internal_error())
 
         structured = output.model_dump(mode="json", by_alias=True)
-        if keyed:
-            await sync_to_async(request_keys.record)(*keyed[:3], structured)
-        return self._result(entry, context, structured)
-
-    @staticmethod
-    def _result(entry: CatalogEntry, context: MCPContext, structured: dict) -> types.CallToolResult:
         if entry.definition.project_scoped and context.token.scope.get("scope") == "account":
             structured = project_references(structured, context.project.pk)
         return tool_result(structured)
@@ -273,6 +264,10 @@ from overbae.services.mcp.tools_datasets import register_dataset_tools  # noqa: 
 
 register_dataset_tools(CATALOG)
 
+from overbae.services.mcp.tools_workbench import register_workbench_tools  # noqa: E402
+
+register_workbench_tools(CATALOG)
+
 from overbae.services.mcp.tools_evaluations import register_evaluation_tools  # noqa: E402
 
 register_evaluation_tools(CATALOG)
@@ -287,10 +282,6 @@ from overbae.services.mcp.tools_model_catalog import (  # noqa: E402
 
 register_model_catalog_tools(CATALOG)
 
-from overbae.services.mcp.tools_decisions import register_decision_tools  # noqa: E402
-
-register_decision_tools(CATALOG)
-
 from overbae.services.mcp.tools_optimizer import register_optimizer_tools  # noqa: E402
 
 register_optimizer_tools(CATALOG)
@@ -304,3 +295,11 @@ from overbae.services.mcp.tools_instrumentation import (  # noqa: E402
 )
 
 register_instrumentation_tools(CATALOG)
+
+from overbae.services.mcp.tools_model_workflows import register_model_workflow_tools  # noqa: E402
+
+register_model_workflow_tools(CATALOG)
+
+from overbae.services.mcp.tools_signals import register_signal_tools  # noqa: E402
+
+register_signal_tools(CATALOG)

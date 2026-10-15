@@ -6,13 +6,9 @@ import socket
 import sys
 
 import django
+from django.conf import settings
 
 from overbae.celery import app
-
-QUEUE_TASKS = {
-    "landing": "overbae.tasks.datasets.land",
-    "interactive": "overbae.tasks.datasets.execute",
-}
 
 
 def healthy(queue):
@@ -24,7 +20,10 @@ def healthy(queue):
     if {entry["name"] for entry in queues} != {queue}:
         return False
     registered = (inspector.registered() or {}).get(destination, [])
-    return QUEUE_TASKS[queue] in registered
+    expected = {
+        task for task, route in settings.CELERY_TASK_ROUTES.items() if route.get("queue") == queue
+    }
+    return bool(expected) and expected.issubset(registered)
 
 
 if __name__ == "__main__":

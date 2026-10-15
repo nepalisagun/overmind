@@ -29,10 +29,14 @@ import type {
   FinetuningRecommendRequestRequest,
   FinetuningRecommendationResponse,
   ModelSwapPrompt,
+  NativeEvaluation,
+  NativeEvaluationRequestRequest,
   PaginatedFinetuningJobEventList,
   PaginatedFinetuningJobListList,
   PaginatedFinetuningJobRunList,
   PatchedFinetuningJobRequest,
+  TrainingEvidence,
+  TrainingMonitoring,
 } from '../models/index';
 import {
     DatasetOverlapResponseFromJSON,
@@ -63,6 +67,10 @@ import {
     FinetuningRecommendationResponseToJSON,
     ModelSwapPromptFromJSON,
     ModelSwapPromptToJSON,
+    NativeEvaluationFromJSON,
+    NativeEvaluationToJSON,
+    NativeEvaluationRequestRequestFromJSON,
+    NativeEvaluationRequestRequestToJSON,
     PaginatedFinetuningJobEventListFromJSON,
     PaginatedFinetuningJobEventListToJSON,
     PaginatedFinetuningJobListListFromJSON,
@@ -71,6 +79,10 @@ import {
     PaginatedFinetuningJobRunListToJSON,
     PatchedFinetuningJobRequestFromJSON,
     PatchedFinetuningJobRequestToJSON,
+    TrainingEvidenceFromJSON,
+    TrainingEvidenceToJSON,
+    TrainingMonitoringFromJSON,
+    TrainingMonitoringToJSON,
 } from '../models/index';
 
 export interface FinetuningJobsBaseModelsRetrieveRequest {
@@ -163,6 +175,29 @@ export interface FinetuningJobsModelsRetrieveRequest {
     maxContext?: number;
 }
 
+export interface FinetuningJobsMonitoringEvidenceRetrieveRequest {
+    id: string;
+    check?: string;
+    field?: string;
+    limit?: number;
+    offset?: number;
+    probe?: FinetuningJobsMonitoringEvidenceRetrieveProbeEnum;
+}
+
+export interface FinetuningJobsMonitoringRetrieveRequest {
+    id: string;
+    check?: string;
+    field?: string;
+    limit?: number;
+    offset?: number;
+    probe?: FinetuningJobsMonitoringRetrieveProbeEnum;
+}
+
+export interface FinetuningJobsNativeEvaluationCreateRequest {
+    id: string;
+    nativeEvaluationRequestRequest: NativeEvaluationRequestRequest;
+}
+
 export interface FinetuningJobsPartialUpdateRequest {
     id: string;
     patchedFinetuningJobRequest?: PatchedFinetuningJobRequest;
@@ -187,7 +222,7 @@ export interface FinetuningJobsRunsListRequest {
     createdBefore?: Date;
     dataset?: string;
     groupId?: string;
-    ordering?: string;
+    ordering?: FinetuningJobsRunsListOrderingEnum;
     page?: number;
     pageSize?: number;
     project?: string;
@@ -1098,6 +1133,221 @@ export class FinetuningJobsApi extends runtime.BaseAPI {
     }
 
     /**
+     */
+    async finetuningJobsMonitoringEvidenceRetrieveRaw(requestParameters: FinetuningJobsMonitoringEvidenceRetrieveRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<TrainingEvidence>> {
+        if (requestParameters['id'] == null) {
+            throw new runtime.RequiredError(
+                'id',
+                'Required parameter "id" was null or undefined when calling finetuningJobsMonitoringEvidenceRetrieve().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        if (requestParameters['check'] != null) {
+            queryParameters['check'] = requestParameters['check'];
+        }
+
+        if (requestParameters['field'] != null) {
+            queryParameters['field'] = requestParameters['field'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        if (requestParameters['offset'] != null) {
+            queryParameters['offset'] = requestParameters['offset'];
+        }
+
+        if (requestParameters['probe'] != null) {
+            queryParameters['probe'] = requestParameters['probe'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("ClerkBearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        if (this.configuration && this.configuration.apiKey) {
+            headerParameters["X-Api-Key"] = await this.configuration.apiKey("X-Api-Key"); // ApiKeyAuth authentication
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("BearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/finetuning-jobs/{id}/monitoring-evidence/`;
+        urlPath = urlPath.replace(`{${"id"}}`, encodeURIComponent(String(requestParameters['id'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => TrainingEvidenceFromJSON(jsonValue));
+    }
+
+    /**
+     */
+    async finetuningJobsMonitoringEvidenceRetrieve(requestParameters: FinetuningJobsMonitoringEvidenceRetrieveRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<TrainingEvidence> {
+        const response = await this.finetuningJobsMonitoringEvidenceRetrieveRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     */
+    async finetuningJobsMonitoringRetrieveRaw(requestParameters: FinetuningJobsMonitoringRetrieveRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<TrainingMonitoring>> {
+        if (requestParameters['id'] == null) {
+            throw new runtime.RequiredError(
+                'id',
+                'Required parameter "id" was null or undefined when calling finetuningJobsMonitoringRetrieve().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        if (requestParameters['check'] != null) {
+            queryParameters['check'] = requestParameters['check'];
+        }
+
+        if (requestParameters['field'] != null) {
+            queryParameters['field'] = requestParameters['field'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        if (requestParameters['offset'] != null) {
+            queryParameters['offset'] = requestParameters['offset'];
+        }
+
+        if (requestParameters['probe'] != null) {
+            queryParameters['probe'] = requestParameters['probe'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("ClerkBearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        if (this.configuration && this.configuration.apiKey) {
+            headerParameters["X-Api-Key"] = await this.configuration.apiKey("X-Api-Key"); // ApiKeyAuth authentication
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("BearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/finetuning-jobs/{id}/monitoring/`;
+        urlPath = urlPath.replace(`{${"id"}}`, encodeURIComponent(String(requestParameters['id'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => TrainingMonitoringFromJSON(jsonValue));
+    }
+
+    /**
+     */
+    async finetuningJobsMonitoringRetrieve(requestParameters: FinetuningJobsMonitoringRetrieveRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<TrainingMonitoring> {
+        const response = await this.finetuningJobsMonitoringRetrieveRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     */
+    async finetuningJobsNativeEvaluationCreateRaw(requestParameters: FinetuningJobsNativeEvaluationCreateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<NativeEvaluation>> {
+        if (requestParameters['id'] == null) {
+            throw new runtime.RequiredError(
+                'id',
+                'Required parameter "id" was null or undefined when calling finetuningJobsNativeEvaluationCreate().'
+            );
+        }
+
+        if (requestParameters['nativeEvaluationRequestRequest'] == null) {
+            throw new runtime.RequiredError(
+                'nativeEvaluationRequestRequest',
+                'Required parameter "nativeEvaluationRequestRequest" was null or undefined when calling finetuningJobsNativeEvaluationCreate().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("ClerkBearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        if (this.configuration && this.configuration.apiKey) {
+            headerParameters["X-Api-Key"] = await this.configuration.apiKey("X-Api-Key"); // ApiKeyAuth authentication
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("BearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/finetuning-jobs/{id}/native-evaluation/`;
+        urlPath = urlPath.replace(`{${"id"}}`, encodeURIComponent(String(requestParameters['id'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: NativeEvaluationRequestRequestToJSON(requestParameters['nativeEvaluationRequestRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => NativeEvaluationFromJSON(jsonValue));
+    }
+
+    /**
+     */
+    async finetuningJobsNativeEvaluationCreate(requestParameters: FinetuningJobsNativeEvaluationCreateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<NativeEvaluation> {
+        const response = await this.finetuningJobsNativeEvaluationCreateRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
      * Update finetuning job metadata
      */
     async finetuningJobsPartialUpdateRaw(requestParameters: FinetuningJobsPartialUpdateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<FinetuningJob>> {
@@ -1333,8 +1583,8 @@ export class FinetuningJobsApi extends runtime.BaseAPI {
     }
 
     /**
-     * The training history lists *runs*, not jobs: the wizard launches one job per experiment and stamps them with a shared `group_id`. Paging jobs would straddle a run across a page boundary and silently corrupt every per-run aggregate the client derives (status, progress, cost, duration, and the single-job test that picks the row\'s navigation target), so this pages over distinct runs and returns each one whole.  `count` is the number of matching **runs**. `results` carries one entry per run — `{run_id, group_id, jobs}` — where `run_id` is the `group_id` when there is one and the lone job\'s id otherwise, and `jobs` is every job of that run so client-side aggregation is always complete. Runs are ordered by their most recent job; `?ordering=` is accepted for compatibility but does not reorder runs.  Every filter of the jobs list applies (`project`, `capability`, `dataset`, `base_model`, `status`, `provider`, `group_id`, `search`).
-     * List training runs — whole runs per page, newest first
+     * The training history lists *runs*, not jobs: the wizard launches one job per experiment and stamps them with a shared `group_id`. Paging jobs would straddle a run across a page boundary and silently corrupt every per-run aggregate the client derives (status, progress, cost, duration, and the single-job test that picks the row\'s navigation target), so this pages over distinct runs and returns each one whole.  `count` is the number of matching **runs**. `results` carries one entry per run — `{run_id, group_id, jobs}` — where `run_id` is the `group_id` when there is one and the lone job\'s id otherwise, and `jobs` is every job of that run so client-side aggregation is always complete. Ordering applies to whole-run values before pagination. By default, the most recently created job places its run first.  Every filter of the jobs list applies (`project`, `capability`, `dataset`, `base_model`, `status`, `provider`, `group_id`, `search`).
+     * List training runs — whole runs per page
      */
     async finetuningJobsRunsListRaw(requestParameters: FinetuningJobsRunsListRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PaginatedFinetuningJobRunList>> {
         const queryParameters: any = {};
@@ -1427,8 +1677,8 @@ export class FinetuningJobsApi extends runtime.BaseAPI {
     }
 
     /**
-     * The training history lists *runs*, not jobs: the wizard launches one job per experiment and stamps them with a shared `group_id`. Paging jobs would straddle a run across a page boundary and silently corrupt every per-run aggregate the client derives (status, progress, cost, duration, and the single-job test that picks the row\'s navigation target), so this pages over distinct runs and returns each one whole.  `count` is the number of matching **runs**. `results` carries one entry per run — `{run_id, group_id, jobs}` — where `run_id` is the `group_id` when there is one and the lone job\'s id otherwise, and `jobs` is every job of that run so client-side aggregation is always complete. Runs are ordered by their most recent job; `?ordering=` is accepted for compatibility but does not reorder runs.  Every filter of the jobs list applies (`project`, `capability`, `dataset`, `base_model`, `status`, `provider`, `group_id`, `search`).
-     * List training runs — whole runs per page, newest first
+     * The training history lists *runs*, not jobs: the wizard launches one job per experiment and stamps them with a shared `group_id`. Paging jobs would straddle a run across a page boundary and silently corrupt every per-run aggregate the client derives (status, progress, cost, duration, and the single-job test that picks the row\'s navigation target), so this pages over distinct runs and returns each one whole.  `count` is the number of matching **runs**. `results` carries one entry per run — `{run_id, group_id, jobs}` — where `run_id` is the `group_id` when there is one and the lone job\'s id otherwise, and `jobs` is every job of that run so client-side aggregation is always complete. Ordering applies to whole-run values before pagination. By default, the most recently created job places its run first.  Every filter of the jobs list applies (`project`, `capability`, `dataset`, `base_model`, `status`, `provider`, `group_id`, `search`).
+     * List training runs — whole runs per page
      */
     async finetuningJobsRunsList(requestParameters: FinetuningJobsRunsListRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PaginatedFinetuningJobRunList> {
         const response = await this.finetuningJobsRunsListRaw(requestParameters, initOverrides);
@@ -1513,12 +1763,15 @@ export type FinetuningJobsEventsListProviderEnum = typeof FinetuningJobsEventsLi
  * @export
  */
 export const FinetuningJobsEventsListStatusEnum = {
+    awaiting_launch: 'awaiting_launch',
     cancelled: 'cancelled',
     deploying: 'deploying',
     failed: 'failed',
     preparing: 'preparing',
+    preprocessing: 'preprocessing',
     queued: 'queued',
     running: 'running',
+    submission_unknown: 'submission_unknown',
     succeeded: 'succeeded'
 } as const;
 export type FinetuningJobsEventsListStatusEnum = typeof FinetuningJobsEventsListStatusEnum[keyof typeof FinetuningJobsEventsListStatusEnum];
@@ -1537,15 +1790,56 @@ export type FinetuningJobsListProviderEnum = typeof FinetuningJobsListProviderEn
  * @export
  */
 export const FinetuningJobsListStatusEnum = {
+    awaiting_launch: 'awaiting_launch',
     cancelled: 'cancelled',
     deploying: 'deploying',
     failed: 'failed',
     preparing: 'preparing',
+    preprocessing: 'preprocessing',
     queued: 'queued',
     running: 'running',
+    submission_unknown: 'submission_unknown',
     succeeded: 'succeeded'
 } as const;
 export type FinetuningJobsListStatusEnum = typeof FinetuningJobsListStatusEnum[keyof typeof FinetuningJobsListStatusEnum];
+/**
+ * @export
+ */
+export const FinetuningJobsMonitoringEvidenceRetrieveProbeEnum = {
+    development: 'development',
+    training_reference: 'training_reference',
+    generation: 'generation'
+} as const;
+export type FinetuningJobsMonitoringEvidenceRetrieveProbeEnum = typeof FinetuningJobsMonitoringEvidenceRetrieveProbeEnum[keyof typeof FinetuningJobsMonitoringEvidenceRetrieveProbeEnum];
+/**
+ * @export
+ */
+export const FinetuningJobsMonitoringRetrieveProbeEnum = {
+    development: 'development',
+    training_reference: 'training_reference',
+    generation: 'generation'
+} as const;
+export type FinetuningJobsMonitoringRetrieveProbeEnum = typeof FinetuningJobsMonitoringRetrieveProbeEnum[keyof typeof FinetuningJobsMonitoringRetrieveProbeEnum];
+/**
+ * @export
+ */
+export const FinetuningJobsRunsListOrderingEnum = {
+    status: 'status',
+    status2: '-status',
+    name: 'name',
+    name2: '-name',
+    models: 'models',
+    models2: '-models',
+    dataset: 'dataset',
+    dataset2: '-dataset',
+    duration: 'duration',
+    duration2: '-duration',
+    credits: 'credits',
+    credits2: '-credits',
+    created_at: 'created_at',
+    created_at2: '-created_at'
+} as const;
+export type FinetuningJobsRunsListOrderingEnum = typeof FinetuningJobsRunsListOrderingEnum[keyof typeof FinetuningJobsRunsListOrderingEnum];
 /**
  * @export
  */
@@ -1561,12 +1855,15 @@ export type FinetuningJobsRunsListProviderEnum = typeof FinetuningJobsRunsListPr
  * @export
  */
 export const FinetuningJobsRunsListStatusEnum = {
+    awaiting_launch: 'awaiting_launch',
     cancelled: 'cancelled',
     deploying: 'deploying',
     failed: 'failed',
     preparing: 'preparing',
+    preprocessing: 'preprocessing',
     queued: 'queued',
     running: 'running',
+    submission_unknown: 'submission_unknown',
     succeeded: 'succeeded'
 } as const;
 export type FinetuningJobsRunsListStatusEnum = typeof FinetuningJobsRunsListStatusEnum[keyof typeof FinetuningJobsRunsListStatusEnum];

@@ -11,8 +11,7 @@ disabling optimizations or baking in stale defaults (concretely trl's SFTConfig
 eos_token="<EOS_TOKEN>" sentinel). Do not reorder, not even for one more
 env-var-setup import.
 
-Only the FINAL model is checkpointed. Validation is optional: an empty or missing
-val.jsonl skips the eval loop entirely.
+Validation and retained checkpoints follow the frozen monitoring policy.
 """
 
 from __future__ import annotations
@@ -94,6 +93,7 @@ from common import (  # noqa: E402
     WEIGHT_DECAY,
     ProgressCallback,
     apply_shared_patches,
+    emit_stage,
     load_jsonl,
     rewrite_adapter_base_model,
 )
@@ -101,9 +101,12 @@ from datasets import Dataset  # noqa: E402
 from packing import sft_collator_flags, use_row_packing  # noqa: E402
 from pretok import pretok_row  # noqa: E402
 from token_accuracy import TokenAccuracy  # noqa: E402
+from training_monitor import TrainingMonitorCallback  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 from trl import SFTConfig, SFTTrainer  # noqa: E402
 from truncation import refuse_truncation  # noqa: E402
+
+from modal_shared.training_data import row_key  # noqa: E402
 
 apply_shared_patches()
 
@@ -283,12 +286,16 @@ def _attention_implementation(model) -> str | None:
     return None
 
 
-def _build_dataset(tok, rows: list[dict], *, pack: bool) -> Dataset | None:
+def _build_dataset(
+    tok, rows: list[dict], *, pack: bool, stage="building_training_dataset"
+) -> Dataset | None:
+    emit_stage(stage, completed=0, total=len(rows), unit="rows")
     out: list[dict] = []
     for i, row in enumerate(rows):
         # Baseten receives conversations; Modal receives the CPU-validated artifact.
-        if "messages" in row:
-            row = pretok_row(tok, MODEL_ID, row["messages"], row.get("tools"))
+        if "messages" in row and "input_ids" not in row:
+            row["key"] = row_key(row)
+            row.update(pretok_row(tok, MODEL_ID, row["messages"], row.get("tools")))
         ids, labels = row.get("input_ids"), row.get("labels")
         if (
             not ids
@@ -300,6 +307,8 @@ def _build_dataset(tok, rows: list[dict], *, pack: bool) -> Dataset | None:
         n = len(ids)
         refuse_truncation(n, MAX_LENGTH, row_index=i)
         out.append({"input_ids": ids, "labels": labels})
+        if (i + 1) % 1000 == 0 or i + 1 == len(rows):
+            emit_stage(stage, completed=i + 1, total=len(rows), unit="rows")
     if not out:
         return None
     if pack:
@@ -387,6 +396,7 @@ def main() -> None:
     elif _tiled_off:
         print("Tiled MLP off (UNSLOTH_TILED_MLP=0)", flush=True)
 
+    emit_stage("loading_model")
     model, tokenizer = _fast_cls.from_pretrained(
         model_name=base_weights_for(model_id),
         max_seq_length=MAX_LENGTH,
@@ -428,6 +438,7 @@ def main() -> None:
 
     _gc = _hooks.peft_gradient_checkpointing()
     if USE_LORA:
+        emit_stage("configuring_adapters")
         _lora_dropout = _hooks.peft_lora_dropout(LORA_DROPOUT, model_id=MODEL_ID)
         if _lora_dropout != LORA_DROPOUT:
             print(
@@ -447,6 +458,7 @@ def main() -> None:
     _hooks.post_load(model, tokenizer, use_lora=USE_LORA)
     _install_qwen3_causal_mask(model)
     if Path("preparation.json").exists():
+        emit_stage("verifying_training_tokenizer")
         prepared = json.loads(Path("preparation.json").read_text())
         prepared_tokenizer = AutoTokenizer.from_pretrained("tokenizer", local_files_only=True)
         vocab = prepared_tokenizer.get_vocab()
@@ -482,6 +494,7 @@ def main() -> None:
     except (ImportError, AttributeError):
         pass  # transformers.integrations.moe not present/shaped this way — no-op
 
+    emit_stage("loading_training_dataset")
     train_rows = load_jsonl("data.jsonl")
     val_rows = load_jsonl("val.jsonl")
     print(f"Loaded: {len(train_rows)} train / {len(val_rows)} val", flush=True)
@@ -499,8 +512,13 @@ def main() -> None:
     train_ds = _build_dataset(tokenizer, train_rows, pack=_pack)
     if train_ds is None:
         raise RuntimeError("pretok produced zero usable training rows")
-    val_ds = _build_dataset(tokenizer, val_rows, pack=_pack) if val_rows else None
+    val_ds = (
+        _build_dataset(tokenizer, val_rows, pack=_pack, stage="building_validation_dataset")
+        if val_rows
+        else None
+    )
     has_val = val_ds is not None
+    emit_stage("initializing_trainer")
 
     # Mean row length × micro-batch — the real denominator for activation C.
     _row_lens = [len(row["input_ids"]) for row in train_ds]
@@ -514,8 +532,7 @@ def main() -> None:
     )
 
     sft_kwargs: dict = {}
-    if has_val:
-        sft_kwargs.update(eval_strategy="epoch")
+    sft_kwargs.update(eval_strategy="no")
     if MAX_STEPS > 0:
         sft_kwargs["max_steps"] = MAX_STEPS
 
@@ -537,7 +554,7 @@ def main() -> None:
         max_length=MAX_LENGTH,
         report_to=[],
         seed=SEED,
-        save_strategy="no",  # final-only
+        save_strategy="no",  # Monitoring owns verified intermediate checkpoints.
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         eos_token=_inner_tok.eos_token,
@@ -551,6 +568,9 @@ def main() -> None:
 
     callback = ProgressCallback(RUN_DIR)
     callback.set_measured_tokens_per_step(_tokens_per_step)
+    monitoring = TrainingMonitorCallback(
+        RUN_DIR, train_rows, val_rows, _build_dataset, _inner_tok, callback
+    )
 
     trainer = SFTTrainer(
         model=model,
@@ -565,11 +585,14 @@ def main() -> None:
         # downstream changes.
         processing_class=_inner_tok,
         data_collator=None,
-        callbacks=[callback],
+        callbacks=[callback, monitoring],
     )
+    monitoring.trainer = trainer
 
     print(f"Training — {len(train_ds)} train / {len(val_ds) if has_val else 0} val …", flush=True)
+    emit_stage("starting_optimizer")
     trainer.train()
+    monitoring.finish(trainer.state)
     restore_serve_chat_template(_inner_tok, _serve_chat_template)
     if _inner_tok is not tokenizer and hasattr(tokenizer, "chat_template"):
         restore_serve_chat_template(tokenizer, _serve_chat_template)

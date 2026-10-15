@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import TRAIN_ROWS, frozen_dataset
 from django.urls import reverse
-from factories import auth_client
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from overbae.models import FinetuningJob, Project, ProjectMembership, User
 from overbae.services.finetuning_runner import (
@@ -14,8 +16,16 @@ from overbae.services.finetuning_runner import (
     parse_together_metrics,
     progress_from_snapshot,
 )
+from overbae.tasks.finetuning import observe_finetuning_job
 
 pytestmark = pytest.mark.django_db
+
+
+def _auth_client(user) -> APIClient:
+    c = APIClient()
+    token = RefreshToken.for_user(user)
+    c.credentials(HTTP_AUTHORIZATION=f"Bearer {token.access_token}")
+    return c
 
 
 def _setup():
@@ -27,7 +37,7 @@ def _setup():
     )
     p = Project.objects.create(name="p")
     ProjectMembership.objects.create(user=u, project=p)
-    ds = frozen_dataset(p, TRAIN_ROWS, name="ds")
+    ds = frozen_dataset(p, TRAIN_ROWS, name="ds", contract="train")
     return u, p, ds
 
 
@@ -94,22 +104,85 @@ def test_progress_blob_thins_huge_series():
     assert thin_series(short) is short
 
 
-def test_cancel_still_succeeds_when_the_provider_cannot_be_reached(sft, fake_modal):
+@pytest.mark.parametrize("state", ["running", "succeeded"])
+def test_provider_observation_retains_preparation_and_recovery_evidence(state):
+    _, project, dataset = _setup()
+    evidence = {
+        "preparation": {"id": "prepared-source", "state": "ready"},
+        "submission_recoveries": [{"task_id": "interrupted-staging"}],
+    }
+    job = FinetuningJob.objects.create(
+        project=project,
+        dataset=dataset,
+        base_model="Qwen/Qwen3.5-0.8B",
+        status="running",
+        provider="modal",
+        remote_job_id="run:call",
+        hyperparameters={"objective": "decision_cross_entropy"},
+        progress={**evidence, "trained_steps": 1},
+    )
+    runner = MagicMock()
+    runner.poll.return_value = PollSnapshot(state=state, step=2, total_steps=3)
+    runner.is_terminal_ok.return_value = state == "succeeded"
+    runner.is_terminal_fail.return_value = False
+    runner.is_terminal_cancelled.return_value = False
+    runner.fetch_epoch_losses.return_value = []
+    with (
+        patch("overbae.services.finetuning_runner.get_runner", return_value=runner),
+        patch("overbae.services.finetuning_eval.tick_job_evals"),
+        patch("overbae.tasks.finetuning._charge_modal_finetuning"),
+    ):
+        observe_finetuning_job(job)
+    job.refresh_from_db()
+    assert job.progress["trained_steps"] == 2
+    for key, value in evidence.items():
+        assert job.progress[key] == value
+
+
+def test_cancel_calls_remote_runner_and_sets_cancelled():
     u, p, ds = _setup()
     job = FinetuningJob.objects.create(
         project=p,
         dataset=ds,
         base_model="m",
         status=FinetuningJob.Status.RUNNING,
-        provider=FinetuningJob.Provider.MODAL,
-        remote_job_id="run-xyz:fc-gone",
+        provider=FinetuningJob.Provider.BASETEN,
+        remote_job_id="proj-1:job-remote-1",
+        celery_task_id="celery-abc",
     )
 
-    def provider_down(run_id):
-        raise RuntimeError("provider down")
+    mock_runner = MagicMock()
+    with (
+        patch("overbae.services.training_cancellation.get_runner", return_value=mock_runner),
+        patch("overbae.services.training_cancellation.celery_app") as celery_app,
+        patch("overbae.tasks.finetuning.collect_training_evidence.apply_async"),
+    ):
+        r = _auth_client(u).post(reverse("finetuningjob-cancel", kwargs={"id": job.id}))
 
-    fake_modal.deploy("overmind-sft", "mark_cancelled", provider_down)
-    r = auth_client(u).post(reverse("finetuningjob-cancel", kwargs={"id": job.id}))
+    assert r.status_code == 200
+    mock_runner.cancel.assert_called_once_with("proj-1:job-remote-1")
+    celery_app.control.revoke.assert_called_once_with("celery-abc", terminate=True)
+    job.refresh_from_db()
+    assert job.status == FinetuningJob.Status.CANCELLED
+
+
+def test_cancel_still_succeeds_when_remote_cancel_fails():
+    u, p, ds = _setup()
+    job = FinetuningJob.objects.create(
+        project=p,
+        dataset=ds,
+        base_model="m",
+        status=FinetuningJob.Status.RUNNING,
+        provider=FinetuningJob.Provider.BASETEN,
+        remote_job_id="proj-1:job-xyz",
+    )
+    mock_runner = MagicMock()
+    mock_runner.cancel.side_effect = RuntimeError("provider down")
+    with (
+        patch("overbae.services.training_cancellation.get_runner", return_value=mock_runner),
+        patch("overbae.tasks.finetuning.collect_training_evidence.apply_async"),
+    ):
+        r = _auth_client(u).post(reverse("finetuningjob-cancel", kwargs={"id": job.id}))
     assert r.status_code == 200
     job.refresh_from_db()
     assert job.status == FinetuningJob.Status.CANCELLED
@@ -147,7 +220,7 @@ def test_loss_curves_reads_progress_metrics():
             ],
         },
     )
-    r = auth_client(u).get(reverse("finetuningjob-loss-curves", kwargs={"id": str(job.id)}))
+    r = _auth_client(u).get(reverse("finetuningjob-loss-curves", kwargs={"id": str(job.id)}))
     assert r.status_code == 200
     assert r.data["steps"] == [1, 2]
     assert r.data["train_loss"] == [2.0, 1.5]
@@ -172,8 +245,23 @@ def test_loss_curves_falls_back_to_epoch_losses():
             "model": "ft-x",
         },
     )
-    r = auth_client(u).get(reverse("finetuningjob-loss-curves", kwargs={"id": str(job.id)}))
+    r = _auth_client(u).get(reverse("finetuningjob-loss-curves", kwargs={"id": str(job.id)}))
     assert r.status_code == 200
     assert r.data["steps"] == [1]
     assert r.data["train_loss"] == [1.2]
     assert r.data["eval_loss"] == [0.8]
+
+
+def test_loss_curve_monitor_carries_elapsed_and_remaining_range():
+    u, p, ds = _setup()
+    job = FinetuningJob.objects.create(
+        project=p,
+        dataset=ds,
+        base_model="m",
+        status=FinetuningJob.Status.RUNNING,
+        progress={"elapsed_seconds": 728, "eta_range_seconds": [913, 2184]},
+    )
+    response = _auth_client(u).get(reverse("finetuningjob-loss-curves", kwargs={"id": str(job.id)}))
+    assert response.status_code == 200
+    assert response.data["progress"]["elapsed_seconds"] == 728
+    assert response.data["progress"]["eta_range_seconds"] == [913, 2184]

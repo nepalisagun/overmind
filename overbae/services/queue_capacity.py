@@ -7,8 +7,7 @@ from datetime import timedelta
 from django.db.models import Count, Min, Q
 from django.utils import timezone
 
-from overbae.models import DatasetImport, Execution
-from overbae.models.eval_generation import EvalGenerationWork
+from overbae.models import DatasetImport, DatasetPipelineRun, EvalRunRow
 
 NAMESPACE = "Overmind/Queues"
 WORKER_SERVICES = {
@@ -34,29 +33,26 @@ def read_workloads():
         blocked=Count("pk", filter=newly_blocked),
         oldest=Min("queued_at", filter=Q(state="queued")),
     )
-    evaluation = EvalGenerationWork.objects.filter(sample__run__status="running").aggregate(
+    evaluation = EvalRunRow.objects.filter(run__status="running").aggregate(
         waiting=Count("pk", filter=Q(state__in=["waiting", "queued"])),
         running=Count("pk", filter=Q(state="running")),
         blocked=Count("pk", filter=Q(state="unknown")),
-        oldest_waiting=Min("sample__created_at", filter=Q(state="waiting")),
+        oldest_waiting=Min("created_at", filter=Q(state="waiting")),
         oldest_queued=Min("queued_at", filter=Q(state="queued")),
     )
     ages = [evaluation.pop(key) for key in ("oldest_waiting", "oldest_queued")]
     evaluation["oldest"] = min((stamp for stamp in ages if stamp is not None), default=None)
-    newly_failed = Q(
-        state="failed",
-        transient=True,
-        finished_at__gte=timezone.now() - timedelta(seconds=NEWLY_BLOCKED_SECONDS),
-    )
-    workshop = Execution.objects.filter(
-        Q(state__in=["queued", "running"]) | newly_failed
-    ).aggregate(
+    workshop = DatasetPipelineRun.objects.filter(state__in=["queued", "running"]).aggregate(
         waiting=Count("pk", filter=Q(state="queued")),
         running=Count("pk", filter=Q(state="running")),
-        blocked=Count("pk", filter=newly_failed),
-        oldest=Min("queued_at", filter=Q(state="queued")),
+        blocked=Count("pk", filter=Q(state="running", lease_until__isnull=True)),
+        oldest=Min("created_at", filter=Q(state="queued")),
     )
-    return {"landing": imports, "batch": evaluation, "interactive": workshop}
+    return {
+        "landing": imports,
+        "batch": evaluation,
+        "interactive": workshop,
+    }
 
 
 def metric_data(workloads, running_workers, *, cluster, now=None):

@@ -1,36 +1,43 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("@/client", () => ({
+  default: { datasets: { datasetsList: vi.fn() } },
+}));
+
+import apiClient from "@/client";
 import { fetchProjectDatasets } from "./use-datasets";
 
-const datasetsList = vi.hoisted(() => vi.fn());
-vi.mock("@/client", () => ({ default: { datasets: { datasetsList } } }));
+const list = vi.mocked(apiClient.datasets.datasetsList);
 
-const page = (ids: string[], next: string | null) => ({
-  count: 5,
-  next,
-  previous: null,
-  results: ids.map((id) => ({ id })),
-});
+describe("project dataset inventory", () => {
+  beforeEach(() => list.mockReset());
 
-describe("dataset inventory of a project", () => {
-  beforeEach(() => datasetsList.mockReset());
-
-  it("reads every page and keeps a dataset that moved between pages once", async () => {
-    datasetsList
-      .mockResolvedValueOnce(page(["a", "b", "c"], "?page=2"))
-      .mockResolvedValueOnce(page(["c", "d", "e"], null));
-    const datasets = await fetchProjectDatasets("project");
-    expect(datasets.map((dataset) => dataset.id)).toEqual(["a", "b", "c", "d", "e"]);
-    expect(datasetsList.mock.calls.map(([request]) => [request.project, request.page])).toEqual([
-      ["project", 1],
-      ["project", 2],
+  it("includes later pages in the same project without duplicating moving rows", async () => {
+    list
+      .mockResolvedValueOnce({
+        count: 130,
+        next: "?page=2",
+        results: Array.from({ length: 100 }, (_, i) => ({ id: `dataset-${i}` })),
+      } as never)
+      .mockResolvedValueOnce({
+        count: 130,
+        next: null,
+        results: Array.from({ length: 31 }, (_, i) => ({ id: `dataset-${i + 99}` })),
+      } as never);
+    const result = await fetchProjectDatasets("project-a");
+    expect(result.map((dataset) => dataset.id)).toEqual(
+      Array.from({ length: 130 }, (_, i) => `dataset-${i}`)
+    );
+    expect(list.mock.calls.map(([request]) => [request?.project, request?.page])).toEqual([
+      ["project-a", 1],
+      ["project-a", 2],
     ]);
   });
 
-  it("fails instead of returning part of the inventory", async () => {
-    datasetsList
-      .mockResolvedValueOnce(page(["a"], "?page=2"))
-      .mockRejectedValueOnce(new Error("page 2 unavailable"));
-    await expect(fetchProjectDatasets("project")).rejects.toThrow("page 2 unavailable");
+  it("does not report a partial inventory as success when a later page fails", async () => {
+    list
+      .mockResolvedValueOnce({ count: 130, next: "?page=2", results: [{ id: "first" }] } as never)
+      .mockRejectedValueOnce(new Error("second page unavailable"));
+    await expect(fetchProjectDatasets("project-b")).rejects.toThrow("second page unavailable");
   });
 });
