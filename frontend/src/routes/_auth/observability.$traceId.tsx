@@ -9,6 +9,7 @@ import { TracePanelNavigation } from "@/components/traces/TracePanelNavigation";
 import { TracePanelNavigationHeader } from "@/components/traces/TracePanelNavigationHeader";
 import { Button } from "@/components/ui/button";
 import { LoadingState } from "@/components/ui/spinner";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { useProjectsList } from "@/hooks/use-projects";
 import type { SpanRow } from "@/hooks/use-traces";
 import { useTraceDetail } from "@/hooks/use-traces";
@@ -73,6 +74,18 @@ function TraceDetailPage() {
 }
 
 function TraceLayoutContent() {
+  const isMobile = useIsMobile();
+  if (isMobile)
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="h-[30%] min-h-36 shrink-0 border-b border-border">
+          <TracePanelNavigation />
+        </div>
+        <div className="min-h-0 flex-1">
+          <TracePanelDetail />
+        </div>
+      </div>
+    );
   return (
     <TraceLayoutDesktop>
       <TraceLayoutDesktop.NavigationPanel>
