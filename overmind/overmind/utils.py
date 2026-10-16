@@ -8,7 +8,7 @@ from typing import Any
 
 from overmind.chassis import stamp_capability_cards
 from overmind.config import Capability, Config, EvalMetric, dump, ensure_project_name, load
-from overmind.enrich import enrich_analysis
+from overmind.enrich import enrich_analysis, read_prompt_span
 from overmind.repository_snapshot import finish_repository_scan
 
 
@@ -121,6 +121,7 @@ def convert_json_to_toml(
     data = json.loads(json_path.read_text(encoding="utf-8"))
     root = repo_root if repo_root is not None else json_path.resolve().parent
     enrich_analysis(data, str(root))
+    validate_scan_detail(data, repo_root=str(root))
     stamp_capability_cards(data, root)
     toml_path = Path(toml_path)
     base = None
@@ -131,3 +132,105 @@ def convert_json_to_toml(
     ensure_project_name(config, toml_path)
     dump(config, toml_path)
     return config
+
+
+def validate_scan_detail(data: dict[str, Any], *, repo_root: str) -> None:
+    """Reject incomplete decision maps before replacing the saved snapshot.
+
+    This checks supplied evidence and graph references, not semantic completeness
+    against every possible execution of the source.
+    """
+    issues: list[str] = []
+    utilities = _utilities_by_parent(data)
+    for raw in data.get("capabilities") or []:
+        card = raw.get("capability_card") or {}
+        paths = card.get("trajectory_map") or []
+        if not any(path.get("claim") == "decision_surface" for path in paths):
+            continue
+        label = _slug_of(raw) or str(raw.get("name") or "capability")
+        known = {anchor.get("qualname"): anchor for anchor in card.get("anchors") or []}
+        for key, default_key in (("model_resolution", "default_model"), ("prompt_resolution", "default_span")):
+            resolution = card.get(key) or {}
+            for field in ("selection", "provenance"):
+                if not resolution.get(field):
+                    issues.append(f"{label}/{key}: supply source-backed {field}")
+            if not resolution.get(default_key) and not resolution.get("unresolved"):
+                issues.append(f"{label}/{key}: supply {default_key} or explain what cannot be resolved statically")
+        prompt = card.get("prompt_resolution") or {}
+        if prompt.get("default_span"):
+            text = read_prompt_span(repo_root, prompt["default_span"])
+            if not text:
+                issues.append(f"{label}/prompt_resolution: default_span must identify readable prompt text")
+            else:
+                try:
+                    # Only the declared template is rendered; repository code is never executed.
+                    if "bindings" in prompt:
+                        text = text.format_map(prompt["bindings"])
+                    supplied = str(raw.get("system_prompt") or "").strip()
+                    if supplied and supplied != text.strip():
+                        issues.append(
+                            f"{label}/prompt_resolution: system_prompt differs from the declared default template"
+                        )
+                    else:
+                        raw["system_prompt"] = text.strip()
+                except (KeyError, ValueError, TypeError, AttributeError, IndexError) as exc:
+                    issues.append(f"{label}/prompt_resolution: invalid template bindings ({type(exc).__name__})")
+        for utility in utilities.get(_slug_of(raw), []) + (card.get("llm_utilities") or []):
+            anchors = utility.get("anchors") or []
+            implementation = str(utility.get("entrypoint_fn") or "")
+            matches_source = any(
+                known.get(anchor, {}).get("file", "").split("#", 1)[0] == utility.get("source_path")
+                and implementation
+                and (anchor == implementation or anchor.endswith("." + implementation))
+                for anchor in anchors
+            )
+            if (
+                any(anchor not in known for anchor in anchors)
+                or (anchors and not matches_source)
+                or (not anchors and not utility.get("unresolved"))
+            ):
+                issues.append(
+                    f"{label}/utility {utility.get('name')}: anchor the implementation or explain unavailable source"
+                )
+        destinations = {"terminal"}
+        owners: list[tuple[str, dict[str, Any]]] = []
+        for path in paths:
+            path_label = f"{label}/{path.get('id') or path.get('name') or 'trajectory'}"
+            decision_surface = path.get("claim") == "decision_surface"
+            steps = path.get("steps") or path.get("sequence") or []
+            steps = [step for step in steps if isinstance(step, dict)]
+            if decision_surface and not any(step.get("kind") == "model_invocation" for step in steps):
+                issues.append(f"{path_label}: describe the model invocation with structured steps")
+            for step in steps:
+                owner = f"{path_label}/{step.get('step') or 'step'}"
+                anchors = step.get("anchors") or []
+                if decision_surface and (not anchors or any(anchor not in known for anchor in anchors)):
+                    issues.append(f"{owner}: supply source-verified step anchors")
+                destinations.update(anchor for anchor in anchors if anchor in known)
+                if decision_surface and step.get("kind") == "model_invocation":
+                    for field in ("input", "action", "output"):
+                        if not str(step.get(field) or "").strip():
+                            issues.append(f"{owner}: describe the model's {field}")
+                owners.append((owner, step))
+        for tool in card.get("tool_spec") or []:
+            owner = f"{label}/tool {tool.get('name') or '(unnamed)'}"
+            branches = tool.get("branches") or []
+            if not branches:
+                issues.append(f"{owner}: inspect the implementation and describe its outcomes in branches")
+            for index, branch in enumerate(branches, 1):
+                branch_owner = f"{owner}/branch {index}"
+                for field in ("condition", "action", "outcome", "provenance"):
+                    if not branch.get(field):
+                        issues.append(f"{branch_owner}: missing {field}")
+                owners.append((branch_owner, branch))
+        for owner, item in owners:
+            for transition in item.get("transitions") or []:
+                target = transition.get("target")
+                if target not in destinations:
+                    issues.append(f"{owner}: transition target {target!r} is not a destination step anchor or terminal")
+    if issues:
+        raise ValueError(
+            "Incomplete capability scan; existing TOML was not changed. "
+            "Read the cited source, repair the analysis JSON and rerun conversion; do not repeat init.\n- "
+            + "\n- ".join(issues)
+        )
