@@ -927,21 +927,6 @@ export function ProbabilityEvaluationMonitor({ plan }: { plan: NativeEvaluation 
                   {data?.count.toLocaleString() ?? ""}
                 </span>
               </h3>
-              <div
-                aria-label="Prediction key"
-                className="ml-auto flex flex-wrap items-center gap-2"
-              >
-                <Badge className="gap-1" variant="success">
-                  <Icon.success aria-hidden className="size-3" /> Correct
-                </Badge>
-                <Badge className="gap-1" variant="error">
-                  <Icon.failed aria-hidden className="size-3" /> Incorrect
-                </Badge>
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <span aria-hidden className="h-1 w-5 rounded-sm bg-muted-foreground" />
-                  Probability
-                </span>
-              </div>
               <ListToolbar
                 filters={
                   <>
