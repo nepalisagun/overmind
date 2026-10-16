@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { toast } from "sonner";
@@ -14,7 +14,6 @@ import {
   RunComparison,
   ScoreChip,
 } from "@/components/evaluations/run-comparison";
-import { ResultsChart } from "@/components/evaluations/run-results-chart";
 import { StatusBadge } from "@/components/evaluations/runs-table";
 import { HeaderStat } from "@/components/finetuning/finetuning-chrome";
 import { ModelProviderChip } from "@/components/model-provider-chip";
@@ -75,19 +74,10 @@ export const Route = createFileRoute("/_auth/evaluations/runs/$runId")({
 });
 
 const MODE_LABEL: Record<string, string> = {
-  generate: "Replay",
+  generate: "Generated",
   provided: "Provided",
   recorded: "Recorded",
 };
-
-function modeLabel(run: Pick<EvalRun, "mode" | "params">) {
-  const strategy =
-    run.params && typeof run.params === "object" && "generation_strategy" in run.params
-      ? run.params.generation_strategy
-      : "";
-  if (run.mode === "generate" && strategy === "single_completion") return "Single completion";
-  return MODE_LABEL[run.mode] ?? run.mode;
-}
 
 const PHASE_LABEL: Record<string, string> = {
   generating: "Generating",
@@ -195,11 +185,6 @@ function EvalRunDetailPage() {
             <RunComparison active={active} hasBaseline={hasBaseline} runId={runId} />
           ) : (
             <>
-              <ResultsChart
-                active={active}
-                run={run}
-                runs={siblings.length > 0 ? siblings : [run]}
-              />
               <SummarySection run={run} />
               <RowsSection active={active} projectId={projectId} runId={runId} />
             </>
@@ -246,29 +231,6 @@ function RelaunchButton({ runId, visible }: { runId: string; visible: boolean })
   );
 }
 
-function replayFacts(metadata: unknown): [string, string][] {
-  if (!metadata || typeof metadata !== "object") return [];
-  const record = metadata as Record<string, unknown>;
-  if (record.generation_strategy == null && record.replay_misses == null && record.steps == null) {
-    return [];
-  }
-  const facts: [string, string][] = [];
-  if (typeof record.generation_strategy === "string") {
-    facts.push([
-      "Strategy",
-      record.generation_strategy === "replay" ? "Replay" : record.generation_strategy,
-    ]);
-  }
-  if (typeof record.steps === "number") facts.push(["Steps", String(record.steps)]);
-  if (typeof record.replay_misses === "number") {
-    facts.push(["Replay misses", String(record.replay_misses)]);
-  }
-  if (typeof record.latency_ms === "number")
-    facts.push(["Latency", `${Math.round(record.latency_ms)} ms`]);
-  if (typeof record.cost === "number") facts.push(["Cost", record.cost.toFixed(4)]);
-  return facts;
-}
-
 function RunHeaderCard({
   run,
   projectId,
@@ -292,7 +254,7 @@ function RunHeaderCard({
               <span className="text-sm font-medium">{targetLabel(run)}</span>
             )}
             <Badge size="chip" variant="neutral">
-              {modeLabel(run)}
+              {MODE_LABEL[run.mode] ?? run.mode}
             </Badge>
             {run.isBaseline && (
               <Badge size="chip" variant="neutral">
@@ -435,18 +397,10 @@ function GroupStrip({
   );
 }
 
-function Stat({ label, value }: { label: string; value: ReactNode }) {
-  return (
-    <div className="flex flex-col gap-1 rounded-md border border-border bg-wash-subtle px-4 py-3">
-      <span className="text-xs text-muted-foreground">{label}</span>
-      <span className="font-mono text-lg font-semibold tabular-nums">{value}</span>
-    </div>
-  );
-}
-
 function SummarySection({ run }: { run: EvalRunDetail }) {
   const summary = asRunSummary(run.summary);
   const metrics = metricEntries(summary);
+  const legacy = summary.migrated === true;
   const classMetrics = Object.entries(summary.class_metrics ?? {}).filter(
     ([, value]) => typeof value === "number"
   ) as [string, number][];
@@ -455,23 +409,23 @@ function SummarySection({ run }: { run: EvalRunDetail }) {
   }
   return (
     <section aria-label="Summary" className="flex flex-col gap-3">
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <Stat label="Score" value={<ScoreChip value={summary.score} />} />
-        <Stat label="Rows" value={summary.rows ?? 0} />
-        <Stat label="Scored" value={summary.scored ?? 0} />
-        <Stat label="Errored" value={summary.errored ?? 0} />
-        <Stat label="Degraded" value={summary.degraded ?? 0} />
-      </div>
+      {legacy && (summary.rows ?? 0) === 0 && (
+        <p className="text-sm text-warning">
+          This older run retains aggregate scores only. Individual inputs, outputs, and scores are
+          unavailable.
+        </p>
+      )}
       {classMetrics.length > 0 && (
-        <div className="flex flex-wrap gap-3">
+        <dl className="flex flex-wrap gap-x-8 gap-y-2 text-xs">
           {classMetrics.map(([name, value]) => (
-            <Stat
-              key={name}
-              label={name.replaceAll("_", " ")}
-              value={value <= 1 ? `${Math.round(value * 100)}%` : value}
-            />
+            <div className="flex items-baseline gap-2" key={name}>
+              <dt className="text-muted-foreground">{name.replaceAll("_", " ")}</dt>
+              <dd className="font-mono tabular-nums">
+                {value <= 1 ? `${Math.round(value * 100)}%` : value}
+              </dd>
+            </div>
           ))}
-        </div>
+        </dl>
       )}
       {metrics.length > 0 && (
         <div className="overflow-auto rounded-md border border-border">
@@ -491,7 +445,11 @@ function SummarySection({ run }: { run: EvalRunDetail }) {
                 <TableRow key={name}>
                   <TableCell className="text-sm font-medium">{name}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {metric.type === "llm" ? "LLM judge" : "Deterministic"}
+                    {metric.type === "llm"
+                      ? "LLM judge"
+                      : metric.type === "deterministic"
+                        ? "Deterministic"
+                        : "Historical"}
                   </TableCell>
                   <TableCell className="text-center">
                     <ScoreChip value={metric.mean} />
@@ -500,10 +458,10 @@ function SummarySection({ run }: { run: EvalRunDetail }) {
                     {metric.n}
                   </TableCell>
                   <TableCell className="text-center font-mono text-xs tabular-nums">
-                    {metric.failed ?? 0}
+                    {metric.failed ?? (legacy ? "—" : 0)}
                   </TableCell>
                   <TableCell className="text-center font-mono text-xs tabular-nums">
-                    {metric.errors ?? 0}
+                    {metric.errors ?? (legacy ? "—" : 0)}
                   </TableCell>
                 </TableRow>
               ))}
@@ -619,21 +577,6 @@ function RowsSection({
   );
 }
 
-function ReplayFacts({ metadata }: { metadata: unknown }) {
-  const facts = replayFacts(metadata);
-  if (facts.length === 0) return null;
-  return (
-    <dl className="grid grid-cols-2 gap-x-4 gap-y-1 rounded-md border border-border bg-wash-subtle px-3 py-2 text-xs">
-      {facts.map(([label, value]) => (
-        <div className="flex justify-between gap-2" key={label}>
-          <dt className="text-muted-foreground">{label}</dt>
-          <dd className="font-mono tabular-nums">{value}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
 function Payload({ label, value }: { label: string; value: unknown }) {
   if (value == null || value === "") return null;
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -682,7 +625,6 @@ function RowSheet({
                 </div>
               )}
               <MetricList metrics={row.metrics} />
-              <ReplayFacts metadata={row.metadata} />
               <Payload label="Input" value={row.input} />
               <Payload label="Reference" value={row.reference} />
               <Payload label="Output" value={row.output} />
