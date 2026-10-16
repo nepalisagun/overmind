@@ -1,12 +1,14 @@
 import { useMemo, useState } from "react";
 
 import { createFileRoute, Link } from "@tanstack/react-router";
+import type { ColumnDef } from "@tanstack/react-table";
 import { toast } from "sonner";
 
 import { UsedVersionChip } from "@/components/datasets/badges";
 import { EntityRef } from "@/components/entity-ref";
+import { MetricBars } from "@/components/evaluations/metric-bars";
 import { MetricList, metricResults } from "@/components/evaluations/metric-list";
-import { renderPayload } from "@/components/evaluations/payload-format";
+import { formatPayload, renderPayload } from "@/components/evaluations/payload-format";
 import { ProbabilityEvaluationPage } from "@/components/evaluations/probability-evaluation-page";
 import {
   asRunSummary,
@@ -21,9 +23,10 @@ import { DetailErrorState } from "@/components/route-error";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { DataTable } from "@/components/ui/data-table";
 import { DateTime } from "@/components/ui/datetime";
-import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icons";
+import { ListToolbar } from "@/components/ui/list-toolbar";
 import { PageHeader } from "@/components/ui/page-header";
 import { PageShell } from "@/components/ui/page-shell";
 import {
@@ -65,6 +68,7 @@ import {
 } from "@/hooks/use-evaluations";
 import { formatElapsed } from "@/lib/formatters";
 import { evaluationRunSearchSchema } from "@/lib/schemas";
+import { TITLE } from "@/lib/typography";
 import { cn } from "@/lib/utils";
 import type { EvalRun, EvalRunDetail, EvalRunRow } from "@/openapi";
 
@@ -101,18 +105,7 @@ function EvalRunDetailPage() {
   const group = useEvalRunGroupQuery(projectId, run?.group || undefined);
   const [view, setView] = useState<"results" | "compare">("results");
 
-  const header = (
-    <PageHeader
-      description="Scores and per-row results for this run."
-      icon={
-        <Icon.evaluations
-          aria-hidden
-          className="size-6 shrink-0 [image-rendering:pixelated] invert"
-        />
-      }
-      title={run?.name || "Evaluation run"}
-    />
-  );
+  const header = <PageHeader title="Evaluations" />;
 
   if (error && !run) {
     return (
@@ -161,7 +154,8 @@ function EvalRunDetailPage() {
           </div>
         ) : null}
 
-        <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-auto">
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto">
+          <h2 className={TITLE.card}>{run.name || "Evaluation run"}</h2>
           <RunHeaderCard active={active} projectId={projectId} run={run} />
 
           {siblings.length > 1 && (
@@ -243,10 +237,10 @@ function RunHeaderCard({
   const progress = run.progress;
   const model = run.resolvedModel || run.modelName;
   return (
-    <Card className="flex flex-col gap-4 p-4">
-      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+    <Card aria-label="Run details" className="flex flex-col" role="region">
+      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 p-4">
         <div className="flex min-w-0 flex-col gap-2">
-          <h3 className="text-xs text-foreground">Target</h3>
+          <h3 className="text-xs text-foreground">Model</h3>
           <div className="flex flex-wrap items-center gap-2">
             {model ? (
               <ModelProviderChip model={model} />
@@ -281,7 +275,7 @@ function RunHeaderCard({
         </dl>
       </div>
 
-      <div className="flex flex-wrap items-stretch gap-y-3 border-t border-border/70 pt-3.5">
+      <div className="flex flex-wrap items-stretch gap-y-3 border-t border-border/70 px-4 py-3.5">
         {run.capabilityId && (
           <>
             <HeaderStat label="Capability">
@@ -325,7 +319,7 @@ function RunHeaderCard({
         )}
       </div>
 
-      <div className="flex flex-wrap items-center gap-2.5 border-t border-border/70 pt-3">
+      <div className="flex flex-wrap items-center gap-2.5 border-t border-border/70 px-4 py-3">
         <StatusBadge status={run.status} />
         {active && progress && (
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
@@ -428,6 +422,25 @@ function SummarySection({ run }: { run: EvalRunDetail }) {
         </dl>
       )}
       {metrics.length > 0 && (
+        <div className="grid gap-4 xl:grid-cols-2">
+          {metrics.map(([name, metric]) => (
+            <MetricBars
+              benchmark={run.name || "Evaluation run"}
+              description={`${metric.n} scored rows · Higher is better.`}
+              emptyHint="No scored rows yet."
+              key={name}
+              percentage
+              rows={
+                metric.mean == null
+                  ? []
+                  : [{ colorIndex: 0, key: run.id, name: targetLabel(run), value: metric.mean }]
+              }
+              title={name}
+            />
+          ))}
+        </div>
+      )}
+      {metrics.length > 0 && (
         <div className="overflow-auto rounded-md border border-border">
           <Table>
             <TableHeader>
@@ -483,6 +496,63 @@ function rowMatches(row: EvalRunRow, filter: RowFilter) {
   return true;
 }
 
+const rowColumns: ColumnDef<EvalRunRow>[] = [
+  { accessorKey: "rowIndex", enableResizing: false, header: "Row", size: 64 },
+  ...(["input", "reference", "output"] as const).map(
+    (field): ColumnDef<EvalRunRow> => ({
+      accessorKey: field,
+      cell: ({ row }) => (
+        <span className="block truncate text-xs">
+          {row.original[field] == null
+            ? "Not captured"
+            : formatPayload(row.original[field]) || JSON.stringify(row.original[field])}
+        </span>
+      ),
+      header: field === "input" ? "Input" : field === "reference" ? "Reference" : "Output",
+      size: 260,
+    })
+  ),
+  {
+    cell: ({ row }) => <ScoreChip value={row.original.score} />,
+    header: "Score",
+    id: "score",
+    size: 90,
+  },
+  {
+    cell: ({ row }) => (
+      <StatusBadge
+        status={
+          row.original.error
+            ? "failed"
+            : row.original.degraded
+              ? "interrupted"
+              : row.original.state === "done"
+                ? "completed"
+                : row.original.state
+        }
+      />
+    ),
+    header: "Status",
+    id: "state",
+    size: 110,
+  },
+  {
+    cell: ({ row }) => (
+      <span className="text-xs text-muted-foreground">
+        {row.original.error ||
+          metricResults(row.original.metrics)
+            .filter(([, m]) => !!m.error || (m.score != null && m.score < FAIL_BELOW))
+            .map(([name]) => name)
+            .join(", ") ||
+          "—"}
+      </span>
+    ),
+    header: "Failing metrics",
+    id: "failing",
+    size: 240,
+  },
+];
+
 function RowsSection({
   runId,
   active,
@@ -492,86 +562,69 @@ function RowsSection({
   active: boolean;
   projectId: string | undefined;
 }) {
-  const { data, isLoading } = useEvalRunRowsQuery(runId, active);
+  const { data, isLoading, error } = useEvalRunRowsQuery(runId, active);
   const [filter, setFilter] = useState<RowFilter>("all");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
   const [openId, setOpenId] = useState<number | undefined>();
   const rows = useMemo(
     () => (data?.results ?? []).filter((row) => rowMatches(row, filter)),
     [data, filter]
   );
-
+  const currentPage = Math.min(page, Math.max(1, Math.ceil(rows.length / pageSize)));
   return (
-    <section aria-label="Rows" className="flex flex-col gap-3">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="text-sm font-medium">
-          Rows <span className="font-mono text-muted-foreground">{data?.count ?? 0}</span>
-        </h3>
-        <Select onValueChange={(v) => setFilter(v as RowFilter)} value={filter}>
-          <SelectTrigger aria-label="Filter rows" className="w-40" size="sm">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All rows</SelectItem>
-            <SelectItem value="failing">Failing</SelectItem>
-            <SelectItem value="errored">Errored or degraded</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      {isLoading ? (
-        <LoadingState />
-      ) : rows.length === 0 ? (
-        <EmptyState
-          className="rounded-md border border-dashed bg-wash-subtle"
-          icon={Icon.evaluations}
-          iconClassName="invert [image-rendering:pixelated]"
-          size="section"
-          title="No rows"
-        />
-      ) : (
-        <div className="overflow-auto rounded-md border border-border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-16">#</TableHead>
-                <TableHead className="w-24">State</TableHead>
-                <TableHead className="w-24 text-center">Score</TableHead>
-                <TableHead>Failing metrics</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((row) => {
-                const failing = metricResults(row.metrics).filter(
-                  ([, m]) => !!m.error || (m.score != null && m.score < FAIL_BELOW)
-                );
-                return (
-                  <TableRow
-                    className="cursor-pointer"
-                    key={row.id}
-                    onClick={() => setOpenId(row.id)}
-                  >
-                    <TableCell className="font-mono text-xs tabular-nums">{row.rowIndex}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {row.error ? (
-                        <span className="text-destructive">Error</span>
-                      ) : row.degraded ? (
-                        <span className="text-warning">Degraded</span>
-                      ) : (
-                        row.state
-                      )}
-                    </TableCell>
-                    <TableCell className="text-center">
-                      <ScoreChip value={row.score} />
-                    </TableCell>
-                    <TableCell className="max-w-md truncate text-xs text-muted-foreground">
-                      {row.error || failing.map(([name]) => name).join(", ") || "—"}
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </div>
-      )}
+    <section aria-label="Datapoints" className="flex min-h-96 flex-col gap-3">
+      <DataTable
+        columns={rowColumns}
+        data={
+          data
+            ? {
+                count: rows.length,
+                results: rows.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+              }
+            : undefined
+        }
+        error={error}
+        getRowId={(row) => String(row.id)}
+        isLoading={isLoading}
+        isRowActive={(row) => row.id === openId}
+        onPageChange={setPage}
+        onPageSizeChange={(size) => {
+          setPageSize(size);
+          setPage(1);
+        }}
+        onRowClick={(row) => setOpenId(row.id)}
+        page={currentPage}
+        pageSize={pageSize}
+        storageKey="evaluation-run-datapoints"
+        toolbar={
+          <ListToolbar
+            filters={
+              <Select
+                onValueChange={(value) => {
+                  setFilter(value as RowFilter);
+                  setPage(1);
+                }}
+                value={filter}
+              >
+                <SelectTrigger aria-label="Filter rows" className="w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All rows</SelectItem>
+                  <SelectItem value="failing">Failing</SelectItem>
+                  <SelectItem value="errored">Errored or degraded</SelectItem>
+                </SelectContent>
+              </Select>
+            }
+            primary={
+              <h3 className={TITLE.card}>
+                Datapoints <span className="text-muted-foreground">{data?.count ?? ""}</span>
+              </h3>
+            }
+          />
+        }
+      />
       <RowSheet id={openId} onClose={() => setOpenId(undefined)} projectId={projectId} />
     </section>
   );

@@ -7,6 +7,7 @@ import type {
   EvalMatrix,
   EvalMatrixRequest,
   EvalRun,
+  EvalRunRow,
   EvalRunsActivityListOrderingEnum,
   EvalRunsActivityListStatusEnum,
   EvaluationActivity,
@@ -239,8 +240,19 @@ export const useEvalRunComparisonQuery = (
 export const useEvalRunRowsQuery = (runId: string | undefined, active = false) =>
   useQuery({
     enabled: !!runId,
-    queryFn: () =>
-      apiClient.evalRunRows.evalRunRowsList({ ordering: "row_index", pageSize: 1000, run: runId }),
+    queryFn: async () => {
+      const results: EvalRunRow[] = [];
+      for (let page = 1; ; page++) {
+        const data = await apiClient.evalRunRows.evalRunRowsList({
+          ordering: "row_index",
+          page,
+          pageSize: 1000,
+          run: runId,
+        });
+        results.push(...data.results);
+        if (!data.next) return { ...data, next: null, previous: null, results };
+      }
+    },
     queryKey: ["eval-run-rows", runId],
     refetchInterval: (q) => backoffPolling(q, active ? 4_000 : false),
   });
