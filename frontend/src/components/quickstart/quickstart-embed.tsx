@@ -1,31 +1,18 @@
-import desktopMonitorIcon from "@/assets/desktop-monitor.svg";
 import { OnboardWithAiPanel } from "@/components/quickstart/onboard-with-ai-panel";
-import { EmptyState } from "@/components/ui/empty-state";
-
-const CapabilitiesIcon = (_props: { className?: string }) => (
-  <span className="mb-4 flex size-14 items-center justify-center rounded-md border border-border bg-muted">
-    <img
-      alt=""
-      aria-hidden="true"
-      className="size-8 [image-rendering:pixelated] invert"
-      src={desktopMonitorIcon}
-    />
-  </span>
-);
+import { Card } from "@/components/ui/card";
 
 export function QuickstartEmbed({ projectId }: { projectId: string }) {
   return (
-    <>
-      <EmptyState
-        className="pb-4"
-        description="Open your repository in a coding agent and paste the onboarding prompt. The agent runs init sync first; capability scan follows in the skill."
-        icon={CapabilitiesIcon}
-        size="section"
-        title="No capabilities yet"
-      />
-      <div className="mx-auto w-full max-w-2xl overflow-hidden rounded-md border border-border p-4">
+    <section aria-labelledby="agent-onboarding-title" className="w-full max-w-2xl">
+      <h2
+        className="relative z-10 -mb-px ml-4 w-fit rounded-t-md border border-b-0 border-border bg-card px-4 py-2 text-sm font-medium"
+        id="agent-onboarding-title"
+      >
+        Get started
+      </h2>
+      <Card className="p-4">
         <OnboardWithAiPanel projectId={projectId} />
-      </div>
-    </>
+      </Card>
+    </section>
   );
 }
