@@ -82,13 +82,30 @@ For deployment, stop old Workshop agent workers before the API cutover. A 3.0
 deployment does not acknowledge cancellation of a model request submitted by an
 older worker. Preserve historical receipts and reconcile unknown provider outcomes.
 
-Initial source imports use a durable `DatasetImport` receipt on the dedicated
-`landing` queue. Publication and execution have separate fenced ownership; the
+Initial source imports retain `DatasetImport` receipts; all landing submissions
+also enter `DatasetLandingWork` before broker publication. A nonblocking control
+dispatcher admits one import per project with least-recent-project fairness and
+bounds global work by observed landing worker slots, capped at eight. Waiting
+imports remain in PostgreSQL, not the broker. Queue waiting has no default expiry;
+`DATASET_IMPORT_MAX_QUEUE_SECONDS` explicitly sets one when nonzero. Worker leases
+and execution limits remain bounded. Unacknowledged, unstarted deliveries can be
+fenced and admitted again; lost started imports require explicit recovery.
+Publication fences recovery through dataset locks; admission checks must leave
+the work row unlocked so its independent heartbeat can renew throughout publication.
+REST operation and MCP dataset/run inspection expose the same admission state and
+measured timestamps without exposing ownership tokens. The dedicated `landing`
+queue consumes only admitted deliveries. Publication and execution have separate fenced ownership; the
 control reconciler recovers lost broker acknowledgements and records expired
 attempts. `resume_dataset_import` and REST `resume-import` explicitly retry a
 blocked import within its attempt budget. Cancellation fences both split members.
 Landing retains evidence and returns to idle; it does not start preparation.
+First-source uploads into an existing empty draft use the same durable import
+receipt. MCP also offers explicit recovery for retained failed draft uploads that
+predate that receipt, preserving the draft and its task brief.
 Pipeline queue demand contributes to interactive capacity through `DatasetPipelineRun`.
+The default project limit is two concurrent pipelines, below the minimum four-slot
+interactive worker so one project's burst cannot occupy the entire worker. Raising
+this limit requires testing it against the minimum deployed worker capacity.
 
 ## Sources, identities and versions
 
@@ -158,7 +175,11 @@ not agent-authored normalization; old immutable cells are not rewritten.
 responses return `query_result_too_large` without clipping values; project or
 aggregate in SQL, or export the exact cell. A separate configurable execution
 deadline defaults to ten seconds and returns `query_timeout`; source cells and
-later queries remain usable. The byte/column budget is enforced while reading
+later queries remain usable. Redis admission bounds MCP SQL across API workers
+(default eight global, two per project). Busy or unavailable admission returns
+retryable errors with exact cell and retry delay before creating a query engine.
+Expired leases recover crashed workers; capacity does not authorize source writes.
+The byte/column budget is enforced while reading
 results, before building an unbounded Python result.
 Results above 200 columns also fail rather than omitting column metadata.
 MCP Workshop run summaries omit bulky row examples and preview samples from
@@ -322,3 +343,8 @@ preparation graph by dataset revision; event reconnection also refreshes it.
 Creating a dataset from selected traces asks for its name and optional capability
 only. It lands with pending purpose; preparation and consumer intent follow in
 Workshop. Trace selections omit the table-only `all_spans` display parameter.
+
+The upload client retries at most five transient chunk-transport failures with
+smaller chunks and bounded backoff against the same transfer and offset. Confirmed
+permission denial stops immediately. Exhausted retries retain the receipt for the
+identical command to resume; publication is not blindly replayed.

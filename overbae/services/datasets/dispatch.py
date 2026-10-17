@@ -5,7 +5,7 @@ import uuid
 from django.db import transaction
 from django.utils import timezone
 
-from overbae.models import Dataset
+from overbae.models import Dataset, DatasetImport
 from overbae.services.datasets import files, imports, selection
 from overbae.services.datasets.land import SPLIT_POSITIONS
 from overbae.services.datasets.lifecycle import (
@@ -133,6 +133,22 @@ def attach_source(dataset, user, source: dict) -> Dataset:
         request_id = stage_attachment(dataset, source)
         from overbae.tasks.datasets import land
 
+        if (
+            not dataset.cells.exists()
+            and not DatasetImport.objects.filter(dataset=dataset).exists()
+        ):
+            imports.enqueue(
+                dataset,
+                {
+                    "dataset_id": str(dataset.pk),
+                    "source": source,
+                    "user_id": _user_id(user),
+                    "infer_capability": False,
+                    "attachment_request": request_id,
+                },
+            )
+            dataset.refresh_from_db()
+            return dataset
         transaction.on_commit(
             lambda: land.apply_async(
                 kwargs={

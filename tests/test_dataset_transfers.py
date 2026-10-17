@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import uuid
+from pathlib import Path
 
 import pytest
 from rest_framework.test import APIClient
@@ -75,6 +77,32 @@ def test_interrupted_upload_and_lost_publication_ack_recover_exact_source(transf
     assert chunk(client, receipt, b"changed").status_code == 409
 
 
+def test_completion_refreshes_metadata_after_another_api_task_uploaded_bytes(
+    transfer_client, monkeypatch
+):
+    client, project = transfer_client
+    receipt, data = reserve(client, project)
+    assert chunk(client, receipt, data).status_code == 200
+    uploaded = files.upload_data_path(receipt["upload_id"])
+    stat = Path.stat
+
+    def cached_stat(path, *args, **kwargs):
+        result = stat(path, *args, **kwargs)
+        if path == uploaded:
+            cached = list(result)
+            cached[6] = 0
+            return os.stat_result(cached)
+        return result
+
+    monkeypatch.setattr(Path, "stat", cached_stat)
+    result = complete(client, receipt)
+    assert result.status_code == 200, result.data
+    dataset = Dataset.objects.get(pk=result.data["result"]["id"])
+    assert dataset.state == "idle", dataset.error
+    assert dataset.source.rows == 2
+    assert complete(client, receipt).data["result"] == result.data["result"]
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -106,6 +134,8 @@ def test_retransmission_rejects_different_bytes_and_completion_verifies_hash(tra
     client, project = transfer_client
     receipt, data = reserve(client, project)
     assert chunk(client, receipt, data[:10]).status_code == 200
+    prefix_retry = chunk(client, receipt, data[:5])
+    assert prefix_retry.status_code == 200 and prefix_retry.data["received"] == 10
     assert chunk(client, receipt, data[:10]).status_code == 200
     assert chunk(client, receipt, b"x" * 10).status_code == 409
     assert complete(client, receipt).status_code == 409
@@ -149,6 +179,7 @@ def test_repeated_attachment_does_not_append_another_cell(transfer_client):
     assert draft.brief == "Keep this brief"
     assert draft.cells.count() == 1
     assert Dataset.objects.count() == 1
+    assert DatasetImport.objects.get(pk=receipt["id"]).state == "complete"
 
 
 def test_split_publication_returns_same_pair(transfer_client):

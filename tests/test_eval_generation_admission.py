@@ -1,13 +1,48 @@
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 
 from overbae.innermind import generation
-from overbae.models import EvalRun, EvalRunRow, Project
+from overbae.models import EvalGenerationScheduler, EvalRun, EvalRunRow, Project
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.mark.django_db(transaction=True)
+def test_overlapping_dispatch_does_not_block_control_capacity():
+    EvalGenerationScheduler.objects.get_or_create(pk=1)
+    held, release = threading.Event(), threading.Event()
+
+    def owner():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                EvalGenerationScheduler.objects.select_for_update().get(pk=1)
+                held.set()
+                assert release.wait(5)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(owner)
+        try:
+            assert held.wait(5)
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout = '500ms'")
+                started = time.monotonic()
+                result = Published().tick()
+                assert time.monotonic() - started < 0.5
+                assert result == {"admitted": 0, "scoring": 0, "expired": 0, "busy": True}
+        finally:
+            release.set()
+        pending.result(timeout=5)
 
 
 def make_run(count=8, project=None):
@@ -136,3 +171,18 @@ def test_last_completion_hands_the_run_to_scoring_exactly_once(limits):
     assert run_id == str(run.pk)
     assert generation.begin_scoring(run_id, scoring_id) is True
     assert generation.begin_scoring(run_id, scoring_id) is False
+
+
+def test_many_runs_cannot_bypass_the_project_budget(settings):
+    settings.EVAL_MAX_IN_FLIGHT = 12
+    settings.EVAL_MAX_IN_FLIGHT_PER_PROJECT = 3
+    settings.EVAL_MAX_IN_FLIGHT_PER_RUN = 2
+    busy = Project.objects.create(name="flood", slug=uuid.uuid4().hex)
+    for _ in range(30):
+        make_run(count=10, project=busy)
+    published = Published()
+    assert published.tick()["admitted"] == 3
+    quiet = make_run(count=2)
+    assert published.tick()["admitted"] == 2
+    assert EvalRunRow.objects.filter(run__project=busy, state__in=generation.IN_FLIGHT).count() == 3
+    assert EvalRunRow.objects.filter(run=quiet, state__in=generation.IN_FLIGHT).count() == 2

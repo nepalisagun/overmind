@@ -1,6 +1,7 @@
 from .billing import BillingService, BillingTelemetry, Subscription, SubscriptionStatus
 from .capabilities import Capability, IdentityAlias, Prompt
 from .connectors import ConnectorCredential, ConnectorSyncConfig, ConnectorSyncRun
+from .dataset_admission import DatasetLandingWork
 from .dataset_context import DatasetContext
 from .dataset_pipeline import (
     DatasetPipeline,
@@ -51,6 +52,9 @@ from .innermind import (
     EvalRunRow,
     EvalScore,
     EvalSet,
+    LiveScoringProject,
+    LiveScoringScheduler,
+    LiveScoringWork,
     ModelRef,
     SignalEvent,
     SignalSubscription,
@@ -77,6 +81,10 @@ __all__ = [
     "OperationalRun",
     "DatasetHistory",
     "DatasetImport",
+    "DatasetLandingWork",
+    "LiveScoringProject",
+    "LiveScoringScheduler",
+    "LiveScoringWork",
     "EvalGenerationScheduler",
     "MCPOAuthClient",
     "MCPOAuthGrant",

@@ -65,7 +65,15 @@ Each line is the invariant; the named skill section carries the mechanics.
 
 - Billing meters platform model/compute spend on the ledger. Remaining-credit 402s, quotas and Stripe apply when `STRIPE_SECRET_KEY` is set. Native-agent model selection and funding belong to the external coding-agent environment. Training, evaluation and serving retain their own billing. Detail: backend-architecture § Auth and tenancy.
 
-- Celery is five workers over six queues: `control` (default, orchestration and beat), `io` + `io_traces` (one threads worker, round-robin), `batch`, `landing` and `interactive` (prefork). Workers are resource profiles, queues are fairness classes; only prefork enforces `time_limit`, so every time-limited task routes to `batch`, `landing` or `interactive`. Imports have dedicated landing capacity; live span and trajectory scoring and signals run on `io_traces`; evaluation generation and scoring run on `batch` with durable, bounded admission and project and run fairness. Workshop pipelines retain queue and execution timestamps in their run receipts; their waiting and occupied slots contribute to interactive capacity, with shared per-project admission. Source imports retain fenced attempts and explicit recovery through REST and MCP. `tests/test_celery_topology.py` enforces both invariants and must stay in sync with `make worker` and docker-compose. Detail: backend-architecture § Celery topology.
+- Celery is six workers over six queues: `control` (default, orchestration and beat), separate `io` (threads) and `io_traces` (prefork) workers, and `batch`, `landing` and `interactive` (prefork). IO and trace workers consume only their own queue and disable prefetch so trace scoring cannot occupy preparation or serving slots. Workers are resource profiles, queues are fairness classes; only prefork enforces `time_limit`, so every time-limited task routes to `batch`, `landing`, `interactive` or the isolated `io_traces` worker. Live scoring uses durable, bounded per-project admission with fenced execution; evaluation generation also caps total admission across a project’s runs. Imports have dedicated landing capacity; live span and trajectory scoring and signals run on `io_traces`; evaluation generation and scoring run on `batch` with durable, bounded admission and project and run fairness. Workshop pipelines retain queue and execution timestamps in their run receipts; their waiting and occupied slots contribute to interactive capacity, with shared per-project admission. Source imports retain fenced attempts and explicit recovery through REST and MCP. `tests/test_celery_topology.py` enforces these invariants and must stay in sync with `make worker` and docker-compose. Detail: backend-architecture § Celery topology.
+
+- Landing submissions wait in `DatasetLandingWork` before bounded broker publication.
+  One import per project runs at a time; least-recent-project admission uses observed
+  worker capacity up to eight. Waiting does not consume an execution attempt or
+  expire unless a nonzero `DATASET_IMPORT_MAX_QUEUE_SECONDS` explicitly sets a limit.
+  Lost started workers are fenced and require explicit recovery. REST and MCP
+  expose the same admission state and timestamps. Landing scale-out counts useful
+  competing projects; raw queue age remains visible independently.
 
 - Most status transitions use `.filter().update()` — **no Django signals fire** and the in-memory object goes stale. Any side effect a transition needs is wired explicitly at the call site, on a freshly reloaded row. Preserve this pattern.
 
@@ -185,7 +193,9 @@ Each line is the invariant; the named skill section carries the mechanics.
 - Dataset storage bounds Parquet staging and DataFrame chunks by bytes and reads small row batches. It preserves mixed scalars and precision-sensitive integers as JSON;
   shared pandas readers must not coerce them again. MCP queries cap JSON output at
   32 KiB and return `query_result_too_large` without clipping values; a configurable
-  ten-second default execution deadline returns `query_timeout`. The CLI exports
+  ten-second default execution deadline returns `query_timeout`. Shared Redis admission
+  bounds MCP SQL to eight concurrent queries globally and two per project by default;
+  retryable capacity errors retain the exact cell and retry delay. The CLI exports
   retained original sources via `dataset export --source SHA256`, verifying bytes
   without overwrite or credential-forwarding redirects. Local uploads
   accept one file per transfer; serial attachments combine rows in new versions.

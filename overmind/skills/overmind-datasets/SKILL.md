@@ -79,7 +79,13 @@ Repeating the identical command resumes it, even after a lost publication reply.
 `--request-key` selects an explicit identity; changing its bound inputs conflicts.
 Inspect `get_job(kind=dataset_transfer)` for measured bytes and publication;
 `get_job(kind=dataset_run)` reports subsequent landing. A pending dispatch is not
-completed landing. For a JSON wrapper use `--json-rows-field FIELD` after inspecting
+completed landing. Dataset-run `progress.admission` and dataset-operation
+`landing_admission` show fair-queue waiting, admission, execution and terminal
+state with measured timestamps. A waiting import consumes no execution attempt;
+follow polling guidance rather than resubmitting. One project's imports execute
+serially so another project can use available workers. Failed or lost started
+attempts retain their source and require explicit recovery through
+`resume_dataset_import`; no automatic replay is implied. For a JSON wrapper use `--json-rows-field FIELD` after inspecting
 the file's structure. Original wrapper bytes remain retained; the selected field
 is recorded as extraction provenance.
 The CLI marks a saved upload state as `state_scope=at_publication`; it is not
@@ -90,6 +96,10 @@ Inspect with `inspect_dataset`, `query_dataset` and `explore_dataset`.
 `query_result_too_large`, select smaller columns, aggregate, or export the exact
 cell; values are not clipped. Mixed scalars and precision-sensitive integers
 are retained as JSON rather than coerced to strings or lossy floats.
+On `query_capacity_busy` or `query_capacity_unavailable`, wait at least the returned
+`retry_after_seconds` before retrying the same exact cell and SQL. Do not fan out
+retries; use a retained pipeline for bulk analysis. The interface resource reports
+global and per-project query budgets.
 On `query_timeout`, narrow the query or export the cell; reads have a configured
 deadline (default ten seconds). Download retained original bytes with
 `overmind dataset export DATASET --source SHA256 --output FILE --json`, using
@@ -283,3 +293,8 @@ packages omit Python bytecode caches; other unsupported files remain errors.
 ### Automatic script retention
 
 Retain the transformation with `save_dataset_pipeline(dataset=..., package=...)`; the dataset keeps its current script automatically. Never ask the user whether to keep or make it reusable. Submit corrected code against the same preparation; the canvas displays the current process. Retain scoped uncertainties and supporting evidence in the script and output. Keep unknown meaning unknown; successful execution and valid formatting do not establish semantic correctness.
+
+File transfer retries up to five transient chunk-transport interruptions with
+smaller chunks and bounded backoff, retaining the same transfer and byte offset.
+Confirmed network permission denial is never retried. If retries are exhausted,
+repeat the identical upload command; do not create another transfer key.
