@@ -14,7 +14,7 @@ from overbae.innermind import evidence
 from overbae.innermind.span_processor import span_processor_factory
 from overbae.models import Capability, EvalMatrix, Span
 from overbae.services.capabilities import identity
-from overbae.services.codebase.anchors import module_dotted_path
+from overbae.services.codebase.anchors import is_script_file, module_dotted_path
 
 DECORATORS = {
     "entry_point": '@overmind.entry_point(capability_id="{capability_id}")',
@@ -66,33 +66,55 @@ def target(qualname: str, file_ref: str) -> dict[str, str]:
     }
 
 
-def placements(capability: Capability) -> list[dict[str, Any]]:
+def _anchors(capability: Capability) -> list[dict[str, Any]]:
     card = (capability.improvement_metadata or {}).get("capability_card") or {}
+    return [a for a in card.get("anchors") or [] if isinstance(a, dict) and a.get("qualname")]
+
+
+def _is_script_anchor(anchor: dict[str, Any]) -> bool:
+    return is_script_file(str(anchor.get("file") or "").split("#", 1)[0])
+
+
+def placements(capability: Capability) -> list[dict[str, Any]]:
+    """Decorator placements for Python anchors. JavaScript/TypeScript has no SDK: its spans
+    arrive over OTLP, so its anchors carry no placement."""
     capability_id = str(capability.id)
     rows = []
-    for anchor in card.get("anchors") or []:
-        if not isinstance(anchor, dict) or not anchor.get("qualname"):
+    for anchor in _anchors(capability):
+        if _is_script_anchor(anchor):
             continue
         kind = anchor.get("kind") if anchor.get("kind") in DECORATORS else "function"
+        qualname = str(anchor["qualname"])
+        file_ref = str(anchor.get("file") or "")
+        placement = target(qualname, file_ref)
         rows.append(
             {
                 "capability": capability.name,
                 "capability_id": capability_id,
                 "kind": kind,
-                "target": target(str(anchor["qualname"]), str(anchor.get("file") or "")),
+                "target": placement,
                 "required_decorator": DECORATORS[kind].format(capability_id=capability_id),
             }
         )
     return sorted(rows, key=lambda row: (row["kind"] != "entry_point", row["target"]["file"]))
 
 
+def _capabilities(project, capability: Capability | None) -> list[Capability]:
+    if capability is not None:
+        return [capability]
+    return list(Capability.objects.filter(project=project).current().order_by("name"))
+
+
 def plan(project, capability: Capability | None = None) -> list[dict[str, Any]]:
-    capabilities = (
-        [capability]
-        if capability is not None
-        else list(Capability.objects.filter(project=project).current().order_by("name"))
+    return [row for cap in _capabilities(project, capability) for row in placements(cap)]
+
+
+def has_script_anchors(project, capability: Capability | None = None) -> bool:
+    return any(
+        _is_script_anchor(anchor)
+        for cap in _capabilities(project, capability)
+        for anchor in _anchors(cap)
     )
-    return [row for cap in capabilities for row in placements(cap)]
 
 
 def build_spans(project_id, payload: list[dict]) -> tuple[list[Span], list[dict]]:

@@ -4,27 +4,18 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
+from overmind import typescript_ast
+from overmind.languages import PYTHON, TYPESCRIPT, detect_language, language_of_path, normalise_language, source_files
 from overmind.repository_snapshot import begin_repository_scan
 
 logger = logging.getLogger(__name__)
-
-_SKIP_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".tox",
-    "site-packages",
-    "dist",
-    "build",
-}
 
 
 @dataclass
@@ -36,10 +27,10 @@ class Chassis:
 
 def module_dotted_path(rel_path: str) -> str:
     parts = [p for p in rel_path.split("/") if p]
-    if parts and parts[-1].endswith(".py"):
-        parts[-1] = parts[-1][:-3]
-    if parts and parts[-1] == "__init__":
-        parts = parts[:-1]
+    if parts and (language := language_of_path(parts[-1])):
+        parts[-1] = os.path.splitext(parts[-1])[0]
+        if language == PYTHON and parts[-1] == "__init__":
+            parts = parts[:-1]
     return ".".join(parts)
 
 
@@ -77,19 +68,26 @@ def _walk_functions(tree: ast.Module, rel_path: str, module: str, chassis: Chass
     visit(tree, "")
 
 
-def extract_chassis(clone_dir: str) -> Chassis:
+def _scan_language(repo_root: str | Path, language: str | None) -> str:
+    return normalise_language(language) or detect_language(repo_root)
+
+
+def extract_chassis(clone_dir: str, language: str | None = None) -> Chassis:
+    """``language`` is ``python`` or ``typescript`` (JavaScript included); unset, the repository's
+    majority language."""
     chassis = Chassis()
-    root = Path(clone_dir)
-    for file in root.rglob("*.py"):
-        rel_parts = file.relative_to(root).parts
-        if any(part in _SKIP_DIRS for part in rel_parts):
-            continue
-        rel_path = "/".join(rel_parts)
+    language = _scan_language(clone_dir, language)
+    for file, rel_path in source_files(clone_dir, language):
+        module = module_dotted_path(rel_path)
         try:
-            tree = ast.parse(file.read_text(encoding="utf-8", errors="ignore"))
+            if language == TYPESCRIPT:
+                if typescript_ast.is_bundle(rel_path) or file.stat().st_size > typescript_ast.MAX_SOURCE_BYTES:
+                    continue
+                typescript_ast.add_functions(file.read_bytes(), rel_path, module, chassis)
+            else:
+                _walk_functions(ast.parse(file.read_text(encoding="utf-8", errors="ignore")), rel_path, module, chassis)
         except (OSError, SyntaxError):
             continue
-        _walk_functions(tree, rel_path, module_dotted_path(rel_path), chassis)
     return chassis
 
 
@@ -170,10 +168,10 @@ def verify_trajectory_claims(card: dict[str, Any], chassis: Chassis) -> None:
         entry["verified"] = all(a.rsplit(".", 1)[-1] in reachable for a in anchors)
 
 
-def stamp_capability_cards(data: dict[str, Any], repo_root: str | Path) -> None:
+def stamp_capability_cards(data: dict[str, Any], repo_root: str | Path, language: str | None = None) -> None:
     """Best-effort: an unextractable repo leaves every entry unstamped."""
     try:
-        chassis = extract_chassis(str(repo_root))
+        chassis = extract_chassis(str(repo_root), language or detect_language(repo_root, data))
     except Exception:
         logger.warning("chassis extraction failed; trajectory entries stay unverified")
         return
@@ -242,19 +240,15 @@ def declared_expectations(repo_root: str | Path) -> dict[str, list[dict[str, str
     """Capability id -> the ``expectations=`` its decorators declare, each with the span it
     is declared on. A decorator without ``capability_id`` belongs to every entry point
     whose call graph reaches it."""
-    chassis = extract_chassis(str(repo_root))
+    chassis = extract_chassis(str(repo_root), PYTHON)
     declared: list[_Declared] = []
-    root = Path(repo_root)
-    for file in root.rglob("*.py"):
-        rel_parts = file.relative_to(root).parts
-        if any(part in _SKIP_DIRS for part in rel_parts):
-            continue
+    for file, rel_path in source_files(repo_root, PYTHON):
         try:
             tree = ast.parse(file.read_text(encoding="utf-8", errors="ignore"))
         except (OSError, SyntaxError):
             continue
 
-        module_prefix = module_dotted_path(file.relative_to(root).as_posix())
+        module_prefix = module_dotted_path(rel_path)
 
         def visit(node: ast.AST, prefix: str, module: str = module_prefix) -> None:
             for child in ast.iter_child_nodes(node):
@@ -288,7 +282,13 @@ def declared_expectations(repo_root: str | Path) -> dict[str, list[dict[str, str
 
 def chassis(
     root: Annotated[Path, typer.Option(help="Repository root to parse")] = Path("."),
+    language: Annotated[
+        str | None,
+        typer.Option(help="python, typescript (JavaScript included); default: the repository's majority language"),
+    ] = None,
 ) -> None:
     """Print the deterministic AST chassis digest the local scan treats as ground truth."""
+    if language is not None and normalise_language(language) is None:
+        raise typer.BadParameter(f"unknown language {language!r}; use python or typescript", param_hint="--language")
     begin_repository_scan(root)
-    typer.echo(chassis_digest(extract_chassis(str(root.resolve()))))
+    typer.echo(chassis_digest(extract_chassis(str(root.resolve()), language)))

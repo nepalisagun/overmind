@@ -33,6 +33,9 @@ the server's summary/page fields; do not sum a partial page as a project total.
 
 ## Get and apply a plan
 
+A JavaScript/TypeScript application has no SDK and no placements: it adds Overmind's OTLP
+endpoint to its existing OpenTelemetry setup, see [javascript.md](javascript.md).
+
 Call `get_instrumentation_plan` with no capability for project-wide work, or
 with a capability for a scoped change. Each placement names a `target`
 (`file`, `qualname`), its `kind` and the exact `required_decorator`; see

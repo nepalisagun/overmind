@@ -130,7 +130,9 @@ The catalog exposes deliberate lifecycle operations including `cancel_dataset`, 
 1. **Planned instrumentation.** Call `get_instrumentation_plan` with no
    capability for project-wide work, or with a capability for scoped work, and
    treat each placement as one edit. If the result has `human_action` or
-   no placements, report its instruction and stop this attempt. Apply each
+   no placements, report its instruction and stop this attempt, except for a
+   JavaScript/TypeScript capability, whose instruction is the OTLP export in
+   [references/javascript.md](references/javascript.md). Apply each
    `required_decorator` verbatim at `target.qualname` in `target.file`, keeping
    `capability_id` exact. When coding subagents are available and permitted,
    group placements by file so one worker owns each file. See
@@ -153,6 +155,10 @@ The catalog exposes deliberate lifecycle operations including `cancel_dataset`, 
 
 ## Use-case references
 
+- JavaScript/TypeScript repositories (isolated tooling runner, TypeScript chassis
+  qualnames, OpenTelemetry export to the OTLP endpoint instead of an SDK): read
+  [references/javascript.md](references/javascript.md) before local setup or
+  instrumentation, and apply it on top of the Python-worded references below.
 - Local setup (`overmind chassis` → scan repo → capability cards / trajectory
   maps → `overmind.toml` → `overmind sync` → decorators with span expectations):
   [references/setup.md](references/setup.md)
