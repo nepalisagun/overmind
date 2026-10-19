@@ -27,7 +27,7 @@ _REGISTRY_INSTRUCTION = (
 _OTLP_INSTRUCTION = (
     "There is no JavaScript/TypeScript SDK. Add Overmind's OTLP endpoint to the application's "
     "existing OpenTelemetry exporters and stamp overmind.capability.id on the resource; "
-    "follow references/javascript.md."
+    "follow the overmind skill's references/javascript.md."
 )
 
 
