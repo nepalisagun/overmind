@@ -3,7 +3,7 @@ import { Navigate } from "@tanstack/react-router";
 import { QuickstartEmbed } from "@/components/quickstart/quickstart-embed";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icons";
-import { Skeleton } from "@/components/ui/skeleton";
+import { LoadingState } from "@/components/ui/spinner";
 import { useProjectsList } from "@/hooks/use-projects";
 
 export function NoProjectsEmptyState() {
@@ -21,13 +21,7 @@ export function ProjectRequiredEmptyState({
   const projects = data?.projects ?? [];
 
   if (isLoading) {
-    return (
-      <div className="flex min-h-[400px] flex-1 flex-col items-center justify-center gap-3">
-        <Skeleton className="h-12 w-12 rounded-sm" />
-        <Skeleton className="h-8 w-64" />
-        <Skeleton className="h-4 w-80" />
-      </div>
-    );
+    return <LoadingState fullPage label="Loading projects" />;
   }
 
   if (projects.length === 0) {
