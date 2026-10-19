@@ -177,6 +177,28 @@ def test_an_import_that_keeps_losing_its_worker_is_blocked_with_its_source(impor
     assert files.upload_data_path(imported_source[1]).exists()
 
 
+def test_stale_import_cannot_write_or_publish_landing_progress(imported_source, monkeypatch):
+    from overbae.services.datasets import imports
+
+    dataset, run = create_import(imported_source)
+    assert imports.claim(run.pk) is not None
+    stale = DatasetImport.objects.get(pk=run.pk)
+    original_spec = dataset.source_spec
+    DatasetImport.objects.filter(pk=run.pk).update(owner=uuid.uuid4())
+    published = []
+    monkeypatch.setattr(imports.events, "publish", lambda *args: published.append(args))
+    imports._read_parts(stale, [dataset])
+    dataset.refresh_from_db()
+    assert dataset.source_spec == original_spec
+    assert published == []
+
+    run.refresh_from_db()
+    imports._read_parts(run, [dataset])
+    dataset.refresh_from_db()
+    assert dataset.source_spec["landing_progress"]["completed"] == 1
+    assert published
+
+
 def test_a_live_import_renews_its_lease_only_up_to_the_execution_limit(imported_source):
     from overbae.services.datasets import imports
 
@@ -530,3 +552,23 @@ def test_recovery_repairs_a_missing_execution_finish_after_actual_publication(im
     assert work.state == "finished" and not work.error
     assert dataset.state == "idle" and dataset.operation["state"] == "completed"
     assert dataset.cells.count() == 1 and dataset.source.rows == 2
+
+
+def test_rolling_deploy_accepts_dataset_inserts_without_ocr_language_field(imported_source):
+    from django.db import connection
+
+    dataset, _ = create_import(imported_source)
+    legacy_id = uuid.uuid4()
+    columns = [
+        field.column
+        for field in Dataset._meta.local_concrete_fields
+        if field.name not in {"id", "ocr_languages"}
+    ]
+    names = ", ".join(connection.ops.quote_name(name) for name in columns)
+    table = connection.ops.quote_name(Dataset._meta.db_table)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'INSERT INTO {table} ("id", {names}) SELECT %s, {names} FROM {table} WHERE "id" = %s',
+            [legacy_id, dataset.pk],
+        )
+    assert Dataset.objects.get(pk=legacy_id).ocr_languages == []
