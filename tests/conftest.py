@@ -22,7 +22,10 @@ from fakes.stripe import StripeAPI
 def pytest_ignore_collect(collection_path, config):
     if collection_path.name != "journeys" or collection_path.parent != Path(__file__).parent:
         return None
-    # Journeys share one broker and Redis DB, so xdist workers would run each other's tasks.
+    # `make test` is xdist over the whole suite and must not collect journeys.
+    # `make test-journeys` sets OVERMIND_JOURNEY_XDIST and gives each worker its own Redis DB.
+    if os.environ.get("OVERMIND_JOURNEY_XDIST"):
+        return None if os.environ.get("TEST_REDIS_URL") else True
     parallel = hasattr(config, "workerinput") or config.getoption("numprocesses", default=None)
     return True if parallel or not os.environ.get("TEST_REDIS_URL") else None
 
