@@ -5,6 +5,12 @@ description: End-to-end workflow for adding or changing Overmind MCP tools, reso
 
 # Adding or changing MCP
 
+Contract 7.12.0 adds `create_api_key`. It accepts the Console dialog's name,
+description, expiry (30, 90, 180 or 365 days, or 0 for never) and project or
+account scope. The plaintext is returned only in that response. A project
+connection can mint a key only for its own project. An account connection can
+mint either scope. Guests cannot create keys. The secret is not readable again.
+
 Contract 7.11.0 removes automatic OCR language detection. `ocr_languages=[]`
 uses English; explicit language choices remain MCP-ready through `update_dataset`.
 Supported Tesseract codes are discoverable at `overmind://dataset-upload`. Set
@@ -256,7 +262,7 @@ Readiness/preparation/estimate/launch accept the same strict monitoring policy;
 provider capabilities and unmeasured check costs remain explicit. Cancellation
 records intent first and preserves durable evidence. Evidence responses have a
 128 KiB lossless bound and return an error rather than clipping values. The current
-tool-manifest budget is 91 KiB. Refresh the connected catalogue after deployment.
+tool-manifest budget is 92 KiB. Refresh the connected catalogue after deployment.
 Native per-question metrics and assessments have `collections` descriptors in
 check/checkpoint overviews. Pass a descriptor's `field` JSON Pointer with
 `offset`/`limit` for exact retained object entries or array items. Append escaped
