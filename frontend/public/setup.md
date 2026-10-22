@@ -52,15 +52,16 @@ Now we can move onto getting started with overmind.
 Overmind can be used in 2 ways, onboarding from a codebase or onboarding using a dataset,
 ASK the USER which one they want to continue with, if it hasn't already been configured.
 
-> Use Overmind MCP to issue an OVERMIND_API_KEY
+> Connect the project once: call the MCP tool `create_api_key` without `project_id`, then run
+> `OVERMIND_API_KEY=<key> python -m overmind sync`. Sync creates the project and saves its key;
+> later syncs need no key. Never print or store the account key. Skip this if `overmind.toml`
+> has a `project-id` and `.overmind/credentials.toml` exists.
 
 ## Onboarding using codebase or repository
 
 Overmind has skills to scan through a respository with agentic codebase written either in Python or Typescript/Javascript
 
 > If codebase is any other Language, avoid runnning `overmind chassis` command and just use the coding agent's output file and use it to run `overmind sync`
-
-See (overmind://prompts/onboaring-using-codebase) Prompt on the Overmind MCP
 
 - Use the `/overmind setup` skill to start scanning the codebase.
 
