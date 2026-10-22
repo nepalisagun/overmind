@@ -162,8 +162,10 @@ Training handoff separates selection construction, acknowledged selection-file u
 provider artifact verification, indexing, row selection and publication. Only successful
 Modal batch completion increments acknowledged bytes/files; live network-byte progress
 is unavailable. The pinned worker publishes bounded transfer measurements to the run's
-`transfer-progress.json`; the existing 15-second reconciler collects them even while the
-submission task is active. Console and MCP read persisted, attempt-fenced diagnostics
+`transfer-progress.json` and commits that volume when a stage finishes. Modal's
+background commit publishes step files; a timer commit is not used, and at most
+five launches upload at once. The existing 15-second reconciler collects transfer
+facts even while the submission task is active. Console and MCP read persisted, attempt-fenced diagnostics
 and operational events, never invoking a worker to read status. Stage start, source
 observation and last forward progress remain separate; absent measurements show no
 percentage. Worker instrumentation requires deployment of a new immutable release and
@@ -379,9 +381,10 @@ The Console projects selected evaluations into waiting rows immediately and repl
 each by kind when its run arrives. Loss-curve polling continues after deployment while
 evaluations remain pending. `services.deployment` persists each deployment's stage,
 remote call handle, generation, retry budget, deadline, and evaluation waiters.
-The single 15-second deployment controller covers training outputs and baselines;
-short IO tasks claim a row for 45 seconds, spawn or observe one remote call, then exit.
-Worker death reconnects to the saved call rather than restarting GPU work. Each
+The single 15-second deployment controller covers training outputs and baselines.
+A finished stage starts the next remote call before the claim is released. The S3
+checkpoint archive is spawned beside that sequence and does not gate readiness.
+Short IO tasks claim a row for 45 seconds. Worker death reconnects to the saved call rather than restarting GPU work. Each
 attempt has a four-hour deadline and at most three confirmed-failure attempts with
 30/60-second backoff. Transport errors retain the handle. Submission without a saved
 acknowledgement fails closed; never launch another call until remote state is resolved.
