@@ -6,6 +6,8 @@ nothing here may wait for a sibling or the trace root.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import zlib
 from datetime import UTC, datetime
@@ -15,6 +17,7 @@ from django.db import transaction
 from django.http import HttpResponseBase, JsonResponse
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
+from google.protobuf import json_format
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans
 from rest_framework.decorators import api_view, permission_classes
@@ -812,6 +815,35 @@ class _MalformedBodyError(Exception):
     pass
 
 
+def _hex_id_to_base64(holder: dict, *keys: str) -> None:
+    for key in keys:
+        if isinstance(holder.get(key), str):
+            holder[key] = base64.b64encode(bytes.fromhex(holder[key])).decode()
+
+
+def _hex_ids_to_base64(export: dict) -> dict:
+    """OTLP/JSON writes trace and span ids as hex; proto3 JSON reads bytes as base64.
+    Only Span and Link ids convert, so unknown fields stay ignorable."""
+    for resource_spans in export.get("resourceSpans") or []:
+        for scope_spans in resource_spans.get("scopeSpans") or []:
+            for span in scope_spans.get("spans") or []:
+                _hex_id_to_base64(span, "traceId", "spanId", "parentSpanId")
+                for link in span.get("links") or []:
+                    _hex_id_to_base64(link, "traceId", "spanId")
+    return export
+
+
+def _parse_export(request, body: bytes) -> trace_service_pb2.ExportTraceServiceRequest:
+    export_request = trace_service_pb2.ExportTraceServiceRequest()
+    if request.content_type.split(";", 1)[0].strip().lower() == "application/json":
+        json_format.ParseDict(
+            _hex_ids_to_base64(json.loads(body)), export_request, ignore_unknown_fields=True
+        )
+    else:
+        export_request.ParseFromString(body)
+    return export_request
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 @extend_schema(exclude=True)
@@ -822,11 +854,16 @@ def otlp_traces(request):
         return JsonResponse({"error": str(exc)}, status=400)
 
     try:
-        export_request = trace_service_pb2.ExportTraceServiceRequest()
-        export_request.ParseFromString(body)
+        export_request = _parse_export(request, body)
     except Exception as exc:
-        logger.error("Failed to parse OTLP protobuf: %s", exc)
-        return JsonResponse({"error": f"Invalid protobuf: {exc}"}, status=400)
+        # The parser's message can quote the rejected payload, so log only its type.
+        logger.error(
+            "Failed to parse OTLP export: %s (%s, %d bytes)",
+            type(exc).__name__,
+            request.content_type,
+            len(body),
+        )
+        return JsonResponse({"error": "Invalid OTLP export."}, status=400)
 
     all_spans: list[Span] = []
     for resource_span in export_request.resource_spans:

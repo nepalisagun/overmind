@@ -219,19 +219,22 @@ function ToolCallBadge() {
   );
 }
 
+// OpenAI wire shape, or the flat {name, arguments} the backend normalizes to.
 function ToolCallBlock({ tc }: { tc: ToolCallItem }) {
+  const args = tc.function?.arguments ?? tc.arguments;
   const prettyArgs = useMemo(() => {
-    if (!tc.function?.arguments) return "";
+    if (args === undefined || args === null || args === "") return "";
+    if (typeof args !== "string") return JSON.stringify(args, null, 2);
     try {
-      return JSON.stringify(JSON.parse(tc.function.arguments), null, 2);
+      return JSON.stringify(JSON.parse(args), null, 2);
     } catch {
-      return tc.function.arguments;
+      return args;
     }
-  }, [tc.function?.arguments]);
+  }, [args]);
 
   return (
     <div className="mt-1 rounded-sm border border-border/60 bg-wash-raised px-2 py-1.5">
-      <span className="font-semibold text-cat-2">{tc.function?.name ?? "tool"}</span>
+      <span className="font-semibold text-cat-2">{tc.function?.name ?? tc.name ?? "tool"}</span>
       {prettyArgs && (
         <pre className="mt-1 whitespace-pre-wrap break-words text-muted-foreground">
           {prettyArgs}
@@ -350,10 +353,44 @@ const ROLE_LABELS: Record<string, string> = {
   user: "User",
 };
 
+function blockText(block: unknown, role: string | undefined): string | null {
+  if (typeof block === "string") return block;
+  const { content, response, text, type } = (block ?? {}) as Record<string, unknown>;
+  if (type === "text" || type === "reasoning") {
+    const value = text ?? content;
+    if (typeof value === "string") return value;
+  }
+  if (type === "tool_call") return null;
+  // Server tools (Claude web search) return results inside the assistant message;
+  // the tool's own span shows them. Client tool results arrive in user or tool messages.
+  if (type === "tool_call_response") {
+    if (role === "assistant") return null;
+    return typeof response === "string" ? response : JSON.stringify(response, null, 2);
+  }
+  return JSON.stringify(block, null, 2);
+}
+
+// Chat APIs send `content` as a string or typed blocks (OpenAI, Anthropic); OTel GenAI
+// messages send `parts`. Text reads as text, tool calls as tool-call rows, the rest as JSON.
+function contentText(content: unknown, role: string | undefined): string {
+  if (content === null || content === undefined) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return JSON.stringify(content, null, 2);
+  return content
+    .map((block) => blockText(block, role))
+    .filter((value) => value !== null)
+    .join("\n");
+}
+
 function MessageRow({ msg }: { msg: TranscriptMessage }) {
   const roleLabel = ROLE_LABELS[msg.role ?? ""] ?? msg.role ?? "Message";
-  const hasToolCalls = (msg.tool_calls?.length ?? 0) > 0;
-  const text = msg.content ?? "";
+  const toolCalls =
+    msg.tool_calls ??
+    ((msg.parts ?? []).filter(
+      (part) => (part as { type?: unknown })?.type === "tool_call"
+    ) as ToolCallItem[]);
+  const hasToolCalls = toolCalls.length > 0;
+  const text = contentText(msg.content ?? msg.parts, msg.role);
   const isTool = msg.role === "tool";
   const canMarkdown =
     !isTool && typeof text === "string" && text.length > 0 && isLikelyMarkdown(text);
@@ -388,7 +425,7 @@ function MessageRow({ msg }: { msg: TranscriptMessage }) {
           )}
         </div>
       )}
-      {msg.tool_calls?.map((tc, tcIdx) => (
+      {toolCalls.map((tc, tcIdx) => (
         <ToolCallBlock key={tcIdx} tc={tc} />
       ))}
     </div>

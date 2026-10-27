@@ -57,6 +57,52 @@ describe("Trace inspector", () => {
     expect(screen.getAllByText("Not captured")).toHaveLength(1);
     expect(screen.getByText(value === "" ? '""' : JSON.stringify(value))).toBeTruthy();
   });
+  it("shows content-block messages as text, with non-text blocks as JSON", () => {
+    const request = {
+      messages: [
+        {
+          content: [
+            { text: "Who won?", type: "text" },
+            { content: "42", tool_use_id: "t1", type: "tool_result" },
+          ],
+          role: "user",
+        },
+      ],
+    };
+    render(
+      <Fixture>
+        <SpanDetailView span={{ ...root, inputs: JSON.stringify(request), outputs: null }} />
+      </Fixture>
+    );
+    expect(screen.getByText(/Who won\?/)).toBeTruthy();
+    expect(screen.getByText(/"tool_result"/)).toBeTruthy();
+  });
+  it("shows OTel GenAI messages: text, tool calls and results, not server-tool results", () => {
+    const answer = [
+      {
+        parts: [
+          { arguments: { query: "who won" }, id: "t1", name: "web_search", type: "tool_call" },
+          { id: "t1", response: [{ title: "Search result" }], type: "tool_call_response" },
+          { content: "Team A won.", type: "text" },
+        ],
+        role: "assistant",
+      },
+    ];
+    const toolResult = [
+      { parts: [{ id: "t2", response: "16C, cloudy", type: "tool_call_response" }], role: "user" },
+    ];
+    render(
+      <Fixture>
+        <SpanDetailView
+          span={{ ...root, inputs: JSON.stringify(toolResult), outputs: JSON.stringify(answer) }}
+        />
+      </Fixture>
+    );
+    expect(screen.getByText("16C, cloudy")).toBeTruthy();
+    expect(screen.getByText("Team A won.")).toBeTruthy();
+    expect(screen.getByText("web_search")).toBeTruthy();
+    expect(screen.queryByText(/Search result/)).toBeNull();
+  });
   it("reveals matching descendants without changing the saved collapsed state", () => {
     const { rerender } = render(
       <Fixture>

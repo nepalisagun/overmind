@@ -18,6 +18,7 @@ from overbae.api.native_evaluation import NativeEvaluationSerializer
 from overbae.api.scoping import project_ids_for
 from overbae.core.errors import InputValidationError
 from overbae.core.model_registry import CATALOG, judge_picker_models
+from overbae.innermind import evidence
 from overbae.models import (
     APIToken,
     BillingTelemetry,
@@ -761,6 +762,16 @@ class SpanSerializer(serializers.ModelSerializer):
     the per-trace list) and as the per-row representation for any span query."""
 
     is_root = serializers.BooleanField(read_only=True)
+    input_attribute = serializers.SerializerMethodField()
+    output_attribute = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_input_attribute(self, obj):
+        return evidence.input_attribute(obj)
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_output_attribute(self, obj):
+        return evidence.output_attribute(obj)
 
     class Meta:
         model = Span
@@ -784,6 +795,8 @@ class SpanSerializer(serializers.ModelSerializer):
             "scope_name",
             "scope_version",
             "attributes",
+            "input_attribute",
+            "output_attribute",
             "events",
             "links",
             "capability",
