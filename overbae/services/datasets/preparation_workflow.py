@@ -1,3 +1,6 @@
+import logging
+from datetime import timedelta
+
 from django.db import transaction
 from django.utils import timezone
 
@@ -12,6 +15,9 @@ from overbae.models import (
 )
 from overbae.services import activity
 from overbae.services.datasets.lifecycle import DatasetError
+
+IDLE_LIMIT = timedelta(hours=24)
+logger = logging.getLogger(__name__)
 
 
 def describe(preparation):
@@ -132,4 +138,45 @@ def update(dataset, preparation_id, state, outputs):
     Activity.objects.filter(key=f"preparation:{preparation.pk}").update(
         status=status, action=action, updated_at=timezone.now()
     )
+    activity.changed(dataset.project_id)
     return preparation
+
+
+def end(dataset):
+    preparation = DatasetPreparation.objects.filter(
+        dataset=dataset, state__in=["preparing", "paused"]
+    ).first()
+    if not preparation:
+        raise DatasetError("This dataset has no open preparation.", code="preparation_not_found")
+    return update(dataset, preparation.pk, "cancelled", [])
+
+
+def _idle(preparation_ids, cutoff):
+    active = Activity.objects.filter(
+        key__in=[f"preparation:{pk}" for pk in preparation_ids], updated_at__gte=cutoff
+    ).values_list("task_id", flat=True)
+    return DatasetPreparation.objects.filter(
+        pk__in=preparation_ids, state__in=["preparing", "paused"], updated_at__lt=cutoff
+    ).exclude(pk__in=[value for value in active if value])
+
+
+def expire():
+    cutoff = timezone.now() - IDLE_LIMIT
+    candidates = list(
+        DatasetPreparation.objects.filter(
+            state__in=["preparing", "paused"], updated_at__lt=cutoff
+        ).values_list("pk", "dataset_id")
+    )
+    expired = 0
+    for preparation_id, dataset_id in candidates:
+        try:
+            with transaction.atomic():
+                # Same lock order as start() and update(); an agent update since the scan wins.
+                dataset = Dataset.objects.select_for_update().filter(pk=dataset_id).first()
+                if dataset is None or not _idle([preparation_id], cutoff).exists():
+                    continue
+                update(dataset, preparation_id, "cancelled", [])
+                expired += 1
+        except Exception:
+            logger.exception("expiring dataset preparation %s failed", preparation_id)
+    return expired

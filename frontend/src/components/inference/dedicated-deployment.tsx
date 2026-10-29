@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Dialog,
   DialogBody,
@@ -84,7 +85,9 @@ function speed(gpu: DedicatedGpu, decision: boolean): string {
 }
 
 function price(credits: string | null | undefined): string {
-  return credits == null ? "Price unavailable" : `${credits} credits/hour per GPU`;
+  return credits == null
+    ? "Price unavailable"
+    : `${Number(credits).toLocaleString(undefined, { maximumFractionDigits: 2 })} credits/hour per GPU`;
 }
 
 function digits(raw: string): string {
@@ -129,12 +132,14 @@ export function DedicatedDeploymentSection({
 }) {
   const [open, setOpen] = useState(false);
   const [snippetOpen, setSnippetOpen] = useState(false);
+  const [confirmStart, setConfirmStart] = useState(false);
   const start = useStartDedicatedMutation(model.id);
   const stop = useStopDedicatedMutation(model.id);
   const ready = model.status === "ready";
   const deployment = useDedicatedDeploymentQuery(model.id, ready);
-  const gpus = useDedicatedGpusQuery(model.id, ready && open);
+  const gpus = useDedicatedGpusQuery(model.id, ready && (open || confirmStart));
   const row = deployment.data ?? null;
+  const startRate = gpus.data?.find((gpu) => gpu.gpuType === row?.gpuType)?.creditsPerGpuHour;
   const active = row != null && ACTIVE.has(row.status ?? "");
   const stopping = row?.status === "shutting_down";
   const pending = start.isPending || stop.isPending;
@@ -145,17 +150,21 @@ export function DedicatedDeploymentSection({
         onError: (error) => notify.error(error, "Couldn't stop the deployment"),
       });
     } else {
-      start.mutate(
-        {
-          gpuType: row.gpuType,
-          idleShutdownSeconds: row.idleShutdownSeconds ?? 900,
-          maxReplicas: row.maxReplicas ?? 1,
-          minReplicas: row.scaleToZero ? 0 : Math.max(1, row.minReplicas ?? 1),
-          scaleToZero: row.scaleToZero ?? false,
-        },
-        { onError: (error) => notify.error(error, "Couldn't start the deployment") }
-      );
+      setConfirmStart(true);
     }
+  };
+  const startDeployment = () => {
+    if (!row) return;
+    start.mutate(
+      {
+        gpuType: row.gpuType,
+        idleShutdownSeconds: row.idleShutdownSeconds ?? 900,
+        maxReplicas: row.maxReplicas ?? 1,
+        minReplicas: row.scaleToZero ? 0 : Math.max(1, row.minReplicas ?? 1),
+        scaleToZero: row.scaleToZero ?? false,
+      },
+      { onError: (error) => notify.error(error, "Couldn't start the deployment") }
+    );
   };
   if (!ready) return null;
   return (
@@ -279,6 +288,25 @@ export function DedicatedDeploymentSection({
         </DialogContent>
       </Dialog>
       {row ? (
+        <ConfirmDialog
+          confirmDisabled={startRate == null}
+          confirmLabel="Start"
+          description={
+            gpus.isLoading
+              ? `${row.gpuType} · Loading the current rate`
+              : startRate == null
+                ? `${row.gpuType} · The current rate is unavailable, so the endpoint cannot start.`
+                : `${row.gpuType} · ${price(startRate)} while replicas run.`
+          }
+          error={gpus.error}
+          isPending={gpus.isLoading}
+          onConfirm={startDeployment}
+          onOpenChange={setConfirmStart}
+          open={confirmStart}
+          title="Start dedicated endpoint"
+        />
+      ) : null}
+      {row ? (
         <ApiSnippetDialog
           capabilityId={null}
           decisionDeploymentId={model.inferenceContract === "decision" ? model.id : undefined}
@@ -301,13 +329,13 @@ function DeploymentStatus({ row }: { row: DedicatedDeployment }) {
           ["GPU", row.gpuType],
           [
             "Replicas",
-            `${row.runningReplicas ?? "—"} running · ${row.minReplicas}–${row.maxReplicas} configured`,
+            `${row.runningReplicas ?? "—"} running · ${row.minReplicas ?? "—"}–${row.maxReplicas ?? "—"} configured`,
           ],
           [
             "Idle timeout",
-            `${row.idleShutdownSeconds}s${row.scaleToZero ? " · scales to zero" : ""}`,
+            `${row.idleShutdownSeconds == null ? "—" : `${row.idleShutdownSeconds}s`}${row.scaleToZero ? " · scales to zero" : ""}`,
           ],
-          ["Rate per GPU", `${row.creditsPerGpuHour} credits/hour`],
+          ["Rate", price(row.creditsPerGpuHour)],
         ].map(([label, value]) => (
           <div className="space-y-1" key={label}>
             <dt className="text-xs text-muted-foreground">{label}</dt>

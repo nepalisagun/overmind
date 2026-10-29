@@ -187,8 +187,6 @@ def publish(dataset, prepared, *, user=None):
         **prepared.dataset_fields, updated_at=timezone.now()
     )
     dataset.refresh_from_db()
-
-    source_ready(dataset, prepared.cell_id, user)
     return dataset
 
 
@@ -203,7 +201,11 @@ def commit(dataset, landing, *, user=None, state=Dataset.State.IDLE, infer_capab
             state=state,
             infer_capability=infer_capability,
         )
-        return publish(dataset, prepared, user=user)
+        with transaction.atomic():
+            dataset = publish(dataset, prepared, user=user)
+            if not {"derived_from", "partition_plan"} & landing.spec.keys():
+                source_ready(dataset, prepared.cell_id, user)
+    return dataset
 
 
 def read_file(path: Path, **options) -> Landing:
