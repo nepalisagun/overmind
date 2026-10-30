@@ -1022,6 +1022,9 @@ they name a symbol or quote a wire value.
 
 ## Don't
 
+- Add floating or inset decorative dividers between content sections. Use spacing
+  and aligned labels. Borders belong to container edges, table rows or data-tree
+  guides, not freestanding rules inside padded content.
 - Write a hex, `hsl()`, `rgb()` or a raw Tailwind palette class
   (`bg-blue-500`, `text-zinc-400`) anywhere in app code.
 - Use the brand copper outside `overmind-eye-copper.svg`. Orange in the UI

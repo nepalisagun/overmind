@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { SpanRow } from "@/hooks/use-traces";
@@ -16,9 +16,11 @@ const root: SpanRow = {
   evalMetrics: {},
   evalScore: null,
   events: [],
+  inputAttribute: null,
   inputs: null,
   model: null,
   name: "Agent",
+  outputAttribute: null,
   outputs: null,
   parentSpanId: null,
   policyOutcome: null,
@@ -55,7 +57,38 @@ describe("Trace inspector", () => {
       </Fixture>
     );
     expect(screen.getAllByText("Not captured")).toHaveLength(1);
-    expect(screen.getByText(value === "" ? '""' : JSON.stringify(value))).toBeTruthy();
+    const input = screen.getByRole("button", { name: "Collapse Input" }).closest("section");
+    expect(within(input!).getByText(value === "" ? '""' : JSON.stringify(value))).toBeTruthy();
+  });
+  it("lists payload attributes that Preview does not render as input or output", () => {
+    render(
+      <Fixture>
+        <SpanDetailView
+          span={{
+            ...root,
+            inputAttribute: "overmind.input",
+            inputs: "Rendered input",
+            spanAttributes: {
+              "gen_ai.input.messages": "Unrendered messages",
+              "overmind.input": "Rendered input",
+            },
+          }}
+        />
+      </Fixture>
+    );
+    expect(screen.getByText("gen_ai.input.messages")).toBeTruthy();
+    expect(screen.queryByText("overmind.input")).toBeNull();
+  });
+  it("renders events whose timestamp is not a valid time", () => {
+    render(
+      <Fixture>
+        <SpanDetailView
+          span={{ ...root, events: [{ name: "provider.retry", timeUnixNano: Number.MAX_VALUE }] }}
+        />
+      </Fixture>
+    );
+    expect(screen.getByText("provider.retry")).toBeTruthy();
+    expect(screen.queryByText("Time")).toBeNull();
   });
   it("shows content-block messages as text, with non-text blocks as JSON", () => {
     const request = {
