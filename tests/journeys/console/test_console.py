@@ -3,11 +3,13 @@ import json
 import uuid
 from datetime import timedelta
 
+import pytest
 from django.utils import timezone
 
 from modal_shared.training_monitoring import fingerprint
 from overbae.models import (
     Activity,
+    BillingTelemetry,
     Cell,
     DataPartitionMember,
     DataPartitionPlan,
@@ -22,13 +24,413 @@ from overbae.models import (
     FinetuningJob,
     NativeEvaluationPlan,
     OperationalRun,
+    Subscription,
 )
 from overbae.services import activity as activity_service
 from overbae.services import training_monitoring
 from overbae.tasks.datasets import reap_stuck_runs
+from tests.fakes.clerk import PENDING_BROWSER_FORM_SCRIPT
 
 from ..datasets import tickets, upload
 from ..stack import drain, settle
+
+
+def test_project_navigation_keeps_the_destination_without_a_project(console):
+    console.goto("/inference?inf_search=needle")
+    console.sees("Copy onboarding prompt")
+    console.wait_until(
+        "() => location.pathname === '/inference' && "
+        "new URLSearchParams(location.search).get('inf_search') === 'needle'"
+    )
+    console.save_evidence("project-navigation-without-project")
+
+
+def test_translated_onboarding_prompt_can_be_copied(console):
+    console.goto("/inference")
+    console.sees("Copy onboarding prompt")
+    console._browser.call(
+        lambda: console._page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    )
+    console._browser.call(
+        console._page.evaluate,
+        """() => {
+            const button = [...document.querySelectorAll('button')].find(
+                element => element.textContent.includes('Copy onboarding prompt'));
+            const texts = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            while (texts.nextNode()) nodes.push(texts.currentNode);
+            for (const text of nodes) {
+                if (!text.textContent.includes('Copy onboarding prompt')) continue;
+                const translated = document.createElement('font');
+                translated.textContent = 'Copiar instrucciones';
+                text.replaceWith(translated);
+            }
+        }""",
+    )
+    console.press("Copiar instrucciones")
+    console.sees("Paste the prompt into your coding agent to start setup.")
+    assert "/setup.md" in console._browser.call(
+        lambda: console._page.evaluate("navigator.clipboard.readText()")
+    )
+    console.save_evidence("translated-onboarding-prompt-copied")
+
+
+def test_project_navigation_selects_the_only_project_without_leaving(console, workshop):
+    project = workshop.project()["id"]
+    console._browser.call(console._page.evaluate, "localStorage.removeItem('__selectedProject')")
+    console.goto("/inference?inf_search=needle")
+    console.wait_until(
+        f"() => location.pathname === '/inference' && "
+        f"new URLSearchParams(location.search).get('projectId') === '{project}' && "
+        "new URLSearchParams(location.search).get('inf_search') === 'needle'"
+    )
+    console.save_evidence("project-navigation-destination")
+
+
+def test_onboarding_prompt_retains_the_selected_project(console, rest_for, account_key):
+    project = rest_for(account_key).request(
+        "POST", "/api/projects/", json={"name": "Existing setup", "slug": "existing-setup"}
+    )["id"]
+    console.goto(f"/?projectId={project}")
+    console._browser.call(
+        console._page.context.grant_permissions, ["clipboard-read", "clipboard-write"]
+    )
+    console.press("Copy onboarding prompt")
+    console.sees("Prompt copied")
+    prompt = console._browser.call(console._page.evaluate, "navigator.clipboard.readText()")
+    assert f"project_id: {project}" in prompt
+    assert "dataset_id" not in prompt
+    console.save_evidence("onboarding-selected-project")
+
+
+@pytest.mark.parametrize("console_url", ["clerk"], indirect=True)
+def test_sign_in_script_failure_offers_a_document_reload(browser, console_url):
+    console = browser.page(console_url)
+    attempts = []
+
+    def external_request(route):
+        if route.request.url.startswith(console_url):
+            route.continue_()
+        else:
+            attempts.append(route.request.url)
+            route.abort()
+
+    console._browser.call(console._page.route, "**/*", external_request)
+    try:
+        console.goto("/login")
+        console.sees("Sign in unavailable")
+        before = len(attempts)
+        console.press("Reload sign in")
+        console.sees("Sign in unavailable")
+        assert len(attempts) > before
+        assert any("clerk" in url for url in attempts)
+        console.save_evidence("sign-in-script-failure")
+    finally:
+        console.close()
+
+
+@pytest.mark.parametrize("console_url", ["clerk"], indirect=True)
+def test_pending_sign_in_offers_a_document_reload(browser, console_url):
+    console = browser.page(console_url)
+    pending = []
+
+    def external_request(route):
+        if route.request.url.startswith(console_url):
+            route.continue_()
+        elif "clerk" in route.request.url:
+            pending.append(route)
+        else:
+            route.abort()
+
+    console._browser.call(console._page.route, "**/*", external_request)
+    try:
+        console._browser.call(lambda: console._page.goto("/login", wait_until="domcontentloaded"))
+        console.sees("Loading sign in")
+        console.save_evidence("sign-in-pending")
+        console._browser.call(
+            lambda: console._page.get_by_role("button", name="Reload sign in").wait_for(
+                state="visible", timeout=15000
+            )
+        )
+        before = len(pending)
+
+        def reload_sign_in():
+            with console._page.expect_request(lambda request: "clerk" in request.url):
+                console._page.get_by_role("button", name="Reload sign in").click()
+
+        console._browser.call(reload_sign_in)
+        console.sees("Loading sign in")
+        assert len(pending) > before
+        console.save_evidence("sign-in-pending-recovery")
+    finally:
+        console.close()
+
+
+@pytest.mark.parametrize("console_url", ["clerk"], indirect=True)
+@pytest.mark.parametrize("mode", ["signin", "signup"])
+def test_pending_authentication_form_offers_recovery(browser, console_url, mode):
+    console = browser.page(console_url)
+    pending = []
+
+    def external_request(route):
+        if route.request.url.startswith(console_url):
+            route.continue_()
+        elif "clerk.browser.js" in route.request.url:
+            route.fulfill(content_type="application/javascript", body=PENDING_BROWSER_FORM_SCRIPT)
+        elif route.request.url.endswith("/pending-form"):
+            pending.append(route)
+        else:
+            route.abort()
+
+    console._browser.call(console._page.route, "**/*", external_request)
+    try:
+
+        def open_form():
+            with console._page.expect_request("**/pending-form"):
+                console._page.goto("/login?mode=signup" if mode == "signup" else "/login")
+
+        console._browser.call(open_form)
+        console.sees("Set up locally")
+        assert pending
+        console.save_evidence(f"authentication-form-pending-{mode}")
+        console.sees("Loading sign in")
+
+        def reload_form():
+            with console._page.expect_request("**/pending-form"):
+                console._page.get_by_role("button", name="Reload sign in").click()
+
+        console._browser.call(reload_form)
+        console.sees("Loading sign in")
+        console.save_evidence(f"authentication-form-recovery-{mode}")
+    finally:
+        console._browser.call(lambda: console._page.unroute_all(behavior="ignoreErrors"))
+        console.close()
+
+
+def test_route_error_home_action_reloads_the_document(console):
+    console.goto("/inference?page=broken")
+    console.sees("Invalid link")
+    console._browser.call(console._page.evaluate, "window.failedDocument = true")
+    console._browser.call(lambda: console._page.get_by_role("link", name="Go to home").click())
+    console.sees("Copy onboarding prompt")
+    console.wait_until("() => location.pathname === '/' && !window.failedDocument")
+    console.save_evidence("route-error-home-recovery")
+
+
+def test_cancelled_plan_checkout_returns_to_account_settings(
+    console, console_url, settings, stripe_api, rest_for, account_key
+):
+    settings.STRIPE_PRO_PRICE_ID = "price_journey"
+    settings.FRONTEND_URL = console_url
+    rest_for(account_key).request("POST", "/api/billing/checkout/")
+    cancel_url = stripe_api.sessions[-1]["cancel_url"]
+    console.goto(cancel_url)
+    console.save_evidence("plan-checkout-cancel-return")
+    console.sees("Settings")
+    console.sees("Buy Pro")
+
+
+@pytest.mark.parametrize("linked_to_stripe", [False, True])
+def test_account_settings_only_offer_renewal_controls_for_managed_plans(
+    console, account, linked_to_stripe
+):
+    user, _ = account
+    Subscription.objects.create(
+        user=user,
+        status="active",
+        stripe_subscription_id="sub_console" if linked_to_stripe else "",
+        end_date=timezone.now() + timedelta(days=30),
+    )
+    console.goto("/settings")
+    console.sees("Plan")
+    console.sees("Pro")
+    console.save_evidence(f"plan-renewal-controls-{linked_to_stripe}")
+    assert console._browser.call(
+        lambda: console._page.get_by_role("button", name="Cancel plan", exact=True).count()
+    ) == int(linked_to_stripe)
+
+
+def test_usage_history_keeps_small_charges_visible(console, account):
+    user, _ = account
+    BillingTelemetry.objects.create(user=user, service="inference", amount="-0.0000312")
+    console.goto("/settings")
+    console.sees("Usage history")
+    console.sees("0.00312")
+    console._browser.call(
+        lambda: console._page.get_by_label("0.00312 credits", exact=True).wait_for()
+    )
+    console.save_evidence("usage-small-charge")
+
+
+def test_dataset_pagination_waits_for_the_requested_rows(
+    console, workshop, cli, sample_agent, tmp_path
+):
+    project = workshop.project()["id"]
+    dataset = upload(cli, sample_agent, tickets(tmp_path, n=25))
+    console.goto(f"/datasets/{dataset}?projectId={project}")
+    console.sees("1–10 of 25 rows")
+    pending = []
+    console._browser.call(
+        console._page.route, "**/rows/?*offset=10*", lambda route: pending.append(route)
+    )
+    try:
+        console.press("Go to next page")
+        console.sees("Loading page 2")
+        assert console._browser.call(
+            lambda: console._page.get_by_role("button", name="Go to next page").is_disabled()
+        )
+        assert pending
+        console._browser.call(lambda: pending.pop().continue_())
+        console.sees("11–20 of 25 rows")
+        console.sees("Refund order 10 please", exact=False)
+        console.save_evidence("dataset-pagination-next-page")
+    finally:
+        for route in pending:
+            console._browser.call(route.continue_)
+        console._browser.call(console._page.unroute, "**/rows/?*offset=10*")
+
+
+def test_dataset_navigation_keeps_rows_with_their_source(
+    console, workshop, cli, sample_agent, tmp_path, worker
+):
+    project = workshop.project()["id"]
+    first_path = tickets(tmp_path, n=25).rename(tmp_path / "large-source.jsonl")
+    first = upload(cli, sample_agent, first_path)
+    second_path = tickets(tmp_path, n=3).rename(tmp_path / "small-source.jsonl")
+    second = upload(cli, sample_agent, second_path)
+    drain(worker)
+    console.goto(f"/datasets/{first}?projectId={project}")
+    console.sees("1–10 of 25 rows")
+    console._browser.call(
+        lambda: console._page.get_by_role("link", name="Datasets", exact=True).first.click()
+    )
+    console.click("small-source.jsonl")
+    console.wait_until(f"() => location.pathname === '/datasets/{second}'")
+    console.sees("3 rows × 2")
+    console.wait_until("() => !document.body.innerText.includes('of 25 rows')")
+    console.sees("Refund order 2 please", exact=False)
+    console.save_evidence("dataset-navigation-matching-source")
+
+
+def test_dataset_pagination_starts_at_the_first_row(console, workshop, cli, sample_agent, tmp_path):
+    project = workshop.project()["id"]
+    dataset = upload(cli, sample_agent, tickets(tmp_path, n=225))
+    console.goto(f"/datasets/{dataset}?projectId={project}")
+    console.sees("1–10 of 225 rows")
+    console._browser.call(lambda: console._page.get_by_role("combobox").click())
+    console._browser.call(
+        lambda: console._page.get_by_role("option", name="100", exact=True).click()
+    )
+    console.sees("1–100 of 225 rows")
+    console._browser.call(
+        lambda: console._page.get_by_role(
+            "button", name="Inspect row 99", exact=True
+        ).scroll_into_view_if_needed()
+    )
+    console.save_evidence("dataset-pagination-before-next")
+    console.press("Go to next page")
+    console.sees("101–200 of 225 rows")
+    console._browser.call(
+        lambda: console._page.get_by_role("button", name="Inspect row 100", exact=True).wait_for()
+    )
+    console.save_evidence("dataset-pagination-first-row")
+    console.wait_until("""() => {
+        const row = document.querySelector('button[aria-label="Inspect row 100"]');
+        const rect = row.getBoundingClientRect();
+        return rect.top >= 0 && rect.bottom <= innerHeight;
+    }""")
+
+
+def test_evaluation_dataset_picker_waits_for_its_options(
+    console, workshop, cli, sample_agent, tmp_path, fake_llm
+):
+    fake_llm.catalog_payload = [{"id": "qwen/qwen3-8b", "name": "Qwen: Qwen3 8B"}]
+    project = workshop.project()["id"]
+    upload(cli, sample_agent, tickets(tmp_path), "--intent", "eval")
+    pending = []
+
+    def hold_eval_datasets(route):
+        if "intent=eval" in route.request.url:
+            pending.append(route)
+        else:
+            route.continue_()
+
+    console._browser.call(console._page.route, "**/datasets/?*", hold_eval_datasets)
+    try:
+        console.goto(f"/evaluations?projectId={project}")
+        console.press("New evaluation")
+        console._browser.call(
+            lambda: console._page.get_by_role("button", name="Eval dataset", exact=True).click()
+        )
+        assert pending
+        console.sees("Loading options")
+        console.save_evidence("evaluation-dataset-picker-pending")
+        console._browser.call(lambda: pending.pop().continue_())
+        console._browser.call(
+            lambda: console._page.get_by_role("radio", name="tickets.jsonl", exact=True).click()
+        )
+        console._browser.call(
+            lambda: (
+                console._page.get_by_role("button", name="Eval dataset", exact=True)
+                .get_by_text("tickets.jsonl", exact=True)
+                .wait_for()
+            )
+        )
+        console.save_evidence("evaluation-dataset-picker-selected")
+        console._browser.call(
+            lambda: console._page.get_by_role(
+                "button", name="Model being tested", exact=True
+            ).click()
+        )
+        model_picker_id = console._browser.call(
+            lambda: console._page.get_by_role(
+                "button", name="Model being tested", exact=True
+            ).get_attribute("aria-controls")
+        )
+        console._browser.call(
+            lambda: (
+                console._page.locator(f'[id="{model_picker_id}"]')
+                .get_by_role("textbox", name="Search…", exact=True)
+                .fill("qwen")
+            )
+        )
+        console._browser.call(
+            lambda: console._page.get_by_role("radio", name="Qwen3 8B", exact=True).click()
+        )
+        console._browser.call(
+            lambda: (
+                console._page.get_by_role("button", name="Model being tested", exact=True)
+                .get_by_text("Qwen3 8B", exact=True)
+                .wait_for()
+            )
+        )
+        console.save_evidence("evaluation-model-search-selected")
+    finally:
+        for route in pending:
+            console._browser.call(route.continue_)
+        console._browser.call(console._page.unroute, "**/datasets/?*")
+
+
+@pytest.mark.parametrize("clear_action", ["Clear search", "Clear filters"])
+def test_inference_search_clear_restores_models(console, workshop, clear_action):
+    project = workshop.project()["id"]
+    dataset = Dataset.objects.create(project_id=project, name="Search fixture")
+    job = FinetuningJob.objects.create(
+        project_id=project,
+        dataset=dataset,
+        base_model="Qwen/Qwen3-8B",
+        status="succeeded",
+        output_model_name="ft-search-result",
+    )
+    DeployedModel.objects.create(
+        project_id=project, finetuning_job=job, model_id="ft-search-result", status="ready"
+    )
+    console.goto(f"/inference?projectId={project}&inf_search=missing-model")
+    console.sees("No results")
+    console.press(clear_action)
+    console.sees("ft-search-result")
+    console.wait_until("() => !new URLSearchParams(location.search).get('inf_search')")
+    console.save_evidence(f"inference-{clear_action.lower().replace(' ', '-')}")
 
 
 def test_embedded_onboarding_copies_setup_and_switches_to_data(console, console_url, live_api):
@@ -512,6 +914,40 @@ def test_decision_data_selects_native_training_controls(
     assert not FinetuningJob.objects.filter(project_id=project).exists()
 
 
+def test_api_key_remains_private_in_session_replay(console, workshop, replay_recorder):
+    project = workshop.project()["id"]
+    console.goto(f"/projects/{project}?projectId={project}")
+    console.press("New API key")
+    console._browser.call(lambda: console._page.add_script_tag(path=str(replay_recorder)))
+    console._browser.call(
+        console._page.evaluate,
+        """() => {
+            window.replayEvents = [];
+            window.stopReplay = ReplayRecorder.record({
+                emit: event => window.replayEvents.push(event),
+                blockClass: 'ph-no-capture', maskTextClass: 'ph-mask', maskAllInputs: true
+            });
+        }""",
+    )
+    console.press("Create API key")
+    console.sees("Your new API key:")
+    console.wait_until("() => window.replayEvents.some(event => event.type === 3)")
+    leaked = console._browser.call(
+        console._page.evaluate,
+        """() => {
+            ReplayRecorder.record.takeFullSnapshot();
+            const key = document.querySelector('[role="dialog"] code').textContent;
+            const leaked = JSON.stringify(window.replayEvents).includes(key);
+            window.stopReplay();
+            return leaked;
+        }""",
+    )
+    console.press("Done")
+    console.wait_until("() => !document.querySelector('[role=\"dialog\"]')")
+    console.save_evidence("api-key-replay-privacy")
+    assert leaked is False, "Session replay captured the API key"
+
+
 def test_native_monitoring_evidence_remains_readable_after_cancellation(console, workshop):
     project = workshop.project()["id"]
     group = uuid.uuid4()
@@ -522,6 +958,7 @@ def test_native_monitoring_evidence_remains_readable_after_cancellation(console,
         status="running",
         group_id=group,
         hyperparameters={"objective": "decision_cross_entropy"},
+        progress={"activity": [{"ts": 1, "message": "Booting and verifying"}]},
     )
     examples = [
         {
@@ -561,6 +998,7 @@ def test_native_monitoring_evidence_remains_readable_after_cancellation(console,
     console.goto(f"/training?projectId={project}&groupId={group}&jobId={job.pk}")
     console.sees("Development loss")
     console.sees("0.6250")
+    console.sees("Running — Booting and verifying")
     check = job.validation_runs.get()
     evidence = workshop.call(
         "inspect_training_progress", {"job": str(job.pk), "check": str(check.pk)}
@@ -570,6 +1008,7 @@ def test_native_monitoring_evidence_remains_readable_after_cancellation(console,
     console.sees("Requests cancellation. Completed checks and saved checkpoints remain available.")
     console.press("Cancel Job")
     console.sees("Cancelled")
+    console.wait_until("() => !document.body.innerText.includes('Booting and verifying')")
     job.refresh_from_db()
     assert job.status == "cancelled"
     console.goto(f"/training?projectId={project}&groupId={group}&jobId={job.pk}")
