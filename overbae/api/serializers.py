@@ -1074,7 +1074,7 @@ class ModelSwapPromptRequestSerializer(serializers.Serializer):
         default=False,
         help_text=(
             "Write this one deployment's concrete model id into the code instead of the "
-            "capability's permanent alias."
+            "capability's permanent alias. A run without a capability is always pinned."
         ),
     )
 
@@ -1082,8 +1082,8 @@ class ModelSwapPromptRequestSerializer(serializers.Serializer):
 class ModelSwapPromptSerializer(serializers.Serializer):
     prompt = serializers.CharField()
     pin = serializers.BooleanField()
-    capability_id = serializers.UUIDField()
-    capability_name = serializers.CharField()
+    capability_id = serializers.UUIDField(allow_null=True)
+    capability_name = serializers.CharField(allow_blank=True)
     old_model = serializers.CharField()
     new_model = serializers.CharField()
 
